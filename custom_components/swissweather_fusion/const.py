@@ -30,6 +30,13 @@ CONF_SRF_CONSUMER_KEY = "srf_consumer_key"
 CONF_SRF_CONSUMER_SECRET = "srf_consumer_secret"
 CONF_METEOBLUE_API_KEY = "meteoblue_api_key"
 CONF_METEONOMIQS_API_KEY = "meteonomiqs_api_key"
+# Optional — Open-Meteo's free tier needs no key at all. This is only for
+# their paid/commercial tier, which raises rate limits and uses dedicated
+# infrastructure — it does NOT make CH1/CH2/D2 refresh more often, since
+# that's fixed by MeteoSwiss/DWD's own model run schedule regardless of
+# tier. See clients/open_meteo.py for the customer- hostname requirement
+# that comes with using a key.
+CONF_OPEN_METEO_API_KEY = "open_meteo_api_key"
 
 CONF_PURGE_DAYS = "purge_days"  # 0 = forever
 DEFAULT_PURGE_DAYS = 0

@@ -31,6 +31,7 @@ from .const import (
     CONF_LONGITUDE,
     CONF_METEOBLUE_API_KEY,
     CONF_METEONOMIQS_API_KEY,
+    CONF_OPEN_METEO_API_KEY,
     CONF_PURGE_DAYS,
     CONF_SRF_CONSUMER_KEY,
     CONF_SRF_CONSUMER_SECRET,
@@ -136,6 +137,8 @@ class SwissWeatherFusionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._data[CONF_SRF_CONSUMER_SECRET] = user_input[CONF_SRF_CONSUMER_SECRET]
             self._data[CONF_METEOBLUE_API_KEY] = user_input[CONF_METEOBLUE_API_KEY]
             self._data[CONF_METEONOMIQS_API_KEY] = user_input[CONF_METEONOMIQS_API_KEY]
+            # Optional (v0.1.3) — free tier needs none of this at all.
+            self._data[CONF_OPEN_METEO_API_KEY] = user_input.get(CONF_OPEN_METEO_API_KEY) or None
             self._data[CONF_PURGE_DAYS] = DEFAULT_PURGE_DAYS
 
             return self.async_create_entry(
@@ -151,6 +154,7 @@ class SwissWeatherFusionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(CONF_SRF_CONSUMER_SECRET): text_password,
                 vol.Required(CONF_METEOBLUE_API_KEY): text_password,
                 vol.Required(CONF_METEONOMIQS_API_KEY): text_password,
+                vol.Optional(CONF_OPEN_METEO_API_KEY): text_password,
             }
         )
         return self.async_show_form(step_id="credentials", data_schema=schema)
@@ -230,6 +234,7 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                 CONF_SRF_CONSUMER_SECRET,
                 CONF_METEOBLUE_API_KEY,
                 CONF_METEONOMIQS_API_KEY,
+                CONF_OPEN_METEO_API_KEY,
             ):
                 if not result.get(key):
                     existing = current.get(key, self._config_entry.data.get(key))
@@ -279,6 +284,7 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                 vol.Optional(CONF_SRF_CONSUMER_SECRET): text_password,
                 vol.Optional(CONF_METEOBLUE_API_KEY): text_password,
                 vol.Optional(CONF_METEONOMIQS_API_KEY): text_password,
+                vol.Optional(CONF_OPEN_METEO_API_KEY): text_password,
                 vol.Required(
                     CONF_PURGE_DAYS, default=current.get(CONF_PURGE_DAYS, DEFAULT_PURGE_DAYS)
                 ): vol.Coerce(int),

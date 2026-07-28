@@ -64,7 +64,12 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
     """
 
     def __init__(
-        self, hass: HomeAssistant, db: SwissWeatherDB, latitude: float, longitude: float
+        self,
+        hass: HomeAssistant,
+        db: SwissWeatherDB,
+        latitude: float,
+        longitude: float,
+        api_key: Optional[str] = None,
     ) -> None:
         super().__init__(
             hass,
@@ -75,7 +80,7 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         self._db = db
         self._latitude = latitude
         self._longitude = longitude
-        self._client = OpenMeteoClient(async_get_clientsession(hass))
+        self._client = OpenMeteoClient(async_get_clientsession(hass), api_key=api_key)
         self._last_issued_at: dict[str, datetime] = {}
         # One health tracker per model, not one for the whole coordinator —
         # CH1 can fail while CH2/D2 succeed (e.g. a MeteoSwiss-side issue

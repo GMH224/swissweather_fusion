@@ -1,5 +1,39 @@
 # Developer notes: architecture rationale
 
+## v0.1.3 — SRF's real root cause, found from a live 404, plus an optional Open-Meteo key
+
+The v0.1.1 defensive fix (handling both list and dict-wrapped response
+shapes) turned out to have fixed a real problem, but not the one still
+causing failures — the geolocation lookup was actually succeeding all
+along, returning a valid ID formatted as `lat,lon`. The actual bug,
+confirmed from a live 404 in production logs plus the official SRG-SSR
+docs and a real working third-party example hitting the same API:
+
+- The forecast endpoint takes the geolocation ID as a **path parameter**
+  (`/forecast/{geolocationId}`), not a query parameter
+  (`?geolocationId=...`) as originally built.
+- There is **no `/v2/` segment in the actual URL path** at all — "V2"
+  refers to the product/subscription tier chosen on the developer portal,
+  not a URL versioning scheme. Both the geolocation and forecast URLs had
+  this incorrectly included.
+
+Both fixed. This is the second and hopefully last SRF-specific bug —
+between this and v0.1.1's fix, both halves of the request/response cycle
+(what we send, how we parse what comes back) have now been corrected
+against real evidence rather than documentation alone.
+
+**Also added**: an optional Open-Meteo API key (config flow + options
+flow). Confirmed from their own docs that using a key requires switching
+to a `customer-` prefixed hostname, not just adding a parameter — worth
+knowing this is their paid/commercial tier, not a free bonus, and it
+raises rate limits/reliability rather than making CH1/CH2/D2 refresh more
+often (that's fixed by MeteoSwiss/DWD's own model schedule regardless of
+tier). While adding this, found and fixed a smaller gap from v0.1.2: the
+SRF/meteoblue/Meteonomiqs credential fields added to the options flow
+never got translation labels, so they were showing as raw config keys
+(`srf_consumer_key`) instead of readable text — fixed alongside the new
+field.
+
 ## v0.1.2 — second deployment round, five more real bugs
 
 1. **Surface pressure vs. sea-level pressure mixed across sources.** CH1/

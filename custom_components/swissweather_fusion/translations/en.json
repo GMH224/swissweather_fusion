@@ -21,12 +21,13 @@
       },
       "credentials": {
         "title": "SwissWeather Fusion — API credentials",
-        "description": "All four credentials are stored securely and never written to a YAML file. SRF and meteoblue and Meteonomiqs credentials are obtained from their respective developer portals — see the README for links.",
+        "description": "SRF, meteoblue, and Meteonomiqs credentials are required and obtained from their respective developer portals — see the README for links. The Open-Meteo key is optional: leave it blank for the free tier (no account needed) — it only raises rate limits on their paid tier, it does not make forecasts refresh more often. All credentials are stored securely and never written to a YAML file.",
         "data": {
           "srf_consumer_key": "SRF (SRG SSR) consumer key",
           "srf_consumer_secret": "SRF (SRG SSR) consumer secret",
           "meteoblue_api_key": "meteoblue API key",
-          "meteonomiqs_api_key": "Meteonomiqs API key"
+          "meteonomiqs_api_key": "Meteonomiqs API key",
+          "open_meteo_api_key": "Open-Meteo API key (optional, paid tier only)"
         }
       },
       "reauth_confirm": {
@@ -50,10 +51,16 @@
     "step": {
       "init": {
         "title": "SwissWeather Fusion — Options",
+        "description": "Credential fields: leave blank to keep the existing value — a masked secret can't be shown for editing, and a blank submission won't erase a working credential.",
         "data": {
           "station_temp_entity": "Temperature sensor",
           "station_humidity_entity": "Humidity sensor",
           "station_pressure_entity": "Pressure sensor",
+          "srf_consumer_key": "SRF (SRG SSR) consumer key (leave blank to keep existing)",
+          "srf_consumer_secret": "SRF (SRG SSR) consumer secret (leave blank to keep existing)",
+          "meteoblue_api_key": "meteoblue API key (leave blank to keep existing)",
+          "meteonomiqs_api_key": "Meteonomiqs API key (leave blank to keep existing)",
+          "open_meteo_api_key": "Open-Meteo API key (optional, paid tier only; leave blank to keep existing or stay on the free tier)",
           "purge_days": "Database purge window (days, 0 = keep forever)"
         }
       }

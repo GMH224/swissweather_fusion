@@ -53,6 +53,11 @@ forecasts (a technique called Model Output Statistics).
     key.
   - MeteoSwiss's own CH1/CH2 data and DWD's ICON-D2 are fetched via
     [Open-Meteo](https://open-meteo.com), which needs no account or key.
+    An Open-Meteo API key is optional — only relevant if you're on their
+    paid/commercial tier (higher rate limits and dedicated
+    infrastructure; it does not make CH1/CH2/D2 refresh more often, since
+    that's fixed by MeteoSwiss/DWD's own model schedule). Leave it blank
+    for the free tier.
 
 ## Installation
 

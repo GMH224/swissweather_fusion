@@ -17,6 +17,7 @@ from .const import (
     CONF_LONGITUDE,
     CONF_METEOBLUE_API_KEY,
     CONF_METEONOMIQS_API_KEY,
+    CONF_OPEN_METEO_API_KEY,
     CONF_SRF_CONSUMER_KEY,
     CONF_SRF_CONSUMER_SECRET,
     CONF_STATION_HUMIDITY_ENTITY,
@@ -70,11 +71,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     srf_consumer_secret = options.get(CONF_SRF_CONSUMER_SECRET, data[CONF_SRF_CONSUMER_SECRET])
     meteoblue_api_key = options.get(CONF_METEOBLUE_API_KEY, data[CONF_METEOBLUE_API_KEY])
     meteonomiqs_api_key = options.get(CONF_METEONOMIQS_API_KEY, data[CONF_METEONOMIQS_API_KEY])
+    # Optional (v0.1.3) — None is a valid, expected value (free tier, the
+    # default), not a missing-config error, so .get() with no required
+    # fallback to data[...] is correct here unlike the other credentials.
+    open_meteo_api_key = options.get(
+        CONF_OPEN_METEO_API_KEY, data.get(CONF_OPEN_METEO_API_KEY)
+    )
 
     station_coordinator = StationCoordinator(
         hass, db, temp_entity, humidity_entity, pressure_entity
     )
-    open_meteo_coordinator = OpenMeteoCoordinator(hass, db, latitude, longitude)
+    open_meteo_coordinator = OpenMeteoCoordinator(
+        hass, db, latitude, longitude, api_key=open_meteo_api_key
+    )
     srf_coordinator = SrfCoordinator(
         hass,
         db,

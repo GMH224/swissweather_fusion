@@ -1,5 +1,9 @@
 """Shared client for ICON-CH1-EPS, ICON-CH2-EPS, and DWD ICON-D2, all via
-Open-Meteo's free, no-key JSON API.
+Open-Meteo's JSON API — free tier needs no key at all; an optional API key
+(v0.1.3) switches to their paid/commercial tier for higher rate limits and
+dedicated infrastructure. It does NOT make CH1/CH2/D2 refresh more often —
+that's fixed by MeteoSwiss/DWD's own model run schedule regardless of
+tier.
 
 One client for all three models since they share the same API shape — only
 the `models=` parameter differs. See DEVELOPER.md for why this project uses
@@ -18,8 +22,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-FORECAST_BASE_URL = "https://api.open-meteo.com/v1/forecast"
-ELEVATION_BASE_URL = "https://api.open-meteo.com/v1/elevation"
+FREE_HOST = "api.open-meteo.com"
+# Confirmed from Open-Meteo's own docs: using an apikey requires this
+# customer- prefixed hostname, not just adding the parameter to the
+# regular one — a plain apikey= on the free host is silently ignored.
+CUSTOMER_HOST = "customer-api.open-meteo.com"
 
 MODEL_PARAM = {
     # Corrected in v0.1.1: these were invented plausible-looking names
@@ -46,22 +53,35 @@ HOURLY_VARIABLES = (
 )
 
 
+def _base_url(path: str, api_key: Optional[str]) -> str:
+    host = CUSTOMER_HOST if api_key else FREE_HOST
+    return f"https://{host}{path}"
+
+
 def build_forecast_url(
-    *, source: str, latitude: float, longitude: float
+    *, source: str, latitude: float, longitude: float, api_key: Optional[str] = None
 ) -> str:
     """Build the forecast request URL for one of ch1/ch2/icon_d2."""
     if source not in MODEL_PARAM:
         raise ValueError(f"Unknown Open-Meteo source: {source!r}")
     variables = ",".join(HOURLY_VARIABLES)
-    return (
-        f"{FORECAST_BASE_URL}?latitude={latitude}&longitude={longitude}"
+    url = (
+        f"{_base_url('/v1/forecast', api_key)}?latitude={latitude}&longitude={longitude}"
         f"&hourly={variables}&models={MODEL_PARAM[source]}&timeformat=iso8601"
         f"&timezone=UTC"
     )
+    if api_key:
+        url += f"&apikey={api_key}"
+    return url
 
 
-def build_elevation_url(*, latitude: float, longitude: float) -> str:
-    return f"{ELEVATION_BASE_URL}?latitude={latitude}&longitude={longitude}"
+def build_elevation_url(
+    *, latitude: float, longitude: float, api_key: Optional[str] = None
+) -> str:
+    url = f"{_base_url('/v1/elevation', api_key)}?latitude={latitude}&longitude={longitude}"
+    if api_key:
+        url += f"&apikey={api_key}"
+    return url
 
 
 @dataclass(frozen=True)
@@ -154,15 +174,22 @@ def extract_error_reason(payload: dict[str, Any]) -> Optional[str]:
 class OpenMeteoClient:
     """Requires an aiohttp.ClientSession, normally HA's shared session via
     homeassistant.helpers.aiohttp_client.async_get_clientsession(hass).
+
+    api_key is optional — leave it unset for the free tier (the default,
+    no account needed). See the module docstring for what a key actually
+    changes (rate limits/infrastructure, not model freshness).
     """
 
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: Any, api_key: Optional[str] = None) -> None:
         self._session = session
+        self._api_key = api_key
 
     async def async_fetch_forecast(
         self, *, source: str, latitude: float, longitude: float
     ) -> ParsedForecast:
-        url = build_forecast_url(source=source, latitude=latitude, longitude=longitude)
+        url = build_forecast_url(
+            source=source, latitude=latitude, longitude=longitude, api_key=self._api_key
+        )
         async with self._session.get(url) as resp:
             if resp.status == 400:
                 # Read the body before raise_for_status discards it — this
@@ -179,7 +206,7 @@ class OpenMeteoClient:
     async def async_fetch_elevation(
         self, *, latitude: float, longitude: float
     ) -> Optional[float]:
-        url = build_elevation_url(latitude=latitude, longitude=longitude)
+        url = build_elevation_url(latitude=latitude, longitude=longitude, api_key=self._api_key)
         async with self._session.get(url) as resp:
             resp.raise_for_status()
             payload = await resp.json()

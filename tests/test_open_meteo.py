@@ -42,6 +42,35 @@ def test_build_forecast_url_rejects_unknown_source():
         om.build_forecast_url(source="bogus", latitude=0, longitude=0)
 
 
+def test_build_forecast_url_free_tier_uses_default_host_no_key():
+    url = om.build_forecast_url(source="ch1", latitude=TEST_LAT, longitude=TEST_LON)
+    assert url.startswith("https://api.open-meteo.com/")
+    assert "customer-" not in url
+    assert "apikey=" not in url
+
+
+def test_build_forecast_url_with_api_key_uses_customer_host():
+    """v0.1.3: optional paid-tier API key. Confirmed from Open-Meteo's own
+    docs that using a key requires the customer- prefixed hostname, not
+    just adding the parameter to the regular one.
+    """
+    url = om.build_forecast_url(
+        source="ch1", latitude=TEST_LAT, longitude=TEST_LON, api_key="TESTKEY"
+    )
+    assert url.startswith("https://customer-api.open-meteo.com/")
+    assert "apikey=TESTKEY" in url
+
+
+def test_build_elevation_url_with_and_without_api_key():
+    free_url = om.build_elevation_url(latitude=TEST_LAT, longitude=TEST_LON)
+    assert free_url.startswith("https://api.open-meteo.com/")
+    assert "apikey=" not in free_url
+
+    paid_url = om.build_elevation_url(latitude=TEST_LAT, longitude=TEST_LON, api_key="TESTKEY")
+    assert paid_url.startswith("https://customer-api.open-meteo.com/")
+    assert "apikey=TESTKEY" in paid_url
+
+
 def test_build_elevation_url():
     url = om.build_elevation_url(latitude=TEST_LAT, longitude=TEST_LON)
     assert "elevation" in url

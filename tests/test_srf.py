@@ -13,6 +13,22 @@ def test_build_basic_auth_header():
     assert decoded == "mykey:mysecret"
 
 
+def test_build_forecast_url_uses_path_parameter_not_query_string():
+    """v0.1.3 regression test: production hit a 404 because the
+    geolocationId was passed as a query parameter (?geolocationId=X) and
+    the URL included an incorrect /v2/ path segment. Confirmed correct
+    structure from SRG-SSR's own docs and a real working example.
+    """
+    url = srf.build_forecast_url("47.5536,8.9120")
+    assert url == "https://api.srgssr.ch/srf-meteo/forecast/47.5536,8.9120"
+    assert "?geolocationId=" not in url
+    assert "/v2/" not in url
+
+
+def test_geolocation_url_has_no_v2_segment():
+    assert "/v2/" not in srf.GEOLOCATION_URL
+
+
 def test_parse_token_response():
     assert srf.parse_token_response({"access_token": "abc123"}) == "abc123"
     with pytest.raises(ValueError):

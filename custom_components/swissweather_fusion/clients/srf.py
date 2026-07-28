@@ -24,8 +24,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 TOKEN_URL = "https://api.srgssr.ch/oauth/v1/accesstoken?grant_type=client_credentials"
-GEOLOCATION_URL = "https://api.srgssr.ch/srf-meteo/v2/geolocations"
-FORECAST_URL = "https://api.srgssr.ch/srf-meteo/v2/forecast"
+# v0.1.3 fix: both URLs below had an incorrect /v2/ path segment, and the
+# forecast URL additionally passed geolocationId as a query parameter
+# instead of a path parameter. Confirmed correct structure from the
+# official SRG-SSR docs ("/forecast/{geolocationId}") and a real working
+# example hitting this exact API successfully
+# (https://api.srgssr.ch/srf-meteo/forecast/47.3965,8.4894) — "V2" refers
+# to the developer-portal product/subscription tier, not a URL version.
+GEOLOCATION_URL = "https://api.srgssr.ch/srf-meteo/geolocations"
+
+
+def build_forecast_url(geolocation_id: str) -> str:
+    return f"https://api.srgssr.ch/srf-meteo/forecast/{geolocation_id}"
 
 TOKEN_LIFETIME = timedelta(days=7)
 # Refresh a bit before actual expiry rather than reacting only to a 401.
@@ -178,10 +188,8 @@ class SrfClient:
         token = await self._async_ensure_token()
         geolocation_id = await self._async_ensure_geolocation_id(latitude, longitude)
         headers = {"Authorization": f"Bearer {token}"}
-        params = {"geolocationId": geolocation_id}
-        async with self._session.get(
-            FORECAST_URL, headers=headers, params=params
-        ) as resp:
+        url = build_forecast_url(geolocation_id)
+        async with self._session.get(url, headers=headers) as resp:
             resp.raise_for_status()
             payload = await resp.json()
         return parse_forecast_response(payload)
