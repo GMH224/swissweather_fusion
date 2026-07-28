@@ -1,5 +1,34 @@
 # Developer notes: architecture rationale
 
+## v0.1.4 — SRF's third distinct failure, and a change in approach
+
+After the URL fix in v0.1.3, SRF got past the 404 and reached real parsing
+code for what appears to be the first time — and hit a third distinct
+error: `'str' object has no attribute 'get'`. Given this is now three
+separate SRF-specific surprises (dict-vs-list in v0.1.1, URL structure in
+v0.1.3, and now this), guessing a fourth exact response shape from
+documentation alone stopped being the right strategy. The approach
+changed instead of just patching the specific symptom again:
+
+- **Both parsers (`parse_geolocation_response`, `parse_forecast_response`)
+  now defend against every level being a different shape than
+  expected** — the top-level payload being a bare string instead of a
+  list/dict, a "results" field not actually being a list, and individual
+  list entries being plain strings rather than objects. Anything that
+  doesn't fit is skipped rather than crashed on.
+- **The client now logs a truncated repr of the raw response whenever
+  parsing yields nothing usable.** Defensive parsing that silently
+  returns an empty result is a regression in one way — a genuine ongoing
+  problem could hide behind "no error, just no data" instead of a loud
+  crash. The logging closes that gap: if there's still a mismatch, the
+  next log capture shows the actual structure instead of requiring
+  another screenshot-and-guess round.
+
+This is a deliberate shift from "fix the specific shape" to "stop
+assuming a fixed shape at all, and make sure we can see what's really
+there if it's wrong again" — appropriate once the same integration point
+has surprised us three times running.
+
 ## v0.1.3 — SRF's real root cause, found from a live 404, plus an optional Open-Meteo key
 
 The v0.1.1 defensive fix (handling both list and dict-wrapped response

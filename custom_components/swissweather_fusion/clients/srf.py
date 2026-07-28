@@ -19,9 +19,12 @@ lacked).
 from __future__ import annotations
 
 import base64
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+_LOGGER = logging.getLogger(__name__)
 
 TOKEN_URL = "https://api.srgssr.ch/oauth/v1/accesstoken?grant_type=client_credentials"
 # v0.1.3 fix: both URLs below had an incorrect /v2/ path segment, and the
@@ -75,15 +78,28 @@ def parse_geolocation_response(payload: Any) -> Optional[str]:
     as an outstanding item at the time). Handles both shapes now rather
     than gambling on which one is actually correct, since the raw
     response body wasn't captured to confirm definitively.
+
+    **v0.1.4**: also defends against each list entry being a bare string
+    (e.g. the coordinate itself, like "47.5536,8.9120") rather than an
+    object with a geolocationId/id field — a third SRF response-shape
+    surprise made this worth guarding rather than assuming a fixed shape.
+    If an entry is already a string, it's presumably already usable as
+    the ID directly.
     """
     if isinstance(payload, list):
         results = payload
-    else:
+    elif isinstance(payload, dict):
         results = payload.get("geolocations") or payload.get("results") or []
+    else:
+        return None
     if not results:
         return None
     first = results[0]
-    return first.get("geolocationId") or first.get("id")
+    if isinstance(first, str):
+        return first
+    if isinstance(first, dict):
+        return first.get("geolocationId") or first.get("id")
+    return None
 
 
 # Fields expected in the V2 forecast response, per what was documented
@@ -107,14 +123,33 @@ class SrfForecastPoint:
 
 
 def parse_forecast_response(payload: Any) -> list[SrfForecastPoint]:
-    """**Fixed in v0.1.1**: same defensive fix as parse_geolocation_response
-    above, for the same reason — handles both a bare top-level list and a
-    dict wrapping one, since the actual shape wasn't confirmed before the
-    crash that surfaced this.
+    """**Fixed in v0.1.1**: handles both a bare top-level list and a dict
+    wrapping one, since the actual shape wasn't confirmed before the crash
+    that surfaced this.
+
+    **v0.1.4**: this is the more likely of the two parsers to have caused
+    the 'str' object has no attribute 'get' crash, since it's the code
+    path newly reached after the v0.1.3 URL fix — we'd never actually
+    gotten a real 200 response with a real body to parse here before.
+    Now defends against every level being a different shape than
+    expected: payload itself being a bare string, entries not being a
+    list at all, and individual entries being strings rather than dicts.
+    Skips anything that doesn't fit rather than crashing on it.
     """
-    entries = payload if isinstance(payload, list) else payload.get("forecast", [])
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict):
+        entries = payload.get("forecast", [])
+    else:
+        entries = []
+
+    if not isinstance(entries, list):
+        entries = []
+
     points: list[SrfForecastPoint] = []
     for entry in entries:
+        if not isinstance(entry, dict):
+            continue
         valid_at_str = entry.get("localDateTime") or entry.get("time")
         if not valid_at_str:
             continue
@@ -177,6 +212,15 @@ class SrfClient:
             payload = await resp.json()
         geolocation_id = parse_geolocation_response(payload)
         if geolocation_id is None:
+            # v0.1.4: log what was actually received rather than just
+            # raising a generic message — this is the third distinct SRF
+            # response-shape surprise, so capturing real evidence here
+            # beats guessing again if this happens once more.
+            _LOGGER.error(
+                "SRF geolocation lookup returned no usable result. Raw "
+                "response (truncated): %s",
+                repr(payload)[:500],
+            )
             raise ValueError("SRF geolocation lookup returned no results")
         self._geolocation_id = geolocation_id
         self._geolocation_coords = (latitude, longitude)
@@ -192,4 +236,17 @@ class SrfClient:
         async with self._session.get(url, headers=headers) as resp:
             resp.raise_for_status()
             payload = await resp.json()
-        return parse_forecast_response(payload)
+        points = parse_forecast_response(payload)
+        if not points:
+            # v0.1.4: same reasoning as the geolocation lookup above —
+            # parsing is now defensive (skips what it doesn't recognize
+            # rather than crashing on it), which means a genuinely
+            # unexpected response shape could otherwise fail silently
+            # instead of loudly. Logging the raw body here means the next
+            # surprise comes with real evidence attached.
+            _LOGGER.warning(
+                "SRF forecast response produced no usable data points. Raw "
+                "response (truncated): %s",
+                repr(payload)[:500],
+            )
+        return points

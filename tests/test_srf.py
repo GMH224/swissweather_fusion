@@ -65,6 +65,23 @@ def test_parse_geolocation_response_bare_list_v0_1_1_fix():
     assert srf.parse_geolocation_response([]) is None
 
 
+def test_parse_geolocation_response_string_entry_v0_1_4_fix():
+    """v0.1.4: a third distinct SRF crash — 'str' object has no attribute
+    'get' — meaning a list entry can apparently be a bare string (the
+    coordinate itself) rather than an object with a geolocationId/id
+    field. If it's already a string, treat it as already usable.
+    """
+    assert srf.parse_geolocation_response(["47.5536,8.9120"]) == "47.5536,8.9120"
+    assert srf.parse_geolocation_response({"geolocations": ["47.5536,8.9120"]}) == "47.5536,8.9120"
+
+
+def test_parse_geolocation_response_unexpected_top_level_types():
+    """Neither a list nor a dict at the top level shouldn't crash either."""
+    assert srf.parse_geolocation_response("just a string") is None
+    assert srf.parse_geolocation_response(None) is None
+    assert srf.parse_geolocation_response(42) is None
+
+
 def test_parse_forecast_response():
     payload = {
         "forecast": [
@@ -96,3 +113,24 @@ def test_parse_forecast_response_bare_list_v0_1_1_fix():
     points = srf.parse_forecast_response(payload)
     assert len(points) == 1
     assert points[0].value == 21.0
+
+
+def test_parse_forecast_response_string_entries_v0_1_4_fix():
+    """v0.1.4: if entries in the list turn out to be plain strings rather
+    than objects (the same class of surprise that hit the geolocation
+    parser), skip them rather than crash — better to return zero points
+    (surfaced via the client's diagnostic logging) than raise.
+    """
+    payload = ["not a dict", "also not a dict"]
+    assert srf.parse_forecast_response(payload) == []
+
+    mixed = [{"localDateTime": "2026-07-25T12:00:00", "temperature": 21.0}, "a bare string"]
+    points = srf.parse_forecast_response(mixed)
+    assert len(points) == 1
+    assert points[0].value == 21.0
+
+
+def test_parse_forecast_response_unexpected_top_level_types():
+    assert srf.parse_forecast_response("just a string") == []
+    assert srf.parse_forecast_response(None) == []
+    assert srf.parse_forecast_response({"forecast": "not actually a list"}) == []
