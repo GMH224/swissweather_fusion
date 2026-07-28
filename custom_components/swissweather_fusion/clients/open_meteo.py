@@ -40,7 +40,7 @@ MODEL_PARAM = {
 HOURLY_VARIABLES = (
     "temperature_2m",
     "relative_humidity_2m",
-    "surface_pressure",
+    "pressure_msl",
     "precipitation",
     "wind_speed_10m",
 )
@@ -83,7 +83,15 @@ class ParsedForecast:
 _VARIABLE_NAME_MAP = {
     "temperature_2m": "temperature",
     "relative_humidity_2m": "humidity",
-    "surface_pressure": "pressure",
+    # v0.1.2 fix: was surface_pressure (pressure at the source's own grid
+    # elevation), which doesn't match what SRF/meteoblue/the local station
+    # report — all of those use sea-level-adjusted pressure. Blending
+    # surface pressure from some sources with sea-level pressure from
+    # others isn't just "a bit off", it's mixing two different physical
+    # quantities (they differ by ~12 hPa per 100m of elevation) — the
+    # 966.2 hPa reading that prompted this fix matches uncorrected surface
+    # pressure at a few hundred meters' elevation almost exactly.
+    "pressure_msl": "pressure",
     "precipitation": "precip",
     "wind_speed_10m": "wind_speed",
 }

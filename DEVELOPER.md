@@ -1,5 +1,45 @@
 # Developer notes: architecture rationale
 
+## v0.1.2 — second deployment round, five more real bugs
+
+1. **Surface pressure vs. sea-level pressure mixed across sources.** CH1/
+   CH2/D2 requested `surface_pressure` (pressure at each source's own grid
+   elevation); SRF, meteoblue, and the local station all report sea-level-
+   adjusted pressure. These are different physical quantities, differing
+   by roughly 12 hPa per 100m of elevation — blending them produced a
+   suspiciously low 966.2 hPa reading in the second deployment, which
+   matches uncorrected surface pressure at a few hundred meters' elevation
+   almost exactly. Fixed by requesting `pressure_msl` instead.
+2. **No device grouping.** No entity set `device_info`, so all 42
+   entities showed as an ungrouped flat list under the integration rather
+   than a nested device card — visibly different from how a well-behaved
+   integration (e.g. weather-fusion-ai, installed alongside this one)
+   presents itself. Added a shared `device_info` (`device.py`) so every
+   entity groups under one card.
+3. **The weather card's "Forecast:" section spun forever.**
+   `WeatherEntityFeature.FORECAST_HOURLY` was declared with no real data
+   behind it — `async_forecast_hourly` always returned `[]`. The frontend
+   kept waiting for hourly data that was never coming, rather than being
+   told there simply wasn't any yet. Removed the feature declaration
+   until a genuine multi-hour forecast exists.
+4. **No way to view or change credentials after initial setup.** The
+   options flow only ever exposed the three station-sensor fields and the
+   purge-days setting — SRF/meteoblue/Meteonomiqs credentials were never
+   in it at all. Added them as optional masked fields (blank = keep the
+   existing value, since a masked secret can't be shown for editing the
+   way a plain setting can).
+5. **Two bugs that would have silently defeated fix #4 on its own**:
+   credentials were read only from `entry.data` in `__init__.py`, never
+   from `entry.options` — so even with the fields added to the options
+   flow, saving them would have had no actual effect. And there was no
+   update listener at all, so *any* options change (station sensors,
+   purge days, now credentials) would sit unused until a manual restart.
+   Both fixed: credentials now check `entry.options` first (matching the
+   pattern already used for station sensors), and an update listener
+   triggers a full reload whenever options are saved.
+
+## Architecture rationale (v0.1 design)
+
 ## v0.1.1 — first deployment, four real bugs found and fixed
 
 The first actual HA deployment surfaced four issues, none of which showed

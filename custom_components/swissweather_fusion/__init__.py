@@ -59,6 +59,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         CONF_STATION_PRESSURE_ENTITY, data[CONF_STATION_PRESSURE_ENTITY]
     )
 
+    # v0.1.2 fix: credentials were only ever read from entry.data (the
+    # initial-setup values), so the options flow's new credential fields
+    # (added in the same fix) would have had no actual effect — the
+    # options flow writes to entry.options, and this was never checked.
+    # Same options-first, data-fallback pattern as the station entities
+    # above, for consistency.
+    options = entry.options or {}
+    srf_consumer_key = options.get(CONF_SRF_CONSUMER_KEY, data[CONF_SRF_CONSUMER_KEY])
+    srf_consumer_secret = options.get(CONF_SRF_CONSUMER_SECRET, data[CONF_SRF_CONSUMER_SECRET])
+    meteoblue_api_key = options.get(CONF_METEOBLUE_API_KEY, data[CONF_METEOBLUE_API_KEY])
+    meteonomiqs_api_key = options.get(CONF_METEONOMIQS_API_KEY, data[CONF_METEONOMIQS_API_KEY])
+
     station_coordinator = StationCoordinator(
         hass, db, temp_entity, humidity_entity, pressure_entity
     )
@@ -68,15 +80,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         db,
         latitude,
         longitude,
-        data[CONF_SRF_CONSUMER_KEY],
-        data[CONF_SRF_CONSUMER_SECRET],
+        srf_consumer_key,
+        srf_consumer_secret,
     )
     meteoblue_coordinator = MeteoblueCoordinator(
-        hass, db, latitude, longitude, data[CONF_METEOBLUE_API_KEY]
+        hass, db, latitude, longitude, meteoblue_api_key
     )
     combiprecip_coordinator = CombiPrecipCoordinator(hass, db, latitude, longitude)
     meteonomiqs_coordinator = MeteonomiqsCoordinator(
-        hass, latitude, longitude, data[CONF_METEONOMIQS_API_KEY]
+        hass, latitude, longitude, meteonomiqs_api_key
     )
     model_b_coordinator = ModelBCoordinator(
         hass,
@@ -142,7 +154,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # v0.1.2 fix: nothing reloaded the integration when options changed —
+    # station sensor edits or credential updates via Configure would sit
+    # in entry.options unused until a manual restart. This is the
+    # standard HA pattern: any options-flow save triggers a full reload,
+    # so changes actually take effect.
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
     return True
+
+
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

@@ -28,6 +28,7 @@ from .const import (
     SOURCE_METEONOMIQS,
     SOURCE_SRF,
 )
+from .device import build_device_info
 from .health import SourceHealth
 from .storage.db import SwissWeatherDB
 
@@ -90,6 +91,7 @@ class _BaseSensor(SensorEntity):
         self._entry = entry
         self._attr_unique_id = f"{entry.entry_id}_{unique_suffix}"
         self._attr_name = name
+        self._attr_device_info = build_device_info(entry)
 
 
 class StatusSensor(_BaseSensor):

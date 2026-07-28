@@ -53,7 +53,7 @@ def test_parse_forecast_response():
             "time": ["2026-07-25T12:00", "2026-07-25T13:00"],
             "temperature_2m": [20.1, 21.3],
             "relative_humidity_2m": [55, 52],
-            "surface_pressure": [1013.2, 1013.0],
+            "pressure_msl": [1013.2, 1013.0],
             "precipitation": [0.0, 0.2],
             "wind_speed_10m": [3.1, 3.4],
         }
@@ -63,6 +63,30 @@ def test_parse_forecast_response():
     temps = [p for p in parsed.points if p.variable == "temperature"]
     assert len(temps) == 2
     assert temps[0].value == 20.1
+
+
+def test_pressure_requests_sea_level_not_surface():
+    """v0.1.2 regression test: requesting surface_pressure instead of
+    pressure_msl silently mixed two different physical quantities across
+    sources (surface pressure differs from sea-level pressure by ~12 hPa
+    per 100m elevation) — a real deployment showed a suspiciously low
+    966.2 hPa blended reading that matched uncorrected surface pressure
+    almost exactly. Confirms the fix and guards against it regressing.
+    """
+    url = om.build_forecast_url(source="ch1", latitude=TEST_LAT, longitude=TEST_LON)
+    assert "pressure_msl" in url
+    assert "surface_pressure" not in url
+
+    payload = {
+        "hourly": {
+            "time": ["2026-07-25T12:00"],
+            "pressure_msl": [1013.2],
+        }
+    }
+    parsed = om.parse_forecast_response(payload)
+    pressures = [p for p in parsed.points if p.variable == "pressure"]
+    assert len(pressures) == 1
+    assert pressures[0].value == 1013.2
 
 
 def test_parse_elevation_response():

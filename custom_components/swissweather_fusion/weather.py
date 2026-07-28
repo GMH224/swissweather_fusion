@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from homeassistant.components.weather import WeatherEntity, WeatherEntityFeature
+from homeassistant.components.weather import WeatherEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     UnitOfPressure,
@@ -22,6 +22,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import ALL_FORECAST_SOURCES, DOMAIN, MIN_SAMPLES_TO_TRUST_BUCKET
+from .device import build_device_info
 from .models import model_a
 from .storage.db import BucketKey, SwissWeatherDB
 
@@ -38,7 +39,14 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
     _attr_name = None
     _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_native_pressure_unit = UnitOfPressure.HPA
-    _attr_supported_features = WeatherEntityFeature.FORECAST_HOURLY
+    # v0.1.2 fix: WeatherEntityFeature.FORECAST_HOURLY was declared here
+    # with no real forecast data behind it (async_forecast_hourly always
+    # returned []) — the dashboard card showed a "Forecast:" section with
+    # a spinner that never resolved, since it was waiting for hourly data
+    # that was never coming rather than being told there simply isn't
+    # any yet. Removed until a genuine multi-hour blended forecast exists
+    # (see DEVELOPER.md) — better to not claim support than to claim it
+    # and never deliver.
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
         super().__init__(runtime["open_meteo_coordinator"])
@@ -46,6 +54,7 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
         self._entry = entry
         self._db: SwissWeatherDB = runtime["db"]
         self._attr_unique_id = f"{entry.entry_id}_weather"
+        self._attr_device_info = build_device_info(entry)
 
     def _blend_measurement(self, measurement: str) -> Optional[float]:
         now = model_a.utcnow()
@@ -115,10 +124,3 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
         if precip is None:
             return None
         return "rainy" if precip > 0.1 else "sunny"
-
-    async def async_forecast_hourly(self) -> list[dict[str, Any]]:
-        # v0.1: a minimal single-point-ahead stub. Full multi-hour blended
-        # forecasts (blending each source's own hourly series, not just
-        # "now") is the natural next iteration — flagged in DEVELOPER.md
-        # rather than built speculatively before the core loop is proven.
-        return []

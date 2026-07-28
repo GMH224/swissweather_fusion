@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
+from .device import build_device_info
 
 
 async def async_setup_entry(
@@ -28,6 +29,7 @@ class DegradedBinarySensor(BinarySensorEntity):
         self._entry = entry
         self._runtime = runtime
         self._attr_unique_id = f"{entry.entry_id}_degraded"
+        self._attr_device_info = build_device_info(entry)
 
     @property
     def is_on(self) -> bool:

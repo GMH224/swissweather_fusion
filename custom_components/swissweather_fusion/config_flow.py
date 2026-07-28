@@ -214,10 +214,34 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(
         self, user_input: Optional[dict[str, Any]] = None
     ) -> FlowResult:
-        if user_input is not None:
-            return self.async_create_entry(title="", data=user_input)
-
         current = self._config_entry.options or {}
+
+        if user_input is not None:
+            # v0.1.2 fix: credential fields were entirely missing from
+            # this flow — there was no way to view or change them after
+            # initial setup at all, exactly the gap reported after
+            # deployment. They're optional here and mean "leave blank to
+            # keep the existing value" (a masked secret can't be
+            # pre-filled for the user to see, and typing over it with a
+            # blank shouldn't erase a working credential by accident).
+            result = dict(user_input)
+            for key in (
+                CONF_SRF_CONSUMER_KEY,
+                CONF_SRF_CONSUMER_SECRET,
+                CONF_METEOBLUE_API_KEY,
+                CONF_METEONOMIQS_API_KEY,
+            ):
+                if not result.get(key):
+                    existing = current.get(key, self._config_entry.data.get(key))
+                    if existing:
+                        result[key] = existing
+                    else:
+                        result.pop(key, None)
+            return self.async_create_entry(title="", data=result)
+
+        text_password = selector.TextSelector(
+            selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
+        )
         schema = vol.Schema(
             {
                 vol.Required(
@@ -251,6 +275,10 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                         domain="sensor", device_class=["pressure", "atmospheric_pressure"]
                     )
                 ),
+                vol.Optional(CONF_SRF_CONSUMER_KEY): text_password,
+                vol.Optional(CONF_SRF_CONSUMER_SECRET): text_password,
+                vol.Optional(CONF_METEOBLUE_API_KEY): text_password,
+                vol.Optional(CONF_METEONOMIQS_API_KEY): text_password,
                 vol.Required(
                     CONF_PURGE_DAYS, default=current.get(CONF_PURGE_DAYS, DEFAULT_PURGE_DAYS)
                 ): vol.Coerce(int),

@@ -24,6 +24,7 @@ HA_DEPENDENT_FILES = [
     "weather.py",
     "sensor.py",
     "binary_sensor.py",
+    "device.py",
 ]
 
 
