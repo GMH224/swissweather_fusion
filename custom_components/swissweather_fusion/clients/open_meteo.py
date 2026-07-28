@@ -68,6 +68,14 @@ def build_forecast_url(
     url = (
         f"{_base_url('/v1/forecast', api_key)}?latitude={latitude}&longitude={longitude}"
         f"&hourly={variables}&models={MODEL_PARAM[source]}&timeformat=iso8601"
+        # v0.1.5 fix: Open-Meteo defaults wind speed to km/h, but
+        # meteoblue's confirmed test response used values (0.94, 1.85,
+        # etc.) consistent with m/s, not km/h — a real cross-source unit
+        # mismatch, same class of bug as the earlier surface-vs-sea-level
+        # pressure issue. Explicitly requesting m/s here to match, rather
+        # than converting meteoblue's values, since this is the source
+        # whose unit is actually configurable via a URL parameter.
+        f"&wind_speed_unit=ms"
         f"&timezone=UTC"
     )
     if api_key:

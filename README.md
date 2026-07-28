@@ -120,6 +120,10 @@ Beyond the main `weather.*` entity, this integration exposes:
   verifying against a real file early.
 - Model B's v0 rule is a hand-crafted heuristic, not a trained model — see
   DEVELOPER.md for the upgrade path once a storm season of data exists.
+- Daily and twice-daily forecast grouping uses UTC calendar-day
+  boundaries, not your configured local timezone — hours near midnight
+  can land in the "wrong" local day. A reasonable follow-up, not yet
+  done.
 
 ## Diagnostics
 

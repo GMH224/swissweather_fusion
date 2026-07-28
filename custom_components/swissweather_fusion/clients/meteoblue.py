@@ -58,6 +58,38 @@ def is_scheduled_poll_time(*, local_dt: datetime) -> bool:
     return local_dt.hour in scheduled_hours_for_month(local_dt.month) and local_dt.minute == 0
 
 
+def should_fire_scheduled_call(
+    *, local_dt: datetime, last_scheduled_call_hour: Optional[datetime]
+) -> bool:
+    """True if local_dt is a scheduled slot AND a call hasn't already
+    fired for this same (date, hour) — extracted from the coordinator's
+    update loop specifically so this logic (including DST edge cases) is
+    directly unit-testable without needing Home Assistant installed. Pure
+    behavior-preserving extraction, not a change — same checks the
+    coordinator used to do inline.
+
+    Deliberately tolerant of the two DST edge cases rather than needing to
+    handle them with perfect precision: during a "spring forward" gap, the
+    skipped local hour simply never occurs, so no scheduled slot silently
+    gets skipped in a way that matters. During a "fall back" repeat, if a
+    scheduled hour happens to repeat, this compares only (date, hour), so
+    a call that already fired in the first occurrence of that hour will
+    correctly NOT fire again in the second occurrence — a missed second
+    attempt is an acceptable outcome (matches the wider project's
+    "gaps are fine, corruption/crashes are not" tolerance for this), not a
+    bug to engineer around further.
+    """
+    if not is_scheduled_poll_time(local_dt=local_dt):
+        return False
+    if (
+        last_scheduled_call_hour is not None
+        and last_scheduled_call_hour.hour == local_dt.hour
+        and last_scheduled_call_hour.date() == local_dt.date()
+    ):
+        return False
+    return True
+
+
 @dataclass
 class BonusCallTracker:
     """Tracks the one-bonus-call-per-storm-scenario allowance (const.py:

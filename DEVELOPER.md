@@ -1,5 +1,106 @@
 # Developer notes: architecture rationale
 
+## v0.1.6 — SRF going silent (hypothesis, not confirmed), and a real timezone bug
+
+Two issues found from a status check before v0.1.5 was even deployed —
+both from the still-running v0.1.4 instance, several hours after the SRF
+fix in that version had been confirmed working:
+
+**meteoblue's schedule was checked against UTC, not actual local time —
+confirmed, not a hypothesis.** In summer (CEST = UTC+2) this meant
+meteoblue was really polling at 14:00/18:00/22:00 local instead of the
+intended 12:00/16:00/20:00 — a genuine 2-hour offset. Fixed by using
+Home Assistant's own configured-timezone `now()` helper
+(`homeassistant.util.dt.now()`) instead of hardcoded UTC.
+
+**SRF's polling appeared to stop entirely, silently, for about 8 hours.**
+`last success` was frozen at an old timestamp while every other source
+(CH1/CH2/D2/CombiPrecip) showed fresh ones — but `consecutive_failures`
+was also stuck at 0, meaning it wasn't failing loudly either, just not
+running. At a 45-minute poll interval, roughly 10 attempts should have
+happened in that gap. The most coherent explanation for *all* of these
+symptoms together (frozen success, zero recorded failures, a notably
+slow 2.7s successful call earlier) is a network call hanging indefinitely
+rather than erroring — none of the SRF client's three HTTP calls (token
+exchange, geolocation lookup, forecast fetch) had an explicit timeout, so
+a stalled connection would leave the coordinator waiting forever instead
+of raising something catchable.
+
+**This is a reasoned hypothesis, explicitly not confirmed the way the
+URL/shape bugs were** — there was no log evidence of a hang, only the
+absence of any evidence of anything at all, which is itself the signature
+an indefinite hang would produce. Fixed defensively either way, since an
+HTTP call with no timeout is worth bounding regardless of whether it's
+the exact cause here:
+- Explicit `aiohttp.ClientTimeout(total=30)` added to all three of the
+  client's HTTP calls.
+- A second, coordinator-level `asyncio.timeout(60)` backstop around the
+  whole fetch, in case a hang happens somewhere other than those three
+  calls specifically (e.g. during the token-cache check).
+
+If SRF goes silent again after this, that will be real evidence the
+timeout hypothesis was wrong and something else is going on — worth
+explicitly watching for on the next check rather than assuming this is
+closed.
+
+**Also added (no version bump — test/robustness work, not a behavior
+change): explicit DST transition coverage.** Requested directly: verify
+neither a winter→summer nor summer→winter transition can crash the
+integration or corrupt learning data (a gap in updates during either is
+explicitly acceptable). Working through where this could actually matter:
+Model A's bucket keys and every stored timestamp are UTC-only by
+construction — UTC has no skipped or repeated hours, so there's nothing
+for DST to corrupt there, and a test now proves that directly (checking
+bucket derivation and storage/purge ordering across both 2026 transition
+instants) rather than leaving it as an unverified assumption. The one
+place genuine local-time logic exists is meteoblue's scheduling guard —
+extracted into a pure `should_fire_scheduled_call` function (behavior-
+preserving refactor, same logic the coordinator used to run inline) so
+both the spring-forward gap and the fall-back repeated hour could be
+exercised directly. Neither crashes; a repeated local hour is treated as
+"already handled" rather than firing twice, which is an accepted trade-off
+consistent with the wider project's "gaps are fine, corruption is not"
+tolerance, not something engineered around further.
+
+## v0.1.5 — real forecast, wind speed, a genuine architecture fix, and a caught unit bug
+
+Prompted by direct comparison against another integration's weather card:
+ours was missing wind speed (data already flowing through Model A's blend
+but never actually exposed) and the entire forecast section (removed
+outright in v0.1.2 rather than ship a never-resolving spinner). Both
+addressed properly rather than patched:
+
+- **`ModelABlendCoordinator`** (new) computes current values plus a real
+  168-hour (7-day) forecast in one batched executor job per 10-minute
+  refresh. This also fixes a real architectural bug: the weather entity
+  used to query the database directly and synchronously inside its
+  properties — every other part of this project routed DB access through
+  an executor job except this one had been doing blocking sqlite3 calls
+  on the event loop on every state read.
+- **Daily and twice-daily forecasts** are pure reshapes of the same
+  hourly data (`models/model_a.py`: `aggregate_daily_forecast`,
+  `aggregate_twice_daily_forecast`) — no extra database access, and both
+  now carry total precipitation in mm, not just the hourly rate, per a
+  direct request for that to be available at all three granularities.
+  A tautological bug in the twice-daily night-period boundary logic (both
+  branches of a conditional returned the same value) was caught by its
+  own regression test before ever shipping — worth noting since it's
+  exactly the kind of bug a quick correctness pass would have missed
+  without a test specifically targeting the early-morning boundary case.
+- **Wind speed unit mismatch, caught proactively while wiring this up**:
+  Open-Meteo defaults wind speed to km/h; meteoblue's confirmed test
+  response used values consistent with m/s. This had been silently
+  flowing into Model A's blend unused since wind speed was never actually
+  displayed — the moment it became visible on the card, the mismatch
+  would have shown up as a visibly wrong number. Fixed by explicitly
+  requesting m/s from Open-Meteo to match, same class of fix as the
+  earlier surface-vs-sea-level pressure bug.
+- Known simplification carried into this version: daily/twice-daily
+  grouping uses UTC calendar-day boundaries, not the configured local
+  timezone — hours near midnight can land in the "wrong" local day.
+  Threading the HA-configured timezone through is a reasonable follow-up,
+  not done here since it wasn't the immediate priority.
+
 ## v0.1.4 — SRF's third distinct failure, and a change in approach
 
 After the URL fix in v0.1.3, SRF got past the 404 and reached real parsing

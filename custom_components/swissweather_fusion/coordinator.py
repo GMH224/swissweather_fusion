@@ -15,6 +15,7 @@ loop.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 import time
@@ -24,14 +25,16 @@ from typing import Any, Optional
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .clients.combiprecip import CombiPrecipClient
-from .clients.meteoblue import BonusCallTracker, MeteoblueClient, is_scheduled_poll_time
+from .clients.meteoblue import BonusCallTracker, MeteoblueClient, should_fire_scheduled_call
 from .clients.meteonomiqs import AnnualCallBudget, MeteonomiqsClient, needs_keepalive_call
 from .clients.open_meteo import OpenMeteoClient
 from .clients.srf import SrfClient
 from .health import SourceHealth
 from .const import (
+    ALL_FORECAST_SOURCES,
     METEONOMIQS_ANNUAL_CALL_BUDGET,
     METEONOMIQS_FORECAST_CALL_HOUR_LOCAL,
     METEONOMIQS_FORECAST_SEASON_MONTHS,
@@ -168,9 +171,17 @@ class SrfCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> list[Any]:
         start = time.monotonic()
         try:
-            points = await self._client.async_fetch_forecast(
-                latitude=self._latitude, longitude=self._longitude
-            )
+            # v0.1.6: an outer backstop timeout, in addition to the
+            # per-request timeouts added in the client itself — belt and
+            # suspenders against a hang happening somewhere other than
+            # the three explicit HTTP calls (e.g. during the token cache
+            # check, or a retry loop), given the whole point is to never
+            # again see a coordinator silently stop updating with no
+            # error recorded.
+            async with asyncio.timeout(60):
+                points = await self._client.async_fetch_forecast(
+                    latitude=self._latitude, longitude=self._longitude
+                )
         except Exception as err:  # noqa: BLE001
             duration_ms = (time.monotonic() - start) * 1000
             kind = self.health.record_error(err, duration_ms=duration_ms)
@@ -255,18 +266,17 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
         await self.hass.async_add_executor_job(self._db.insert_forecast_snapshots_bulk, rows)
 
     async def _async_update_data(self) -> None:
-        # local_dt should use the configured HA timezone; UTC is used here
-        # as the simplest correct default — see DEVELOPER.md if local-time
-        # scheduling behaves unexpectedly across a DST transition.
-        local_dt = datetime.now(timezone.utc)
-        if not is_scheduled_poll_time(local_dt=local_dt):
-            return None
-        # Guard against firing twice within the same scheduled hour, since
-        # this coordinator checks every 5 minutes.
-        if (
-            self._last_scheduled_call_hour is not None
-            and self._last_scheduled_call_hour.hour == local_dt.hour
-            and self._last_scheduled_call_hour.date() == local_dt.date()
+        # v0.1.6 fix: this used hardcoded UTC ("local_dt" was a misnomer —
+        # it wasn't local at all). In summer (CEST = UTC+2), that meant
+        # meteoblue was actually polling at 14:00/18:00/22:00 local time
+        # instead of the intended 12:00/16:00/20:00 — a real 2-hour
+        # scheduling offset, caught from a production log showing
+        # meteoblue hadn't polled yet at a time it should have. Now uses
+        # HA's own configured-timezone "now" helper, the standard pattern
+        # for this rather than assuming UTC equals local time.
+        local_dt = dt_util.now()
+        if not should_fire_scheduled_call(
+            local_dt=local_dt, last_scheduled_call_hour=self._last_scheduled_call_hour
         ):
             return None
         try:
@@ -485,6 +495,141 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
             # data-fetch error elsewhere in this system.
             _LOGGER.error("Meteonomiqs keep-alive call failed: %s", err)
         return None
+
+
+class ModelABlendCoordinator(DataUpdateCoordinator):
+    """Computes Model A's blended values — both "now" and a genuine
+    multi-hour forecast — in one batched executor job per refresh cycle.
+
+    **v0.1.5 fix**: this replaces logic that used to live directly in
+    weather.py's entity properties, which queried the database
+    synchronously on the event loop — every other part of this project
+    routes DB access through an executor job except that one. Moving the
+    computation here, run once per refresh rather than once per property
+    read, fixes that and is also what makes a real hourly forecast
+    practical: computing 48 hours × 5 measurements as 240 individual
+    blocking property-reads would have been much worse than the same
+    work batched into one executor job.
+
+    Also the home of wind_speed exposure, which was already flowing
+    through Model A's blend (every client already reports it) but was
+    never actually surfaced on the weather entity — data that existed
+    with nothing reading it.
+    """
+
+    MEASUREMENTS = ("temperature", "humidity", "pressure", "precip", "wind_speed")
+    # 7 days rather than 2 — needed for meaningful daily/twice-daily
+    # coverage (added alongside precipitation-in-mm for those views), and
+    # matches roughly CH2/meteoblue's own horizons. Sources with shorter
+    # horizons (CH1's ~33-45h) simply taper off within this window rather
+    # than every hour having full coverage from every source.
+    FORECAST_HOURS_AHEAD = 168
+
+    def __init__(self, hass: HomeAssistant, db: SwissWeatherDB) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="swissweather_fusion_blend",
+            update_interval=timedelta(minutes=10),
+        )
+        self._db = db
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        return await self.hass.async_add_executor_job(self._compute_blend)
+
+    def _blend_at(self, measurement: str, target_hour: datetime) -> Optional[float]:
+        """Synchronous — only ever called from inside _compute_blend,
+        which itself only ever runs inside the executor job above. Same
+        logic that used to live in weather.py, relocated rather than
+        rewritten, since the logic itself was already correct — only
+        where it ran was the problem.
+        """
+        from .models import model_a
+        from .storage.db import BucketKey
+
+        hour_of_day = target_hour.hour
+        season = model_a.derive_season(target_hour)
+        target_iso = target_hour.replace(minute=0, second=0, microsecond=0).isoformat()
+
+        contributions: list[model_a.SourceContribution] = []
+        for source in ALL_FORECAST_SOURCES:
+            rows = self._db.get_forecast_values_for_valid_at(
+                source=source, variable=measurement, valid_at=target_iso
+            )
+            if not rows:
+                continue
+            latest_row = rows[0]  # already ordered by issued_at DESC
+            issued_at = datetime.fromisoformat(latest_row["issued_at"])
+            lead_time_bucket = model_a.derive_lead_time_bucket(issued_at, target_hour)
+            bucket = self._db.get_bucket_stats(
+                BucketKey(
+                    hour_of_day=hour_of_day,
+                    season=season,
+                    lead_time_bucket=lead_time_bucket,
+                    source=source,
+                    measurement=measurement,
+                )
+            )
+            if bucket is None:
+                contributions.append(
+                    model_a.SourceContribution(
+                        source=source, raw_value=latest_row["value"],
+                        ema_bias=0.0, ema_weight=1.0, sample_count=0,
+                    )
+                )
+            else:
+                contributions.append(
+                    model_a.SourceContribution(
+                        source=source, raw_value=latest_row["value"],
+                        ema_bias=bucket.ema_bias, ema_weight=bucket.ema_weight,
+                        sample_count=bucket.sample_count,
+                    )
+                )
+        return model_a.blend(contributions)
+
+    def _compute_blend(self) -> dict[str, Any]:
+        from .models import model_a
+
+        now = model_a.utcnow().replace(minute=0, second=0, microsecond=0)
+
+        current = {m: self._blend_at(m, now) for m in self.MEASUREMENTS}
+
+        hourly_forecast: list[dict[str, Any]] = []
+        for i in range(self.FORECAST_HOURS_AHEAD):
+            target = now + timedelta(hours=i)
+            temperature = self._blend_at("temperature", target)
+            humidity = self._blend_at("humidity", target)
+            pressure = self._blend_at("pressure", target)
+            precip = self._blend_at("precip", target)
+            wind_speed = self._blend_at("wind_speed", target)
+            # Skip hours with literally nothing from any source — no
+            # point showing an all-None row, and sources with shorter
+            # horizons (CH1's ~33-45h) will naturally taper off within
+            # this 48h window rather than every hour having full coverage.
+            if all(v is None for v in (temperature, humidity, pressure, precip, wind_speed)):
+                continue
+            hourly_forecast.append(
+                {
+                    "datetime": target.isoformat(),
+                    "native_temperature": temperature,
+                    "humidity": humidity,
+                    "native_pressure": pressure,
+                    "native_precipitation": precip,
+                    "native_wind_speed": wind_speed,
+                    "condition": "rainy" if (precip or 0) > 0.1 else "sunny",
+                }
+            )
+
+        return {
+            "current": current,
+            "hourly_forecast": hourly_forecast,
+            # Built from the same hourly data above — no extra DB access,
+            # just reshaped, per the request to have precipitation (mm)
+            # available at daily and twice-daily granularity too, not just
+            # hourly.
+            "daily_forecast": model_a.aggregate_daily_forecast(hourly_forecast),
+            "twice_daily_forecast": model_a.aggregate_twice_daily_forecast(hourly_forecast),
+        }
 
 
 class ModelBCoordinator(DataUpdateCoordinator):

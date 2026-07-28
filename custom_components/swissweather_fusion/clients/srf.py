@@ -24,7 +24,25 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+import aiohttp
+
 _LOGGER = logging.getLogger(__name__)
+
+# v0.1.6: none of this client's three HTTP calls (token exchange,
+# geolocation lookup, forecast fetch) had an explicit timeout. Found after
+# SRF's polling appeared to silently stop entirely for several hours in
+# production — last_success frozen, but consecutive_failures also stuck
+# at 0 (i.e. not failing loudly either), which is the signature of a
+# request hanging forever rather than erroring. This is a reasoned
+# hypothesis based on that symptom pattern, not a confirmed root cause
+# the way the URL/shape fixes were — but an unbounded HTTP call is worth
+# fixing regardless of whether it's the exact cause here.
+REQUEST_TIMEOUT_SECONDS = 30
+
+
+def _client_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+
 
 TOKEN_URL = "https://api.srgssr.ch/oauth/v1/accesstoken?grant_type=client_credentials"
 # v0.1.3 fix: both URLs below had an incorrect /v2/ path segment, and the
@@ -184,7 +202,10 @@ class SrfClient:
                     self._consumer_key, self._consumer_secret
                 )
             }
-            async with self._session.post(TOKEN_URL, headers=headers) as resp:
+            timeout = _client_timeout()
+            async with self._session.post(
+                TOKEN_URL, headers=headers, timeout=timeout
+            ) as resp:
                 resp.raise_for_status()
                 payload = await resp.json()
             access_token = parse_token_response(payload)
@@ -206,7 +227,7 @@ class SrfClient:
         headers = {"Authorization": f"Bearer {token}"}
         params = {"latitude": latitude, "longitude": longitude}
         async with self._session.get(
-            GEOLOCATION_URL, headers=headers, params=params
+            GEOLOCATION_URL, headers=headers, params=params, timeout=_client_timeout()
         ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
@@ -233,7 +254,9 @@ class SrfClient:
         geolocation_id = await self._async_ensure_geolocation_id(latitude, longitude)
         headers = {"Authorization": f"Bearer {token}"}
         url = build_forecast_url(geolocation_id)
-        async with self._session.get(url, headers=headers) as resp:
+        async with self._session.get(
+            url, headers=headers, timeout=_client_timeout()
+        ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
         points = parse_forecast_response(payload)

@@ -118,6 +118,17 @@ def test_pressure_requests_sea_level_not_surface():
     assert pressures[0].value == 1013.2
 
 
+def test_wind_speed_requests_meters_per_second_not_kmh():
+    """v0.1.5 regression test: Open-Meteo defaults wind speed to km/h, but
+    meteoblue's confirmed test response used values (0.94, 1.85, etc.)
+    consistent with m/s — a real cross-source unit mismatch that would
+    have become visible the moment wind speed was actually exposed on the
+    weather card (it previously flowed into Model A's blend unused).
+    """
+    url = om.build_forecast_url(source="ch1", latitude=TEST_LAT, longitude=TEST_LON)
+    assert "wind_speed_unit=ms" in url
+
+
 def test_parse_elevation_response():
     assert om.parse_elevation_response({"elevation": [543.0]}) == 543.0
     assert om.parse_elevation_response({"elevation": []}) is None

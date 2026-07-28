@@ -30,6 +30,7 @@ from .coordinator import (
     CombiPrecipCoordinator,
     MeteoblueCoordinator,
     MeteonomiqsCoordinator,
+    ModelABlendCoordinator,
     ModelBCoordinator,
     OpenMeteoCoordinator,
     SrfCoordinator,
@@ -107,6 +108,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         meteoblue_coordinator,
         meteonomiqs_coordinator,
     )
+    # v0.1.5: computes Model A's current values + hourly/daily/twice-daily
+    # forecast in one batched executor job — see coordinator.py for why
+    # this replaced logic that used to live directly in weather.py.
+    blend_coordinator = ModelABlendCoordinator(hass, db)
 
     # First refresh for each. **Fixed in v0.1.1**: this used to be a bare
     # loop where any single coordinator raising (e.g. the SRF crash) would
@@ -147,6 +152,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "Initial Model B scoring failed, will retry on its own schedule: %s", err
         )
 
+    try:
+        await blend_coordinator.async_config_entry_first_refresh()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning(
+            "Initial Model A blend computation failed, will retry on its own "
+            "schedule: %s",
+            err,
+        )
+
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
         "db": db,
@@ -160,6 +174,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "combiprecip_coordinator": combiprecip_coordinator,
         "meteonomiqs_coordinator": meteonomiqs_coordinator,
         "model_b_coordinator": model_b_coordinator,
+        "blend_coordinator": blend_coordinator,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

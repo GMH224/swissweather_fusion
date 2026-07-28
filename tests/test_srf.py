@@ -6,6 +6,17 @@ import pytest
 from swissweather_fusion.clients import srf
 
 
+def test_client_timeout_configured():
+    """v0.1.6: confirms the timeout helper actually produces a bounded
+    timeout, added after SRF's polling appeared to silently stop for
+    several hours in production with no failure recorded — consistent
+    with a hung request rather than an error.
+    """
+    timeout = srf._client_timeout()
+    assert timeout.total == srf.REQUEST_TIMEOUT_SECONDS
+    assert timeout.total is not None and timeout.total > 0
+
+
 def test_build_basic_auth_header():
     header = srf.build_basic_auth_header("mykey", "mysecret")
     assert header.startswith("Basic ")

@@ -77,6 +77,12 @@ def _install_homeassistant_stubs() -> None:
     update_coordinator.UpdateFailed = type("UpdateFailed", (Exception,), {})
     update_coordinator.CoordinatorEntity = type("CoordinatorEntity", (), {"__init__": lambda self, *a, **kw: None})
 
+    util = _module("homeassistant.util")
+    util.__path__ = []
+    dt_util = _module("homeassistant.util.dt")
+    from datetime import datetime as _datetime, timezone as _timezone
+    dt_util.now = lambda: _datetime.now(_timezone.utc)
+
     entity_platform = _module("homeassistant.helpers.entity_platform")
     entity_platform.AddEntitiesCallback = object
 

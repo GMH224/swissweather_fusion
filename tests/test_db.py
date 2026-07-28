@@ -102,3 +102,43 @@ def test_purge_touches_only_high_volume_tables(db):
     # Never purged, regardless of cutoff:
     assert db.get_bucket_stats(key) is not None
     assert len(db.get_all_storm_events()) == 1
+
+
+def test_storage_ordering_unaffected_by_dst_transition_instant(db):
+    """Requested edge cases: winter->summer and summer->winter transitions.
+    All storage here is UTC ISO8601 strings — since UTC has no DST, there
+    is nothing for a "transition" to disrupt at the storage layer. This
+    test proves that directly: inserting a continuous run of hourly
+    station observations spanning the exact UTC instant of both 2026
+    European DST transitions, then confirming purge_older_than's simple
+    string-comparison cutoff still keeps/deletes exactly the rows it
+    should — no corruption, no ordering surprises, no crash.
+    """
+    # Spring-forward instant is 2026-03-29T01:00:00Z (Europe/Zurich
+    # switches CET->CEST). Insert a run of hours straddling it.
+    spring_hours = [
+        f"2026-03-29T{h:02d}:00:00+00:00" for h in range(0, 4)
+    ]
+    for ts in spring_hours:
+        db.insert_station_observation(ts, 10.0, 60.0, 1015.0)
+
+    # Fall-back instant is 2026-10-25T01:00:00Z (Europe/Zurich switches
+    # CEST->CET). Insert a run of hours straddling it too.
+    fall_hours = [
+        f"2026-10-25T{h:02d}:00:00+00:00" for h in range(0, 4)
+    ]
+    for ts in fall_hours:
+        db.insert_station_observation(ts, 8.0, 65.0, 1018.0)
+
+    all_rows = db.get_station_observations_since("2026-01-01T00:00:00+00:00")
+    assert len(all_rows) == 8  # all 8 inserts present, nothing silently lost
+
+    # Purge everything before the fall-back run — should remove exactly
+    # the 4 spring-transition rows, keep exactly the 4 fall-transition
+    # rows. A plain ISO8601 UTC string comparison has no DST ambiguity to
+    # get this wrong.
+    deleted = db.purge_older_than("2026-10-25T00:00:00+00:00")
+    assert deleted["station_observations"] == 4
+    remaining = db.get_station_observations_since("2026-01-01T00:00:00+00:00")
+    assert len(remaining) == 4
+    assert all(row["ts"].startswith("2026-10-25") for row in remaining)

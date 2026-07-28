@@ -14,7 +14,8 @@ values. This separation is what makes the module trivially unit-testable
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
 
 from ..const import (
     EMA_ALPHA_BY_LEAD_TIME,
@@ -200,3 +201,91 @@ def apply_lapse_rate_precorrection(
 def utcnow() -> datetime:
     """Single source of truth for "now" in tests and production alike."""
     return datetime.now(timezone.utc)
+
+
+def aggregate_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Groups the already-computed hourly blend entries into daily
+    high/low temperature and total precipitation — no additional data
+    access needed, this is purely a reshaping of what the hourly
+    forecast already produced.
+
+    **Known simplification**: groups by UTC calendar day, not the
+    configured local timezone. Hours near midnight can land in the
+    "wrong" local day as a result. Correcting this needs the HA-configured
+    timezone threaded through, which is straightforward to add later but
+    was not the priority for the first real version of this feature.
+    """
+    by_day: dict[Any, list[dict[str, Any]]] = {}
+    for entry in hourly_forecast:
+        day = datetime.fromisoformat(entry["datetime"]).date()
+        by_day.setdefault(day, []).append(entry)
+
+    results: list[dict[str, Any]] = []
+    for day in sorted(by_day):
+        entries = by_day[day]
+        temps = [e["native_temperature"] for e in entries if e["native_temperature"] is not None]
+        precips = [
+            e["native_precipitation"] for e in entries if e["native_precipitation"] is not None
+        ]
+        total_precip = sum(precips) if precips else None
+        results.append(
+            {
+                "datetime": datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc).isoformat(),
+                "native_temperature": max(temps) if temps else None,
+                "native_templow": min(temps) if temps else None,
+                "native_precipitation": total_precip,
+                "condition": "rainy" if (total_precip or 0) > 0.5 else "sunny",
+            }
+        )
+    return results
+
+
+# UTC-hour boundaries for the day/night split — same "not localized yet"
+# simplification as aggregate_daily_forecast above.
+TWICE_DAILY_DAY_START_HOUR = 6
+TWICE_DAILY_DAY_END_HOUR = 18
+
+
+def aggregate_twice_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Splits each day into a daytime period (06:00-18:00 UTC) and a
+    nighttime period (18:00-06:00 UTC), each with its own representative
+    temperature and total precipitation — same source data as the daily
+    aggregation above, just grouped differently.
+    """
+    by_period: dict[tuple[Any, bool], list[dict[str, Any]]] = {}
+    for entry in hourly_forecast:
+        dt = datetime.fromisoformat(entry["datetime"])
+        is_daytime = TWICE_DAILY_DAY_START_HOUR <= dt.hour < TWICE_DAILY_DAY_END_HOUR
+        if is_daytime:
+            period_day = dt.date()
+        elif dt.hour >= TWICE_DAILY_DAY_END_HOUR:
+            period_day = dt.date()  # night period starting this evening
+        else:
+            # Early-morning hours (00:00-05:59) are the tail end of the
+            # *previous* day's overnight period, not a new one starting
+            # at midnight — this branch was a no-op bug initially (both
+            # sides of the condition returned dt.date()), caught before
+            # ever shipping.
+            period_day = dt.date() - timedelta(days=1)
+        by_period.setdefault((period_day, is_daytime), []).append(entry)
+
+    results: list[dict[str, Any]] = []
+    for (day, is_daytime), entries in sorted(by_period.items(), key=lambda kv: (kv[0][0], not kv[0][1])):
+        temps = [e["native_temperature"] for e in entries if e["native_temperature"] is not None]
+        precips = [
+            e["native_precipitation"] for e in entries if e["native_precipitation"] is not None
+        ]
+        total_precip = sum(precips) if precips else None
+        period_start_hour = TWICE_DAILY_DAY_START_HOUR if is_daytime else TWICE_DAILY_DAY_END_HOUR
+        results.append(
+            {
+                "datetime": datetime.combine(
+                    day, datetime.min.time(), tzinfo=timezone.utc
+                ).replace(hour=period_start_hour).isoformat(),
+                "is_daytime": is_daytime,
+                "native_temperature": max(temps) if temps else None,
+                "native_precipitation": total_precip,
+                "condition": "rainy" if (total_precip or 0) > 0.5 else "sunny",
+            }
+        )
+    return results
