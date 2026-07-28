@@ -54,14 +54,22 @@ def parse_token_response(payload: dict[str, Any]) -> str:
     return token
 
 
-def parse_geolocation_response(payload: dict[str, Any]) -> Optional[str]:
-    """SRF's geolocation search returns a list; take the closest match.
+def parse_geolocation_response(payload: Any) -> Optional[str]:
+    """SRF's geolocation search returns matches; take the closest one.
 
-    Exact response shape not yet confirmed against a live call (flagged in
-    the plan doc as still outstanding) — this parses the documented shape
-    and should be revisited against a real response before relying on it.
+    **Fixed in v0.1.1**: this crashed in production with 'list' object has
+    no attribute 'get' — the actual response is very likely a bare JSON
+    array at the top level, not the dict-wrapped shape
+    ({"geolocations": [...]}) this originally assumed from documentation
+    alone, never verified against a live call before deployment (flagged
+    as an outstanding item at the time). Handles both shapes now rather
+    than gambling on which one is actually correct, since the raw
+    response body wasn't captured to confirm definitively.
     """
-    results = payload.get("geolocations") or payload.get("results") or []
+    if isinstance(payload, list):
+        results = payload
+    else:
+        results = payload.get("geolocations") or payload.get("results") or []
     if not results:
         return None
     first = results[0]
@@ -88,9 +96,15 @@ class SrfForecastPoint:
     value: Optional[float]
 
 
-def parse_forecast_response(payload: dict[str, Any]) -> list[SrfForecastPoint]:
+def parse_forecast_response(payload: Any) -> list[SrfForecastPoint]:
+    """**Fixed in v0.1.1**: same defensive fix as parse_geolocation_response
+    above, for the same reason — handles both a bare top-level list and a
+    dict wrapping one, since the actual shape wasn't confirmed before the
+    crash that surfaced this.
+    """
+    entries = payload if isinstance(payload, list) else payload.get("forecast", [])
     points: list[SrfForecastPoint] = []
-    for entry in payload.get("forecast", []):
+    for entry in entries:
         valid_at_str = entry.get("localDateTime") or entry.get("time")
         if not valid_at_str:
             continue

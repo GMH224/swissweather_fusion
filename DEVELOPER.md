@@ -1,5 +1,49 @@
 # Developer notes: architecture rationale
 
+## v0.1.1 — first deployment, four real bugs found and fixed
+
+The first actual HA deployment surfaced four issues, none of which showed
+up in the unit test suite — a useful reminder of exactly the limitation
+flagged in "Testing philosophy" below: the pure logic was verified, the
+HA-integration layer and the live third-party APIs were not, until now.
+
+1. **CH1/CH2 requests all failed with 400 Bad Request.** The Open-Meteo
+   model identifiers (`icon_ch1_eps`, `icon_ch2_eps`) were invented
+   plausible-looking names, never actually checked against Open-Meteo's
+   docs. The real values are `meteoswiss_icon_ch1` / `meteoswiss_icon_ch2`.
+   ICON-D2's identifier (`dwd_icon_d2`) happened to already be correct.
+   Fixed, and the client now also surfaces Open-Meteo's actual JSON error
+   `reason` field on a 400 instead of a bare status code, so a mistake
+   like this is immediately diagnosable next time rather than requiring a
+   documentation re-check.
+2. **SRF crashed with `'list' object has no attribute 'get'`.** The
+   geolocation and forecast response parsers assumed a dict-wrapped shape
+   that was never verified against a live call (flagged as an outstanding
+   item since planning). The actual shape is very likely a bare JSON array
+   at the top level. Both parsers now handle either shape.
+3. **The whole integration reported "failed setup, will retry" because of
+   bug #2 alone.** `__init__.py` ran each coordinator's first refresh in a
+   plain sequential loop — one coordinator raising (SRF) propagated all
+   the way up and failed `async_setup_entry` entirely, taking down
+   station/meteoblue/CombiPrecip/Meteonomiqs too, even though those would
+   have worked. This is exactly the opposite of the graceful-degradation
+   principle the whole project was designed around, just never actually
+   implemented at the setup level. Each coordinator's first refresh is now
+   isolated in its own try/except; a failure logs a clear warning and
+   setup continues with everything else.
+4. **The pressure entity selector silently excluded valid sensors.** The
+   config flow filtered on `device_class="pressure"` only. Real-world
+   integrations like Netatmo use the newer, more specific
+   `atmospheric_pressure` class instead — both describe the same kind of
+   sensor, just under HA's older vs. newer taxonomy. The selector now
+   accepts either. Temperature and humidity were checked too:
+   temperature has no equivalent split, and humidity's second class
+   (`absolute_humidity`) measures a different physical quantity (g/m³, not
+   %) — adding it would have introduced a bug, not fixed one, so those two
+   were deliberately left alone.
+
+## Architecture rationale (v0.1 design)
+
 This document is the "why" behind decisions referenced throughout the
 code's docstrings. It exists because a design this opinionated is easy to
 accidentally un-fix during future changes if the reasoning isn't written

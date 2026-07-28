@@ -22,8 +22,15 @@ FORECAST_BASE_URL = "https://api.open-meteo.com/v1/forecast"
 ELEVATION_BASE_URL = "https://api.open-meteo.com/v1/elevation"
 
 MODEL_PARAM = {
-    "ch1": "icon_ch1_eps",
-    "ch2": "icon_ch2_eps",
+    # Corrected in v0.1.1: these were invented plausible-looking names
+    # (icon_ch1_eps/icon_ch2_eps) rather than checked against Open-Meteo's
+    # actual docs, causing every CH1/CH2 request to 400. The real values
+    # confirmed from open-meteo.com/en/docs/meteoswiss-api:
+    "ch1": "meteoswiss_icon_ch1",
+    "ch2": "meteoswiss_icon_ch2",
+    # dwd_icon_d2 was already correct — matches the dwd_icon_seamless/
+    # dwd_icon_eu/dwd_icon_d2 naming pattern confirmed on DWD's own docs
+    # page, so this one needed no change.
     "icon_d2": "dwd_icon_d2",
 }
 
@@ -117,6 +124,20 @@ def parse_elevation_response(payload: dict[str, Any]) -> Optional[float]:
     return float(elevations[0])
 
 
+def extract_error_reason(payload: dict[str, Any]) -> Optional[str]:
+    """Open-Meteo's error responses include a human-readable "reason"
+    field (e.g. "Cannot initialize model from invalid String value
+    icon_ch1_eps for key models") — surfacing this instead of just an
+    HTTP status code is exactly what would have made the wrong model
+    identifier bug (v0.1.1) immediately obvious in the logs, rather than a
+    bare "400, message='Bad Request'" with no indication of which
+    parameter was wrong.
+    """
+    if payload.get("error"):
+        return payload.get("reason")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Async I/O — thin wrapper, kept separate from the pure functions above.
 # ---------------------------------------------------------------------------
@@ -135,6 +156,14 @@ class OpenMeteoClient:
     ) -> ParsedForecast:
         url = build_forecast_url(source=source, latitude=latitude, longitude=longitude)
         async with self._session.get(url) as resp:
+            if resp.status == 400:
+                # Read the body before raise_for_status discards it — this
+                # is what should have caught the v0.1.1 wrong-model-name
+                # bug immediately instead of a bare "400 Bad Request".
+                error_payload = await resp.json()
+                reason = extract_error_reason(error_payload)
+                if reason:
+                    raise ValueError(f"Open-Meteo rejected the request: {reason}")
             resp.raise_for_status()
             payload = await resp.json()
         return parse_forecast_response(payload)

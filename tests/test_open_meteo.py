@@ -9,8 +9,32 @@ TEST_LAT, TEST_LON = 46.9480, 7.4474
 
 def test_build_forecast_url():
     url = om.build_forecast_url(source="ch1", latitude=TEST_LAT, longitude=TEST_LON)
-    assert "models=icon_ch1_eps" in url
+    # v0.1.1: was icon_ch1_eps — a plausible-looking guess never checked
+    # against Open-Meteo's actual docs, which caused every CH1 request to
+    # 400 in the first real deployment. Confirmed correct value below.
+    assert "models=meteoswiss_icon_ch1" in url
     assert f"latitude={TEST_LAT}" in url
+
+
+def test_build_forecast_url_all_three_models_use_confirmed_identifiers():
+    ch2_url = om.build_forecast_url(source="ch2", latitude=TEST_LAT, longitude=TEST_LON)
+    d2_url = om.build_forecast_url(source="icon_d2", latitude=TEST_LAT, longitude=TEST_LON)
+    assert "models=meteoswiss_icon_ch2" in ch2_url
+    # dwd_icon_d2 was already correct before v0.1.1 — confirms it wasn't
+    # touched by the CH1/CH2 fix.
+    assert "models=dwd_icon_d2" in d2_url
+
+
+def test_extract_error_reason():
+    error_payload = {
+        "error": True,
+        "reason": "Cannot initialize model from invalid String value icon_ch1_eps for key models",
+    }
+    assert om.extract_error_reason(error_payload) == (
+        "Cannot initialize model from invalid String value icon_ch1_eps for key models"
+    )
+    assert om.extract_error_reason({"error": False}) is None
+    assert om.extract_error_reason({}) is None
 
 
 def test_build_forecast_url_rejects_unknown_source():

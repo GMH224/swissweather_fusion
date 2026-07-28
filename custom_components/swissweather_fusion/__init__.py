@@ -87,9 +87,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         meteonomiqs_coordinator,
     )
 
-    # First refresh for each — failures here surface to the user during
-    # setup rather than silently, per the engineering-standards commitment
-    # to a real audit trail (plan doc §12/DEVELOPER.md).
+    # First refresh for each. **Fixed in v0.1.1**: this used to be a bare
+    # loop where any single coordinator raising (e.g. the SRF crash) would
+    # propagate all the way up and fail async_setup_entry entirely — HA
+    # then reports the *whole integration* as "failed setup, will retry",
+    # even though station/meteoblue/CombiPrecip/etc. would have worked
+    # fine. That's exactly the opposite of the graceful-degradation
+    # principle this project was designed around (plan doc §6/§12,
+    # DEVELOPER.md) — one flaky source should degrade, not take everything
+    # down with it. Each coordinator's first refresh is now isolated: a
+    # failure is logged clearly and that coordinator simply starts with no
+    # data (its entities show unavailable/unknown until its own next
+    # scheduled refresh succeeds), rather than blocking setup for sources
+    # that are working.
     for coordinator in (
         station_coordinator,
         open_meteo_coordinator,
@@ -98,8 +108,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         combiprecip_coordinator,
         meteonomiqs_coordinator,
     ):
-        await coordinator.async_config_entry_first_refresh()
-    await model_b_coordinator.async_config_entry_first_refresh()
+        try:
+            await coordinator.async_config_entry_first_refresh()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Initial refresh failed for %s, continuing setup with the "
+                "other sources — this coordinator will retry on its own "
+                "schedule: %s",
+                coordinator.name,
+                err,
+            )
+
+    try:
+        await model_b_coordinator.async_config_entry_first_refresh()
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning(
+            "Initial Model B scoring failed, will retry on its own schedule: %s", err
+        )
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {

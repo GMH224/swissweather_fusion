@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icons/icon.png" width="128" height="128" alt="SwissWeather Fusion icon">
+</p>
+
 # SwissWeather Fusion
 
 A Home Assistant integration that fuses multiple weather forecast sources —
@@ -9,11 +13,15 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.1.** The core architecture is built and the business logic
-(bias correction, storm scoring, radar sampling) is unit-tested. It has
-not yet been run against a live Home Assistant instance or the real
-external APIs — see [DEVELOPER.md](DEVELOPER.md) for exactly what's
-verified versus what still needs a first real run.
+**Status: v0.1.1.** The core architecture is built and the business logic
+(bias correction, storm scoring, radar sampling) is unit-tested. The first
+real deployment against a live Home Assistant instance found four bugs
+(wrong Open-Meteo model names, an SRF response-shape crash, a setup
+sequencing issue that let one failing source block the whole integration,
+and an overly-narrow pressure sensor filter) — all fixed, see
+[DEVELOPER.md](DEVELOPER.md) for the full account. Continued real-world
+testing is still the priority; this is one deployment cycle in, not a
+mature, battle-tested release.
 
 ## What this does
 
@@ -55,6 +63,20 @@ forecasts (a technique called Model Output Statistics).
    "SwissWeather Fusion".
 4. Follow the setup steps: location & elevation, local station sensors,
    then the four API credentials.
+
+### About the icon
+
+`icons/icon.png` (256×256) and `icons/icon@2x.png` (512×512) are included,
+sized to match the [home-assistant/brands](https://github.com/home-assistant/brands)
+convention. Worth being upfront about a real limitation here: for a
+private/custom HACS repository (added manually, not the default HACS
+store), there isn't a way to make this icon show natively next to the
+integration in HA's own Settings → Devices & Services list or HACS's
+store UI — that specific placement is sourced from the `brands` repository,
+which requires submitting a PR there and is really only appropriate once
+this is a public, stable, more broadly-used integration. Until then, the
+icon displays wherever this repo's README is rendered (HACS's own repo
+info page, GitHub itself), which is what's set up above.
 
 ## Configuration notes
 

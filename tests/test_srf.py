@@ -39,6 +39,16 @@ def test_parse_geolocation_response():
     assert srf.parse_geolocation_response({}) is None
 
 
+def test_parse_geolocation_response_bare_list_v0_1_1_fix():
+    """v0.1.1: production crashed with 'list' object has no attribute
+    'get' — the actual SRF response is very likely a bare top-level array,
+    not the dict-wrapped shape originally guessed from documentation
+    alone. This is the fix, confirmed against the specific failure mode.
+    """
+    assert srf.parse_geolocation_response([{"geolocationId": "GL789"}]) == "GL789"
+    assert srf.parse_geolocation_response([]) is None
+
+
 def test_parse_forecast_response():
     payload = {
         "forecast": [
@@ -60,3 +70,13 @@ def test_parse_forecast_response():
     assert len(points) == 6  # 3 fields x 2 timesteps
     temps = [p for p in points if p.variable == "temperature"]
     assert temps[0].value == 21.0
+
+
+def test_parse_forecast_response_bare_list_v0_1_1_fix():
+    """Same defensive fix as the geolocation parser, same reason."""
+    payload = [
+        {"localDateTime": "2026-07-25T12:00:00", "temperature": 21.0},
+    ]
+    points = srf.parse_forecast_response(payload)
+    assert len(points) == 1
+    assert points[0].value == 21.0

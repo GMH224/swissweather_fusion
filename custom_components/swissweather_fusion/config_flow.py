@@ -114,7 +114,15 @@ class SwissWeatherFusionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     selector.EntitySelectorConfig(domain="sensor", device_class="humidity")
                 ),
                 vol.Required(CONF_STATION_PRESSURE_ENTITY): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor", device_class="pressure")
+                    # Fixed in v0.1.1: was device_class="pressure" only,
+                    # which silently excluded sensors using the more
+                    # specific atmospheric_pressure class (e.g. Netatmo) —
+                    # both classes cover the same weather-pressure sensors,
+                    # just categorized under HA's newer, more specific
+                    # taxonomy for some integrations.
+                    selector.EntitySelectorConfig(
+                        domain="sensor", device_class=["pressure", "atmospheric_pressure"]
+                    )
                 ),
             }
         )
@@ -237,7 +245,11 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                         self._config_entry.data.get(CONF_STATION_PRESSURE_ENTITY),
                     ),
                 ): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor", device_class="pressure")
+                    # Same fix as the initial setup step — see there for
+                    # the full explanation.
+                    selector.EntitySelectorConfig(
+                        domain="sensor", device_class=["pressure", "atmospheric_pressure"]
+                    )
                 ),
                 vol.Required(
                     CONF_PURGE_DAYS, default=current.get(CONF_PURGE_DAYS, DEFAULT_PURGE_DAYS)
