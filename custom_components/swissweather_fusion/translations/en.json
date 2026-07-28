@@ -1,0 +1,62 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "SwissWeather Fusion — Location",
+        "description": "Coordinates only (never a postal code) — precision here matters for the microclimate correction this integration does. Defaults to your Home Assistant home location. Elevation is looked up automatically; enter a value below only if you have a more precise one (e.g. from a differential GPS survey).",
+        "data": {
+          "latitude": "Latitude",
+          "longitude": "Longitude",
+          "elevation_override": "Elevation override (meters, optional)"
+        }
+      },
+      "station": {
+        "title": "SwissWeather Fusion — Local station",
+        "description": "Select the sensor entities for your local weather station. Rain and wind can be added once your station supports them.",
+        "data": {
+          "station_temp_entity": "Temperature sensor",
+          "station_humidity_entity": "Humidity sensor",
+          "station_pressure_entity": "Pressure sensor"
+        }
+      },
+      "credentials": {
+        "title": "SwissWeather Fusion — API credentials",
+        "description": "All four credentials are stored securely and never written to a YAML file. SRF and meteoblue and Meteonomiqs credentials are obtained from their respective developer portals — see the README for links.",
+        "data": {
+          "srf_consumer_key": "SRF (SRG SSR) consumer key",
+          "srf_consumer_secret": "SRF (SRG SSR) consumer secret",
+          "meteoblue_api_key": "meteoblue API key",
+          "meteonomiqs_api_key": "Meteonomiqs API key"
+        }
+      },
+      "reauth_confirm": {
+        "title": "SwissWeather Fusion — Re-authenticate SRF",
+        "description": "Your SRF (SRG SSR) consumer key/secret needs to be updated, e.g. after rotating it on their developer portal.",
+        "data": {
+          "srf_consumer_key": "SRF (SRG SSR) consumer key",
+          "srf_consumer_secret": "SRF (SRG SSR) consumer secret"
+        }
+      }
+    },
+    "error": {
+      "elevation_lookup_failed": "Could not automatically look up elevation for these coordinates. Enter one manually, or check your network connection and try again.",
+      "unknown": "Unexpected error — please try again."
+    },
+    "abort": {
+      "reauth_successful": "Credentials updated successfully."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "SwissWeather Fusion — Options",
+        "data": {
+          "station_temp_entity": "Temperature sensor",
+          "station_humidity_entity": "Humidity sensor",
+          "station_pressure_entity": "Pressure sensor",
+          "purge_days": "Database purge window (days, 0 = keep forever)"
+        }
+      }
+    }
+  }
+}
