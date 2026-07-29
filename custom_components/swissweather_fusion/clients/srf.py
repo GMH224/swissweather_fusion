@@ -46,7 +46,17 @@ REQUEST_TIMEOUT_SECONDS = 30
 # entirely consumed by that metadata, so the actual data fields we
 # actually need to see were cut off. Raised substantially so the next
 # diagnostic capture (if still needed) shows enough to work with.
-DIAGNOSTIC_LOG_TRUNCATION_CHARS = 4000
+# v0.1.8: raised again — the 4000-character limit from v0.1.7 was
+# entirely consumed by the geolocation metadata plus a 5-7 day forecast
+# array, cut off mid-array, before ever reaching whatever comes after it
+# in the response. That capture is what confirmed the real "day" array
+# structure (see _DAY_FIELD_MAP below) — but it's still unknown whether
+# the response also contains an "hour" or "three_hours" sibling array
+# with genuine hourly data (a community-documented example of this same
+# API family shows day/three_hours/hour arrays all present together).
+# Raised well past what the full day array needs, so the next capture (if
+# still needed) can confirm one way or the other.
+DIAGNOSTIC_LOG_TRUNCATION_CHARS = 20000
 
 
 def _client_timeout() -> aiohttp.ClientTimeout:
@@ -129,16 +139,29 @@ def parse_geolocation_response(payload: Any) -> Optional[str]:
     return None
 
 
-# Fields expected in the V2 forecast response, per what was documented
-# during planning. NOT yet verified against a live call for this project
-# specifically — see plan doc §0 checklist. Verify before trusting this
-# mapping in production.
-_FIELD_MAP = {
-    "temperature": "temperature",
-    "relativeHumidity": "humidity",
-    "meanSeaLevelPressure": "pressure",
-    "precipitation": "precip",
-    "windSpeed": "wind_speed",
+# v0.1.8: replaced entirely with confirmed field names from a real
+# production response (previous guesses — temperature, relativeHumidity,
+# meanSeaLevelPressure — never appeared in any actual SRF response and
+# were the reason this kept returning zero usable points). The real
+# response nests under forecast.day (a list), with genuinely DAILY
+# fields: TX_C/TN_C (day max/min), RRR_MM (day precip total), FF_KMH (day
+# avg wind), no humidity or pressure field visible at all at this
+# granularity.
+#
+# Deliberately mapped to measurement names DISTINCT from the hourly ones
+# ("temperature", "humidity", "pressure", "precip", "wind_speed") that
+# CH1/CH2/D2/meteoblue use — a day's maximum temperature is not the
+# temperature at any specific hour, and silently writing it into the same
+# hourly bucket system Model A learns from would corrupt bias-learning
+# for whatever hour it got assigned to. Named distinctly here, these
+# simply don't participate in Model A's hourly blend at all, which is the
+# correct, safe behavior until the actual hourly structure (if SRF's API
+# offers one — see DEVELOPER.md) is confirmed.
+_DAY_FIELD_MAP = {
+    "TX_C": "temperature_daily_max",
+    "TN_C": "temperature_daily_min",
+    "RRR_MM": "precip_daily_total",
+    "FF_KMH": "wind_speed_daily_avg",
 }
 
 
@@ -150,41 +173,46 @@ class SrfForecastPoint:
 
 
 def parse_forecast_response(payload: Any) -> list[SrfForecastPoint]:
-    """**Fixed in v0.1.1**: handles both a bare top-level list and a dict
-    wrapping one, since the actual shape wasn't confirmed before the crash
-    that surfaced this.
-
-    **v0.1.4**: this is the more likely of the two parsers to have caused
-    the 'str' object has no attribute 'get' crash, since it's the code
-    path newly reached after the v0.1.3 URL fix — we'd never actually
-    gotten a real 200 response with a real body to parse here before.
-    Now defends against every level being a different shape than
-    expected: payload itself being a bare string, entries not being a
-    list at all, and individual entries being strings rather than dicts.
-    Skips anything that doesn't fit rather than crashing on it.
+    """**v0.1.8**: rebuilt against a confirmed real response body rather
+    than documentation or further guesswork. The real shape is
+    `{"forecast": {"day": [...]}}` — `forecast` is a dict, not a list, so
+    the earlier `payload.get("forecast", [])` silently produced an empty
+    list every time via the "not a list" defensive check added in
+    v0.1.4 (which correctly avoided crashing, but also correctly found
+    nothing, since it really was looking in the wrong place). Still
+    defends against every level being an unexpected shape, same
+    discipline as before — this response family has surprised this
+    project three times already.
     """
-    if isinstance(payload, list):
-        entries = payload
-    elif isinstance(payload, dict):
-        entries = payload.get("forecast", [])
+    if isinstance(payload, dict):
+        forecast = payload.get("forecast")
     else:
-        entries = []
+        forecast = None
 
-    if not isinstance(entries, list):
-        entries = []
+    if isinstance(forecast, dict):
+        day_entries = forecast.get("day", [])
+    elif isinstance(forecast, list):
+        # In case a future/different response variant puts the array
+        # directly under "forecast" rather than "forecast.day".
+        day_entries = forecast
+    else:
+        day_entries = []
+
+    if not isinstance(day_entries, list):
+        day_entries = []
 
     points: list[SrfForecastPoint] = []
-    for entry in entries:
+    for entry in day_entries:
         if not isinstance(entry, dict):
             continue
-        valid_at_str = entry.get("localDateTime") or entry.get("time")
+        valid_at_str = entry.get("local_date_time")
         if not valid_at_str:
             continue
         valid_at = datetime.fromisoformat(valid_at_str)
         if valid_at.tzinfo is None:
             valid_at = valid_at.replace(tzinfo=timezone.utc)
-        for srf_key, internal_name in _FIELD_MAP.items():
-            if srf_key in entry:
+        for srf_key, internal_name in _DAY_FIELD_MAP.items():
+            if srf_key in entry and entry[srf_key] is not None:
                 points.append(
                     SrfForecastPoint(
                         variable=internal_name, valid_at=valid_at, value=entry[srf_key]

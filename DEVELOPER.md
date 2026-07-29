@@ -1,5 +1,45 @@
 # Developer notes: architecture rationale
 
+## v0.1.8 — SRF's real shape confirmed: daily, not hourly, and isolated accordingly
+
+The v0.1.7 truncation increase (500→4000 characters) worked exactly as
+intended: a production log finally showed the real response body instead
+of getting cut off before the useful part. What it showed was a genuine
+surprise, not another shape variant of the same data — SRG-SSR's own
+documentation confirms they offer two structurally different response
+types, "hourly forecasts for each day" or "one core statement per day (no
+hourly progression)" — and what we're actually getting is the **daily-only**
+variant: `forecast.day`, a list with `TX_C`/`TN_C` (day max/min
+temperature), `RRR_MM` (day precip total), `FF_KMH` (day avg wind). No
+humidity or pressure field appears anywhere. None of the originally
+assumed field names (`temperature`, `relativeHumidity`,
+`meanSeaLevelPressure`) exist in any real response — they were a
+plausible-looking guess from documentation, never verified, and the
+actual cause of every previous "zero usable data points" result.
+
+**The fix isn't just correcting field names — it's making sure this data
+can never quietly corrupt Model A.** A day's maximum temperature is not
+the temperature at any specific hour; writing it into the same
+"temperature" measurement CH1/CH2/D2/meteoblue use for hourly point
+values would have silently corrupted bias-learning for whatever hour it
+got assigned to. Instead, the parsed fields are stored under distinct
+measurement names — `temperature_daily_max`, `temperature_daily_min`,
+`precip_daily_total`, `wind_speed_daily_avg` — which simply never
+participate in Model A's hourly blend at all. This means SRF currently
+contributes nothing to Model A's blend or `expert_weight_srf` (which will
+show "Unknown" indefinitely, not as a bug but as an accurate reflection
+of "this data doesn't fit the hourly bucket system") — a real, open
+design question about what to actually do with SRF's daily data (feed it
+into the existing daily-aggregation as an independent cross-check?
+something else?) rather than something resolved here.
+
+**Still open**: a community-documented example of this same API family
+shows day/three_hours/hour arrays can all appear together in one
+response — genuine hourly data might exist further into the body than
+the 4000-character capture reached (the day array alone, across 5-7 days,
+consumed nearly the whole budget). Truncation raised again, to 20000
+characters, to check for that possibility if another capture is needed.
+
 ## v0.1.7 — the blend crash that broke the whole card, plus a second blocking-I/O bug
 
 Three confirmed bugs from direct log evidence (not hypotheses this time —

@@ -93,55 +93,79 @@ def test_parse_geolocation_response_unexpected_top_level_types():
     assert srf.parse_geolocation_response(42) is None
 
 
-def test_parse_forecast_response():
+def test_parse_forecast_response_matches_confirmed_real_structure():
+    """v0.1.8: rewritten against a real captured production response, not
+    documentation or further guessing. Confirmed real shape:
+    {"forecast": {"day": [...]}} with TX_C/TN_C/RRR_MM/FF_KMH fields (day
+    max/min temperature, day precip total, day avg wind) — genuinely
+    daily granularity, no humidity or pressure field present at all.
+    Mapped to measurement names distinct from the hourly ones
+    (temperature_daily_max, not temperature) so these can never be
+    silently blended as if they were hourly point values.
+    """
     payload = {
-        "forecast": [
-            {
-                "localDateTime": "2026-07-25T12:00:00",
-                "temperature": 21.0,
-                "relativeHumidity": 55,
-                "meanSeaLevelPressure": 1013.5,
-            },
-            {
-                "localDateTime": "2026-07-25T13:00:00",
-                "temperature": 22.0,
-                "relativeHumidity": 52,
-                "meanSeaLevelPressure": 1013.2,
-            },
-        ]
+        "geolocation": {"id": "47.5536,8.9120", "default_name": "Neuhuuse"},
+        "forecast": {
+            "day": [
+                {
+                    "TX_C": 34, "TN_C": 15, "RRR_MM": 0.0, "FF_KMH": 6,
+                    "local_date_time": "2026-07-29T00:00:00+02:00",
+                },
+                {
+                    "TX_C": 30, "TN_C": 18, "RRR_MM": 2.0, "FF_KMH": 6,
+                    "local_date_time": "2026-08-01T00:00:00+02:00",
+                },
+            ]
+        },
     }
     points = srf.parse_forecast_response(payload)
-    assert len(points) == 6  # 3 fields x 2 timesteps
-    temps = [p for p in points if p.variable == "temperature"]
-    assert temps[0].value == 21.0
+    assert len(points) == 8  # 4 fields x 2 days
+
+    max_temps = [p for p in points if p.variable == "temperature_daily_max"]
+    assert max_temps[0].value == 34
+    precip_totals = [p for p in points if p.variable == "precip_daily_total"]
+    assert precip_totals[1].value == 2.0
+    # None of the hourly measurement names appear at all — this is the
+    # whole point of the fix.
+    assert not any(p.variable in ("temperature", "humidity", "pressure") for p in points)
 
 
-def test_parse_forecast_response_bare_list_v0_1_1_fix():
-    """Same defensive fix as the geolocation parser, same reason."""
-    payload = [
-        {"localDateTime": "2026-07-25T12:00:00", "temperature": 21.0},
-    ]
-    points = srf.parse_forecast_response(payload)
-    assert len(points) == 1
-    assert points[0].value == 21.0
+def test_parse_forecast_response_skips_entries_missing_local_date_time():
+    payload = {"forecast": {"day": [{"TX_C": 30, "TN_C": 18}]}}  # no local_date_time
+    assert srf.parse_forecast_response(payload) == []
 
 
 def test_parse_forecast_response_string_entries_v0_1_4_fix():
     """v0.1.4: if entries in the list turn out to be plain strings rather
-    than objects (the same class of surprise that hit the geolocation
-    parser), skip them rather than crash — better to return zero points
-    (surfaced via the client's diagnostic logging) than raise.
+    than objects, skip them rather than crash — this defensive discipline
+    is kept even after the v0.1.8 rebuild against the confirmed real
+    structure, since this response family has surprised this project
+    multiple times already.
     """
-    payload = ["not a dict", "also not a dict"]
+    payload = {"forecast": {"day": ["not a dict", "also not a dict"]}}
     assert srf.parse_forecast_response(payload) == []
 
-    mixed = [{"localDateTime": "2026-07-25T12:00:00", "temperature": 21.0}, "a bare string"]
-    points = srf.parse_forecast_response(mixed)
+    mixed_payload = {
+        "forecast": {
+            "day": [
+                {"TX_C": 30, "local_date_time": "2026-07-29T00:00:00+02:00"},
+                "a bare string",
+            ]
+        }
+    }
+    points = srf.parse_forecast_response(mixed_payload)
     assert len(points) == 1
-    assert points[0].value == 21.0
+    assert points[0].value == 30
 
 
 def test_parse_forecast_response_unexpected_top_level_types():
     assert srf.parse_forecast_response("just a string") == []
     assert srf.parse_forecast_response(None) == []
-    assert srf.parse_forecast_response({"forecast": "not actually a list"}) == []
+    assert srf.parse_forecast_response({"forecast": "not a dict or list"}) == []
+    assert srf.parse_forecast_response({"forecast": {"day": "not a list"}}) == []
+    # A future/different variant might put the array directly under
+    # "forecast" rather than "forecast.day" — handled too.
+    direct_list_payload = {
+        "forecast": [{"TX_C": 30, "local_date_time": "2026-07-29T00:00:00+02:00"}]
+    }
+    assert len(srf.parse_forecast_response(direct_list_payload)) == 1
