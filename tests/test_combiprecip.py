@@ -105,6 +105,36 @@ def test_extract_values_at_points_finds_marker_cell(synthetic_odim_file):
     assert results[0].valid_at.hour == 12
 
 
+def test_write_temp_and_extract_handles_bytes_end_to_end(synthetic_odim_file):
+    """v0.1.7 regression test: production logs showed HA's own
+    loop-blocking detector catching the file write and temp-directory
+    cleanup happening directly inside an async method (the same class of
+    bug fixed for weather.py in v0.1.5, in different code this time).
+    Confirms the replacement — a plain synchronous method meant to be
+    called via an executor job, taking raw bytes rather than doing any
+    async I/O of its own — still produces the correct extracted values
+    end to end, and doesn't leave the temp file behind afterward.
+    """
+    with open(synthetic_odim_file, "rb") as f:
+        raw_bytes = f.read()
+
+    lon_at_col3 = 7.0 + (3 + 0.5) / 10.0 * (8.0 - 7.0)
+    lat_at_row2 = 47.5 - (2 + 0.5) / 10.0 * (47.5 - 46.5)
+
+    client = cp.CombiPrecipClient(
+        session=None,  # not used by write_temp_and_extract at all
+        latitude=lat_at_row2,
+        longitude=lon_at_col3,
+        bearing_degrees=225.0,
+        distances_km=(30.0,),
+        labels=("near",),
+    )
+    results = client.write_temp_and_extract(raw_bytes)
+
+    local_result = next(r for r in results if r.label == "local")
+    assert local_result.precip_rate_mmh == 42.0
+
+
 def test_extract_values_at_points_nodata_sentinel():
     path = tempfile.mktemp(suffix=".h5")
     with h5py.File(path, "w") as f:

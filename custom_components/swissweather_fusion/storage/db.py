@@ -179,11 +179,46 @@ class SwissWeatherDB:
         )
         return cur.fetchall()
 
+    def get_station_observations_between(
+        self, start_ts: str, end_ts: str
+    ) -> list[sqlite3.Row]:
+        """Used by the Model A learning reconciliation step (v0.1.7) to
+        fetch candidate ground-truth readings around a batch of forecast
+        valid_at times in one query, rather than one query per forecast
+        row.
+        """
+        cur = self._conn.execute(
+            "SELECT * FROM station_observations WHERE ts >= ? AND ts <= ? ORDER BY ts ASC",
+            (start_ts, end_ts),
+        )
+        return cur.fetchall()
+
     def get_latest_station_observation(self) -> Optional[sqlite3.Row]:
         cur = self._conn.execute(
             "SELECT * FROM station_observations ORDER BY ts DESC LIMIT 1"
         )
         return cur.fetchone()
+
+    # -- reconciliation watermark (Model A learning, v0.1.7) ---------------------
+    # Reuses schema_meta rather than a new table — this is a single small
+    # value (the last valid_at up to which forecast_snapshots have already
+    # been compared against actual observations and folded into
+    # bucket_stats), not worth a dedicated table for.
+
+    def get_reconciliation_watermark(self) -> Optional[str]:
+        cur = self._conn.execute(
+            "SELECT value FROM schema_meta WHERE key = 'reconciliation_watermark'"
+        )
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+    def set_reconciliation_watermark(self, ts: str) -> None:
+        self._conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('reconciliation_watermark', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (ts,),
+        )
+        self._conn.commit()
 
     # -- forecast snapshots -----------------------------------------------------
 
@@ -224,6 +259,32 @@ class SwissWeatherDB:
             "WHERE source = ? AND variable = ? AND valid_at = ? "
             "ORDER BY issued_at DESC",
             (source, variable, valid_at),
+        )
+        return cur.fetchall()
+
+    def get_forecast_snapshots_to_reconcile(
+        self, *, since_ts: str, until_ts: str, measurements: tuple[str, ...]
+    ) -> list[sqlite3.Row]:
+        """Rows whose valid_at has now passed (i.e. we should have a real
+        station observation to compare against) but haven't yet been
+        folded into bucket_stats — used by the Model A learning
+        reconciliation step (v0.1.7). Restricted to measurements the
+        local station can actually confirm (temperature/humidity/
+        pressure) — precip/wind_speed have no ground truth yet since the
+        station doesn't have rain/wind sensors.
+
+        Every matching row is returned individually, not deduplicated by
+        (source, valid_at) — a source can have several snapshots for the
+        same valid_at from different issued_at times (different lead
+        times), and each is a genuinely separate, separately-informative
+        data point for its own lead_time_bucket.
+        """
+        placeholders = ",".join("?" for _ in measurements)
+        cur = self._conn.execute(
+            f"SELECT * FROM forecast_snapshots "
+            f"WHERE valid_at > ? AND valid_at <= ? AND variable IN ({placeholders}) "
+            f"ORDER BY valid_at ASC",
+            (since_ts, until_ts, *measurements),
         )
         return cur.fetchall()
 

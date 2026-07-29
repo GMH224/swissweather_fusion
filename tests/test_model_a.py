@@ -102,9 +102,66 @@ def test_blend_empty_returns_none():
     assert model_a.blend([]) is None
 
 
+def test_blend_skips_none_raw_value_instead_of_crashing():
+    """v0.1.7 regression test: a source returning null for a given
+    hour/measurement (legitimate behavior from Open-Meteo/SRF/meteoblue)
+    crashed in production with 'unsupported operand type(s) for *:
+    NoneType and float' on every single blend cycle since deployment —
+    this is why the weather entity stayed continuously Unavailable rather
+    than intermittently. A None-valued contribution must be skipped, not
+    crash the whole blend.
+    """
+    contributions = [
+        model_a.SourceContribution(source="ch1", raw_value=None, ema_bias=0.0, ema_weight=1.0, sample_count=10),
+        model_a.SourceContribution(source="ch2", raw_value=20.0, ema_bias=2.0, ema_weight=5.0, sample_count=10),
+    ]
+    # Only ch2 should contribute; ch1's None is skipped entirely, not
+    # treated as zero or any other silently-wrong substitute value.
+    assert model_a.blend(contributions) == 20.0 - 2.0
+
+
+def test_blend_returns_none_if_every_contribution_is_none():
+    contributions = [
+        model_a.SourceContribution(source="ch1", raw_value=None, ema_bias=0.0, ema_weight=1.0, sample_count=0),
+        model_a.SourceContribution(source="ch2", raw_value=None, ema_bias=0.0, ema_weight=1.0, sample_count=0),
+    ]
+    assert model_a.blend(contributions) is None
+
+
 def test_lapse_rate_precorrection():
     corrected = model_a.apply_lapse_rate_precorrection(
         raw_temperature=20.0, source_grid_elevation_m=600.0, actual_elevation_m=400.0
     )
     # grid 200m higher than actual -> source reads colder than reality -> add back
     assert abs(corrected - 21.3) < 1e-9
+
+
+def test_find_nearest_observation_picks_closest_within_tolerance():
+    target = datetime(2026, 7, 25, 15, 0, tzinfo=timezone.utc)
+    candidates = [
+        (datetime(2026, 7, 25, 14, 50, tzinfo=timezone.utc), 20.0),
+        (datetime(2026, 7, 25, 15, 2, tzinfo=timezone.utc), 21.0),  # genuinely closest (2 min away)
+        (datetime(2026, 7, 25, 15, 20, tzinfo=timezone.utc), 22.0),
+    ]
+    assert model_a.find_nearest_observation(target=target, candidates=candidates) == 21.0
+
+
+def test_find_nearest_observation_respects_tolerance():
+    target = datetime(2026, 7, 25, 15, 0, tzinfo=timezone.utc)
+    # Only candidate is 45 minutes away — outside the default 30-min tolerance.
+    candidates = [(datetime(2026, 7, 25, 15, 45, tzinfo=timezone.utc), 21.0)]
+    assert model_a.find_nearest_observation(target=target, candidates=candidates) is None
+
+
+def test_find_nearest_observation_skips_none_values():
+    target = datetime(2026, 7, 25, 15, 0, tzinfo=timezone.utc)
+    candidates = [
+        (datetime(2026, 7, 25, 15, 1, tzinfo=timezone.utc), None),  # closest but no value
+        (datetime(2026, 7, 25, 15, 10, tzinfo=timezone.utc), 19.5),  # further but usable
+    ]
+    assert model_a.find_nearest_observation(target=target, candidates=candidates) == 19.5
+
+
+def test_find_nearest_observation_no_candidates():
+    target = datetime(2026, 7, 25, 15, 0, tzinfo=timezone.utc)
+    assert model_a.find_nearest_observation(target=target, candidates=[]) is None

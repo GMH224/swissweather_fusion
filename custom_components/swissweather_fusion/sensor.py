@@ -64,7 +64,7 @@ async def async_setup_entry(
         StatusSensor(entry, runtime),
         ForecastAccuracySensor(entry, db),
         ActiveSourcesSensor(entry, db, runtime),
-        LastLearningASensor(entry, db),
+        LastLearningASensor(entry, runtime),
         LastLearningBSensor(entry, db),
         StormOnsetProbabilitySensor(entry, runtime),
     ]
@@ -169,18 +169,32 @@ class ActiveSourcesSensor(_BaseSensor):
 
 
 class LastLearningASensor(_BaseSensor):
-    """When Model A's EMA buckets last updated — continuous in principle,
-    this reports the most recent bucket_stats.last_updated across all
-    buckets, giving a simple heartbeat for "is Model A actually learning".
+    """When Model A's EMA buckets last updated. **Fixed in v0.1.7**: this
+    was a permanent stub (always None) because nothing in production code
+    actually ran the reconciliation step — see ModelALearningCoordinator
+    in coordinator.py for the full story. Now reports that coordinator's
+    last successful run, plus how many forecast snapshots it reconciled,
+    as a real heartbeat for "is Model A actually learning" rather than an
+    always-empty placeholder.
     """
 
-    def __init__(self, entry: ConfigEntry, db: SwissWeatherDB) -> None:
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
         super().__init__(entry, "last_learning_a", "Model A last learning update")
-        self._db = db
+        self._runtime = runtime
 
     @property
     def native_value(self) -> Optional[datetime]:
-        return None  # wired to a MAX(last_updated) query once implemented
+        coordinator = self._runtime.get("learning_coordinator")
+        if coordinator is None:
+            return None
+        return coordinator.data
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        coordinator = self._runtime.get("learning_coordinator")
+        if coordinator is None:
+            return {}
+        return {"reconciled_last_run": getattr(coordinator, "last_reconciled_count", 0)}
 
 
 class LastLearningBSensor(_BaseSensor):

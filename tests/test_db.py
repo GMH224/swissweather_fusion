@@ -142,3 +142,41 @@ def test_storage_ordering_unaffected_by_dst_transition_instant(db):
     remaining = db.get_station_observations_since("2026-01-01T00:00:00+00:00")
     assert len(remaining) == 4
     assert all(row["ts"].startswith("2026-10-25") for row in remaining)
+
+
+def test_get_station_observations_between(db):
+    db.insert_station_observation("2026-07-25T10:00:00+00:00", 18.0, 50.0, 1013.0)
+    db.insert_station_observation("2026-07-25T12:00:00+00:00", 20.0, 48.0, 1012.5)
+    db.insert_station_observation("2026-07-25T14:00:00+00:00", 22.0, 45.0, 1012.0)
+
+    rows = db.get_station_observations_between(
+        "2026-07-25T11:00:00+00:00", "2026-07-25T13:00:00+00:00"
+    )
+    assert len(rows) == 1
+    assert rows[0]["ts"] == "2026-07-25T12:00:00+00:00"
+
+
+def test_reconciliation_watermark_roundtrip(db):
+    assert db.get_reconciliation_watermark() is None
+    db.set_reconciliation_watermark("2026-07-25T12:00:00+00:00")
+    assert db.get_reconciliation_watermark() == "2026-07-25T12:00:00+00:00"
+    # Updating again should overwrite, not create a second row/conflict.
+    db.set_reconciliation_watermark("2026-07-25T13:00:00+00:00")
+    assert db.get_reconciliation_watermark() == "2026-07-25T13:00:00+00:00"
+
+
+def test_get_forecast_snapshots_to_reconcile_filters_by_measurement_and_window(db):
+    db.insert_forecast_snapshot("ch1", "2026-07-25T09:00:00+00:00", "2026-07-25T12:00:00+00:00", "temperature", 22.0)
+    db.insert_forecast_snapshot("ch1", "2026-07-25T09:00:00+00:00", "2026-07-25T12:00:00+00:00", "precip", 0.0)
+    db.insert_forecast_snapshot("ch2", "2026-07-25T06:00:00+00:00", "2026-07-25T12:30:00+00:00", "humidity", 55.0)
+    db.insert_forecast_snapshot("ch1", "2026-07-25T09:00:00+00:00", "2026-07-26T12:00:00+00:00", "temperature", 20.0)
+
+    rows = db.get_forecast_snapshots_to_reconcile(
+        since_ts="2026-07-25T00:00:00+00:00",
+        until_ts="2026-07-25T13:00:00+00:00",
+        measurements=("temperature", "humidity", "pressure"),
+    )
+    # precip is excluded (no station ground truth for it), and the row
+    # valid_at 2026-07-26 is outside the until_ts window.
+    variables = sorted(r["variable"] for r in rows)
+    assert variables == ["humidity", "temperature"]

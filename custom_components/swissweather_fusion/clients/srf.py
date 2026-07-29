@@ -39,6 +39,15 @@ _LOGGER = logging.getLogger(__name__)
 # fixing regardless of whether it's the exact cause here.
 REQUEST_TIMEOUT_SECONDS = 30
 
+# v0.1.7: the last diagnostic log capture showed the real SRF response is
+# dominated by verbose location metadata (station_id, alarm_region_name,
+# district, geolocation_names...) before ever reaching whatever field
+# holds the actual forecast data — the previous 500-character limit was
+# entirely consumed by that metadata, so the actual data fields we
+# actually need to see were cut off. Raised substantially so the next
+# diagnostic capture (if still needed) shows enough to work with.
+DIAGNOSTIC_LOG_TRUNCATION_CHARS = 4000
+
 
 def _client_timeout() -> aiohttp.ClientTimeout:
     return aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
@@ -240,7 +249,7 @@ class SrfClient:
             _LOGGER.error(
                 "SRF geolocation lookup returned no usable result. Raw "
                 "response (truncated): %s",
-                repr(payload)[:500],
+                repr(payload)[:DIAGNOSTIC_LOG_TRUNCATION_CHARS],
             )
             raise ValueError("SRF geolocation lookup returned no results")
         self._geolocation_id = geolocation_id
@@ -270,6 +279,6 @@ class SrfClient:
             _LOGGER.warning(
                 "SRF forecast response produced no usable data points. Raw "
                 "response (truncated): %s",
-                repr(payload)[:500],
+                repr(payload)[:DIAGNOSTIC_LOG_TRUNCATION_CHARS],
             )
         return points

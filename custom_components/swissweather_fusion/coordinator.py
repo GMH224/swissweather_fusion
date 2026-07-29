@@ -319,8 +319,17 @@ class CombiPrecipCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> list[Any]:
         start = time.monotonic()
         try:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                values = await self._client.async_fetch_latest_values(tmp_dir=tmp_dir)
+            # v0.1.7 fix: this used to do `with tempfile.TemporaryDirectory()`
+            # directly here, with the actual file write happening inside
+            # the awaited client call — HA's own loop-blocking detector
+            # caught both the file write and the temp-dir cleanup
+            # happening synchronously on the event loop. Now: async
+            # download only, then the entire blocking sequence (temp dir,
+            # write, h5py parse, cleanup) runs via one executor job.
+            data = await self._client.async_fetch_latest_bytes()
+            values = await self.hass.async_add_executor_job(
+                self._client.write_temp_and_extract, data
+            )
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err, duration_ms=(time.monotonic() - start) * 1000)
             raise UpdateFailed(f"CombiPrecip fetch failed: {err}") from err
@@ -630,6 +639,152 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             "daily_forecast": model_a.aggregate_daily_forecast(hourly_forecast),
             "twice_daily_forecast": model_a.aggregate_twice_daily_forecast(hourly_forecast),
         }
+
+
+class ModelALearningCoordinator(DataUpdateCoordinator):
+    """Model A's actual learning step — periodically compares past
+    forecasts against what the station actually measured, and folds the
+    result into bucket_stats via the EMA.
+
+    **v0.1.7: closes a real gap found during review.**
+    `models.model_a.update_bucket_ema` and `storage.db.upsert_bucket_stats`
+    existed and were unit-tested in isolation since early in this
+    project, but nothing in production code ever actually called them.
+    Without this coordinator, `bucket_stats` would stay empty forever —
+    not just during a cold-start window — meaning Model A's blend was
+    only ever an unweighted average of raw forecasts, never applying the
+    learned bias correction that's the actual point of the project.
+
+    Runs every 20 minutes (bias correction is a slow-moving statistic;
+    this doesn't need to be frequent) and does the entire batch — finding
+    due forecast rows, fetching candidate station readings, matching,
+    and updating every bucket — inside one executor job, the same
+    pattern as ModelABlendCoordinator.
+    """
+
+    RECONCILIATION_INTERVAL = timedelta(minutes=20)
+    # Only measurements the local station can actually confirm — precip
+    # and wind_speed have no ground truth yet (station has no rain/wind
+    # sensors), so forecasts for those are stored but never reconciled.
+    RECONCILIATION_MEASUREMENTS = ("temperature", "humidity", "pressure")
+    # How far back to look on the very first run ever (no watermark yet).
+    # 14 days comfortably covers every source's forecast horizon
+    # (meteoblue's ~7-10 days is the longest) without trying to reconcile
+    # an unbounded amount of history in one go.
+    INITIAL_LOOKBACK = timedelta(days=14)
+
+    def __init__(self, hass: HomeAssistant, db: SwissWeatherDB) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="swissweather_fusion_learning",
+            update_interval=self.RECONCILIATION_INTERVAL,
+        )
+        self._db = db
+        self.last_reconciled_count: int = 0
+
+    async def _async_update_data(self) -> Optional[datetime]:
+        return await self.hass.async_add_executor_job(self._reconcile)
+
+    def _reconcile(self) -> datetime:
+        """Synchronous — only ever called via the executor job above."""
+        from .models import model_a
+        from .storage.db import BucketKey
+
+        now = model_a.utcnow()
+        watermark_str = self._db.get_reconciliation_watermark()
+        since = (
+            datetime.fromisoformat(watermark_str)
+            if watermark_str is not None
+            else now - self.INITIAL_LOOKBACK
+        )
+        since_iso = since.isoformat()
+        until_iso = now.isoformat()
+
+        rows_to_reconcile = self._db.get_forecast_snapshots_to_reconcile(
+            since_ts=since_iso,
+            until_ts=until_iso,
+            measurements=self.RECONCILIATION_MEASUREMENTS,
+        )
+        if not rows_to_reconcile:
+            self._db.set_reconciliation_watermark(until_iso)
+            self.last_reconciled_count = 0
+            return now
+
+        # One station-observation query for the whole batch (padded by
+        # the matching tolerance on each side), not one query per forecast
+        # row — matches the batching approach already used elsewhere in
+        # this project (e.g. ModelABlendCoordinator).
+        tolerance = timedelta(minutes=model_a.RECONCILIATION_TOLERANCE_MINUTES)
+        station_rows = self._db.get_station_observations_between(
+            (since - tolerance).isoformat(), (now + tolerance).isoformat()
+        )
+        candidates_by_measurement: dict[str, list[tuple[datetime, Any]]] = {
+            "temperature": [],
+            "humidity": [],
+            "pressure": [],
+        }
+        for row in station_rows:
+            ts = datetime.fromisoformat(row["ts"])
+            candidates_by_measurement["temperature"].append((ts, row["temperature"]))
+            candidates_by_measurement["humidity"].append((ts, row["humidity"]))
+            candidates_by_measurement["pressure"].append((ts, row["pressure"]))
+
+        reconciled_count = 0
+        for fs_row in rows_to_reconcile:
+            if fs_row["value"] is None:
+                continue
+            measurement = fs_row["variable"]
+            valid_at = datetime.fromisoformat(fs_row["valid_at"])
+            issued_at = datetime.fromisoformat(fs_row["issued_at"])
+
+            actual_value = model_a.find_nearest_observation(
+                target=valid_at, candidates=candidates_by_measurement[measurement]
+            )
+            if actual_value is None:
+                continue
+
+            key = BucketKey(
+                hour_of_day=valid_at.hour,
+                season=model_a.derive_season(valid_at),
+                lead_time_bucket=model_a.derive_lead_time_bucket(issued_at, valid_at),
+                source=fs_row["source"],
+                measurement=measurement,
+            )
+            existing = self._db.get_bucket_stats(key)
+            if existing is None:
+                previous_bias, previous_abs_error, previous_sample_count = 0.0, 0.0, 0
+            else:
+                previous_bias = existing.ema_bias
+                previous_abs_error = existing.ema_abs_error
+                previous_sample_count = existing.sample_count
+
+            result = model_a.update_bucket_ema(
+                previous_bias=previous_bias,
+                previous_abs_error=previous_abs_error,
+                previous_sample_count=previous_sample_count,
+                forecast_value=fs_row["value"],
+                actual_value=actual_value,
+                lead_time_bucket=key.lead_time_bucket,
+            )
+            self._db.upsert_bucket_stats(
+                key,
+                ema_bias=result.ema_bias,
+                ema_abs_error=result.ema_abs_error,
+                ema_weight=result.ema_weight,
+                sample_count=result.sample_count,
+                last_updated=now.isoformat(),
+            )
+            reconciled_count += 1
+
+        self._db.set_reconciliation_watermark(until_iso)
+        self.last_reconciled_count = reconciled_count
+        _LOGGER.debug(
+            "Model A learning: reconciled %d of %d due forecast snapshots",
+            reconciled_count,
+            len(rows_to_reconcile),
+        )
+        return now
 
 
 class ModelBCoordinator(DataUpdateCoordinator):

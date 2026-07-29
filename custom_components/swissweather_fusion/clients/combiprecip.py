@@ -247,10 +247,20 @@ def extract_values_at_points(
 
 
 class CombiPrecipClient:
-    """Requires an aiohttp.ClientSession (HA's shared session) and a
-    writable temp directory for the downloaded HDF5 file (deleted after
-    each poll — this client doesn't keep raw radar files around, only the
-    extracted pixel values go into storage/db.py).
+    """Requires an aiohttp.ClientSession (HA's shared session).
+
+    **v0.1.7 fix**: this used to write the downloaded file and clean up
+    its temp directory directly inside an async method — HA's own
+    loop-blocking detector caught both the `open(..., "wb")` write and
+    the temp-directory cleanup's `scandir` call happening directly on the
+    event loop. h5py itself has no async support at all regardless, so
+    the fix is a clean split: `async_fetch_latest_bytes` does only the
+    async STAC query + HTTP download (both genuinely non-blocking via
+    aiohttp) and returns raw bytes; `write_temp_and_extract` does
+    everything blocking (temp dir, file write, h5py parse, cleanup) as a
+    single plain synchronous method, meant to be called via
+    `hass.async_add_executor_job()` by the coordinator — the same pattern
+    every other blocking operation in this project already uses.
     """
 
     def __init__(
@@ -272,9 +282,11 @@ class CombiPrecipClient:
             labels=labels,
         )
 
-    async def async_fetch_latest_values(self, *, tmp_dir: str) -> list[RadarPixelValue]:
-        import os
-
+    async def async_fetch_latest_bytes(self) -> bytes:
+        """Async-only: STAC query + HTTP download. No file I/O here at
+        all — that's handled separately by write_temp_and_extract, which
+        must be called via an executor job, not awaited directly.
+        """
         async with self._session.get(
             STAC_ITEMS_URL, params={"limit": 1, "sortby": "-datetime"}
         ) as resp:
@@ -286,13 +298,21 @@ class CombiPrecipClient:
             raise ValueError("No CombiPrecip assets found in STAC response")
         latest = assets[0]
 
-        local_path = os.path.join(tmp_dir, "combiprecip_latest.h5")
         async with self._session.get(latest.href) as resp:
             resp.raise_for_status()
-            with open(local_path, "wb") as f:
-                f.write(await resp.read())
+            return await resp.read()
 
-        try:
+    def write_temp_and_extract(self, data: bytes) -> list[RadarPixelValue]:
+        """Synchronous — must only ever be called via
+        hass.async_add_executor_job(), never awaited/called directly from
+        async code. Handles the entire blocking sequence (temp directory,
+        file write, h5py parse, cleanup) in one place.
+        """
+        import os
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            local_path = os.path.join(tmp_dir, "combiprecip_latest.h5")
+            with open(local_path, "wb") as f:
+                f.write(data)
             return extract_values_at_points(hdf5_path=local_path, points=self._points)
-        finally:
-            os.remove(local_path)

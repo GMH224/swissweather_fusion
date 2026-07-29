@@ -1,7 +1,7 @@
 {
   "domain": "swissweather_fusion",
   "name": "SwissWeather Fusion",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "codeowners": ["@your-github-username"],
   "config_flow": true,
   "documentation": "https://github.com/your-github-username/swissweather-fusion",

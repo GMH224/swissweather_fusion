@@ -131,7 +131,7 @@ def update_bucket_ema(
 @dataclass(frozen=True)
 class SourceContribution:
     source: str
-    raw_value: float
+    raw_value: Optional[float]
     ema_bias: float
     ema_weight: float
     sample_count: int
@@ -151,7 +151,18 @@ def blend(contributions: list[SourceContribution]) -> float | None:
     proceeds using raw values; there's no untrusted-everything fallback
     beyond that, by design (some answer is better than none).
 
-    Returns None only if contributions is empty — the caller (coordinator)
+    **v0.1.7 fix**: a source can legitimately return `null` for a given
+    hour/measurement (any of Open-Meteo/SRF/meteoblue can do this), which
+    gets stored in forecast_snapshots as None — this crashed in production
+    with 'unsupported operand type(s) for *: NoneType and float' on every
+    single blend cycle since deployment, which is why the weather entity
+    stayed continuously Unavailable rather than intermittently. A
+    contribution with raw_value=None is now treated the same as "this
+    source has nothing to say for this hour" and skipped, same as if it
+    had never been included at all.
+
+    Returns None only if there are no *usable* contributions (empty list,
+    or every contribution had a None raw_value) — the caller (coordinator)
     is expected to fall back to any single available raw forecast in that
     case, not treat None as an error.
     """
@@ -161,6 +172,8 @@ def blend(contributions: list[SourceContribution]) -> float | None:
     weighted_sum = 0.0
     weight_total = 0.0
     for c in contributions:
+        if c.raw_value is None:
+            continue
         if c.sample_count < MIN_SAMPLES_TO_TRUST_BUCKET:
             debiased = c.raw_value
             weight = 1.0
@@ -201,6 +214,42 @@ def apply_lapse_rate_precorrection(
 def utcnow() -> datetime:
     """Single source of truth for "now" in tests and production alike."""
     return datetime.now(timezone.utc)
+
+
+# How close a station reading needs to be to a forecast's valid_at time to
+# count as "the actual outcome" for reconciliation purposes — half the
+# hourly granularity forecasts are made at, so the nearest reading is
+# meaningfully tied to that specific hour rather than a neighboring one.
+RECONCILIATION_TOLERANCE_MINUTES = 30
+
+
+def find_nearest_observation(
+    *,
+    target: datetime,
+    candidates: list[tuple[datetime, Optional[float]]],
+    tolerance_minutes: int = RECONCILIATION_TOLERANCE_MINUTES,
+) -> Optional[float]:
+    """Given a forecast's valid_at time and a list of (timestamp, value)
+    station readings, returns the value of the nearest one within
+    tolerance, or None if nothing qualifies (no readings, all outside the
+    tolerance window, or the nearest one's value is itself None).
+
+    Pure function — the actual DB fetch of candidates happens once per
+    reconciliation batch in the coordinator, not per forecast row, so this
+    only does the in-memory nearest-match logic.
+    """
+    best_value: Optional[float] = None
+    best_diff_seconds: Optional[float] = None
+    for ts, value in candidates:
+        if value is None:
+            continue
+        diff_seconds = abs((ts - target).total_seconds())
+        if diff_seconds > tolerance_minutes * 60:
+            continue
+        if best_diff_seconds is None or diff_seconds < best_diff_seconds:
+            best_value = value
+            best_diff_seconds = diff_seconds
+    return best_value
 
 
 def aggregate_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> list[dict[str, Any]]:

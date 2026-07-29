@@ -1,5 +1,124 @@
 # Developer notes: architecture rationale
 
+## v0.1.7 — the blend crash that broke the whole card, plus a second blocking-I/O bug
+
+Three confirmed bugs from direct log evidence (not hypotheses this time —
+actual tracebacks and HA's own loop-blocking detector caught all three):
+
+1. **The weather entity's persistent "Unavailable" state, root cause
+   confirmed**: `model_a.blend()` crashed with `unsupported operand
+   type(s) for *: 'NoneType' and 'float'` on every single refresh cycle
+   since deployment (confirmed twice in the log, exactly 10 minutes apart
+   — the blend coordinator's refresh interval). A source can legitimately
+   return `null` for a given hour/measurement (Open-Meteo, SRF, and
+   meteoblue can all do this), and that flows straight into
+   `forecast_snapshots` as `None` — `blend()` never checked for it before
+   doing arithmetic. Fixed: a `None` raw_value is now skipped, treated the
+   same as "this source has nothing to say for this hour," not crashed
+   on. This is the single highest-impact fix here, since it's why the
+   card had never worked at all since the v0.1.5 rebuild.
+2. **A second blocking-I/O bug, same class as the one fixed in weather.py
+   for v0.1.5, different code**: HA's own loop-blocking detector caught
+   the CombiPrecip client's file write (`open(..., "wb")`) and its
+   temp-directory cleanup (`shutil.rmtree`'s `scandir` call) both
+   happening directly inside the async coordinator method. h5py has no
+   async support regardless, so the fix mirrors the weather.py rebuild:
+   split into `async_fetch_latest_bytes()` (async STAC query + HTTP
+   download, genuinely non-blocking via aiohttp) and
+   `write_temp_and_extract()` (a plain synchronous method — temp dir,
+   file write, h5py parse, cleanup, all in one place — called via
+   `hass.async_add_executor_job()` by the coordinator, never awaited
+   directly).
+3. **SRF's diagnostic log truncation raised from 500 to 4000 characters.**
+   The last capture showed the real response is dominated by verbose
+   location metadata (station_id, alarm_region_name, district,
+   geolocation_names...) before ever reaching whatever field holds the
+   actual forecast data — the 500-character limit was entirely consumed
+   by that metadata. This doesn't fix SRF's still-zero-data-points issue
+   by itself, but the next diagnostic capture should actually show enough
+   of the response to work with, rather than being cut off before the
+   useful part.
+
+**An open question, not yet resolved**: a later status check showed every
+single source's `last_success` frozen at the same startup moment for
+roughly 2.5 hours straight — not just SRF, all seven sources
+simultaneously. That's a broader symptom than any of the three bugs above
+individually explain. The working hypothesis is that the blend
+coordinator crashing every 10 minutes, uninterrupted, for that whole
+window may have cascaded into something affecting the other coordinators
+too (resource buildup, event loop congestion) — but this is explicitly
+unconfirmed without a log covering that specific window. Fixing bug #1
+may resolve this as a side effect, or it may not — worth checking a fresh
+log after this deploy specifically for whether all sources resume normal
+independent update cadences, not just whether SRF's crash is gone.
+
+**Update, from a fuller log capture**: this hypothesis turned out to be
+wrong, and worth saying so plainly. The same fuller log showed the blend
+coordinator crashing at exactly 10-minute intervals continuously for the
+entire 2.5-hour window (16 crashes, no drift, no stopping) — proof that
+HA's own coordinator scheduling was never actually disrupted by the
+repeated failures. The far more likely explanation for the earlier
+"everything frozen" screenshots is a stale cached view in the HA app's
+more-info dialog (a real, common frontend behavior), not an actual
+backend freeze — none of the other coordinators showed any repeated
+errors over that same window, which is consistent with them working
+correctly and simply not logging anything (successful coordinator runs
+are silent by design).
+
+## v0.1.7 addendum — the bias-learning step never actually existed
+
+A direct question ("what's still broken?") led to checking something that
+turned out to be a bigger gap than any bug fixed above: **nothing in
+production code ever called `update_bucket_ema` or `upsert_bucket_stats`.**
+Both existed and were unit-tested in isolation since early in this
+project, but no coordinator ever invoked them. Practically, this meant
+`bucket_stats` would have stayed empty forever — not just during a
+cold-start window — meaning Model A's blend was only ever an unweighted
+average of raw forecasts, never applying the learned bias correction
+that's the actual point of the project. `expert_weight_*` sensors and
+`last_learning_a` would have shown "Unknown"/stub values permanently, no
+matter how long the integration ran.
+
+**Fixed with a new coordinator, `ModelALearningCoordinator`**, which every
+20 minutes:
+1. Queries `forecast_snapshots` for rows whose `valid_at` has now passed
+   (restricted to `temperature`/`humidity`/`pressure` — `precip` and
+   `wind_speed` have no ground truth yet, since the local station has no
+   rain/wind sensors) and that fall after a stored watermark (reusing the
+   `schema_meta` table rather than a new one — a single small value isn't
+   worth a dedicated table).
+2. Fetches the local station's actual readings in that same window in one
+   query (not one query per forecast row).
+3. For each due forecast row, finds the nearest station reading within
+   30 minutes (`find_nearest_observation`, a new pure function), and if
+   one exists, computes the bucket key and folds the (forecast, actual)
+   pair into `bucket_stats` via the existing, already-tested
+   `update_bucket_ema`.
+4. Advances the watermark, so the same row is never reconciled twice.
+
+Deliberately processes every individual forecast_snapshots row rather than
+deduplicating by (source, valid_at) — a source can have several snapshots
+for the same valid_at from different issued_at times (different lead
+times as a forecast run gets closer to the target hour), and each is a
+genuinely separate, separately-informative data point for its own
+lead_time_bucket, not a duplicate to collapse.
+
+`LastLearningASensor` now reports this coordinator's real last-run
+timestamp (plus how many rows it reconciled last time) instead of the
+permanent `None` stub it was before. `LastLearningBSensor` remains a
+stub — that one's still correct, since Model B v1 training genuinely
+doesn't exist yet (see the v0 -> v1 upgrade path discussed earlier in
+this document).
+
+Tested at three levels: the new pure function (`find_nearest_observation`)
+in isolation, the new DB queries in isolation, and — given how much this
+depends on several pieces working correctly together — a dedicated
+end-to-end test file (`test_learning_integration.py`) that replicates the
+coordinator's exact logic against a real database, confirming a forecast
+plus a matching station reading genuinely produces a real `bucket_stats`
+row via the full flow, not just when the individual functions are called
+directly.
+
 ## v0.1.6 — SRF going silent (hypothesis, not confirmed), and a real timezone bug
 
 Two issues found from a status check before v0.1.5 was even deployed —

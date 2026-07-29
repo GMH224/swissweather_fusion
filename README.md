@@ -112,8 +112,14 @@ Beyond the main `weather.*` entity, this integration exposes:
 
 ## Known v0.1 limitations
 
-- `forecast_accuracy` and `last_learning_a/b` are honest stubs (return
-  `None`) pending the first real run's data — see DEVELOPER.md.
+- `forecast_accuracy` and `last_learning_b` are honest stubs (return
+  `None`) — `forecast_accuracy` pending a real rolling-MAE implementation,
+  `last_learning_b` because Model B's v1 trained classifier genuinely
+  doesn't exist yet (see DEVELOPER.md for the v0→v1 upgrade path).
+  `last_learning_a` is no longer a stub — Model A's actual bias-learning
+  step (comparing past forecasts against real station readings and
+  updating the learned correction) now runs every 20 minutes; this sensor
+  reports its last real run.
 - The CombiPrecip radar client's HDF5 parsing is built against the
   documented ODIM_H5 standard, not a downloaded real file (no network
   access to data.geo.admin.ch in the environment that built this) — worth
