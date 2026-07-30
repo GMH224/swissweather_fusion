@@ -613,6 +613,22 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
     blocking property-reads would have been much worse than the same
     work batched into one executor job.
 
+    **v0.1.13 fix**: moving the work into one executor job wasn't enough
+    on its own — the job itself was still doing up to ~8,400 individual
+    sequential database round trips every single cycle (168 hours × 5
+    measurements × up to 5 sources, each needing its own
+    get_forecast_values_for_valid_at *and* get_bucket_stats call). Found
+    while investigating a reported multi-hour freeze affecting every
+    coordinator simultaneously — whether or not this was the full
+    explanation, an executor job potentially taking a very long time
+    every 10 minutes is a real problem on its own, tying up a thread far
+    longer than it needs to. Now: two bulk queries
+    (get_forecast_snapshots_in_window, get_all_bucket_stats) fetch
+    everything needed for the whole 168-hour computation up front, and
+    _blend_at becomes a pure in-memory lookup with no database access at
+    all — the same math, just no longer paying for a round trip per
+    individual lookup.
+
     Also the home of wind_speed exposure, which was already flowing
     through Model A's blend (every client already reports it) but was
     never actually surfaced on the weather entity — data that existed
@@ -639,15 +655,21 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self) -> dict[str, Any]:
         return await self.hass.async_add_executor_job(self._compute_blend)
 
-    def _blend_at(self, measurement: str, target_hour: datetime) -> Optional[float]:
-        """Synchronous — only ever called from inside _compute_blend,
-        which itself only ever runs inside the executor job above. Same
-        logic that used to live in weather.py, relocated rather than
-        rewritten, since the logic itself was already correct — only
-        where it ran was the problem.
+    def _blend_at(
+        self,
+        measurement: str,
+        target_hour: datetime,
+        *,
+        latest_forecast: dict[tuple[str, str, str], tuple[float, datetime]],
+        bucket_lookup: dict[tuple, Any],
+    ) -> Optional[float]:
+        """**v0.1.13**: pure in-memory lookup, no database access at all —
+        both dicts are built once per cycle in _compute_blend from two
+        bulk queries, not fetched here. Same blending math as before,
+        just no longer paying for a round trip per (hour, measurement,
+        source) combination.
         """
         from .models import model_a
-        from .storage.db import BucketKey
 
         hour_of_day = target_hour.hour
         season = model_a.derive_season(target_hour)
@@ -655,34 +677,25 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
 
         contributions: list[model_a.SourceContribution] = []
         for source in ALL_FORECAST_SOURCES:
-            rows = self._db.get_forecast_values_for_valid_at(
-                source=source, variable=measurement, valid_at=target_iso
-            )
-            if not rows:
+            entry = latest_forecast.get((source, measurement, target_iso))
+            if entry is None:
                 continue
-            latest_row = rows[0]  # already ordered by issued_at DESC
-            issued_at = datetime.fromisoformat(latest_row["issued_at"])
+            raw_value, issued_at = entry
             lead_time_bucket = model_a.derive_lead_time_bucket(issued_at, target_hour)
-            bucket = self._db.get_bucket_stats(
-                BucketKey(
-                    hour_of_day=hour_of_day,
-                    season=season,
-                    lead_time_bucket=lead_time_bucket,
-                    source=source,
-                    measurement=measurement,
-                )
+            bucket = bucket_lookup.get(
+                (hour_of_day, season, lead_time_bucket, source, measurement)
             )
             if bucket is None:
                 contributions.append(
                     model_a.SourceContribution(
-                        source=source, raw_value=latest_row["value"],
+                        source=source, raw_value=raw_value,
                         ema_bias=0.0, ema_weight=1.0, sample_count=0,
                     )
                 )
             else:
                 contributions.append(
                     model_a.SourceContribution(
-                        source=source, raw_value=latest_row["value"],
+                        source=source, raw_value=raw_value,
                         ema_bias=bucket.ema_bias, ema_weight=bucket.ema_weight,
                         sample_count=bucket.sample_count,
                     )
@@ -691,19 +704,51 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
 
     def _compute_blend(self) -> dict[str, Any]:
         from .models import model_a
+        from .storage.db import BucketStats
 
         now = model_a.utcnow().replace(minute=0, second=0, microsecond=0)
+        end = now + timedelta(hours=self.FORECAST_HOURS_AHEAD)
 
-        current = {m: self._blend_at(m, now) for m in self.MEASUREMENTS}
+        # Two bulk queries for the whole cycle, replacing what used to be
+        # up to ~8,400 individual round trips — see the class docstring.
+        raw_rows = self._db.get_forecast_snapshots_in_window(
+            start_valid_at=now.isoformat(), end_valid_at=end.isoformat()
+        )
+        latest_forecast: dict[tuple[str, str, str], tuple[float, datetime]] = {}
+        for row in raw_rows:
+            if row["value"] is None:
+                continue
+            key = (row["source"], row["variable"], row["valid_at"])
+            if key in latest_forecast:
+                continue  # already have the freshest (rows are issued_at DESC)
+            latest_forecast[key] = (row["value"], datetime.fromisoformat(row["issued_at"]))
+
+        bucket_rows = self._db.get_all_bucket_stats()
+        bucket_lookup: dict[tuple, BucketStats] = {}
+        for row in bucket_rows:
+            key = (
+                row["hour_of_day"], row["season"], row["lead_time_bucket"],
+                row["source"], row["measurement"],
+            )
+            bucket_lookup[key] = BucketStats(
+                ema_bias=row["ema_bias"], ema_abs_error=row["ema_abs_error"],
+                ema_weight=row["ema_weight"], sample_count=row["sample_count"],
+                last_updated=row["last_updated"],
+            )
+
+        current = {
+            m: self._blend_at(m, now, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
+            for m in self.MEASUREMENTS
+        }
 
         hourly_forecast: list[dict[str, Any]] = []
         for i in range(self.FORECAST_HOURS_AHEAD):
             target = now + timedelta(hours=i)
-            temperature = self._blend_at("temperature", target)
-            humidity = self._blend_at("humidity", target)
-            pressure = self._blend_at("pressure", target)
-            precip = self._blend_at("precip", target)
-            wind_speed = self._blend_at("wind_speed", target)
+            temperature = self._blend_at("temperature", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
+            humidity = self._blend_at("humidity", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
+            pressure = self._blend_at("pressure", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
+            precip = self._blend_at("precip", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
+            wind_speed = self._blend_at("wind_speed", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
             # Skip hours with literally nothing from any source — no
             # point showing an all-None row, and sources with shorter
             # horizons (CH1's ~33-45h) will naturally taper off within

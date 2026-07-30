@@ -1,5 +1,44 @@
 # Developer notes: architecture rationale
 
+## v0.1.13 — the lock fix didn't work; a real performance problem, fixed regardless
+
+A 50-minute post-deploy diagnostics capture showed the v0.1.12 lock fix
+did not resolve the freeze. The identical signature recurred exactly:
+every coordinator succeeds once in the startup burst, then goes silent —
+this time even the learning coordinator's `last_run_time` (new in
+v0.1.11's wider diagnostics coverage) confirmed the same freeze instant.
+Since serializing all database access didn't stop it from recurring, the
+SQLite-connection-concurrency theory from v0.1.12 is not the (or not the
+whole) explanation. Worth saying plainly rather than defending a theory
+the evidence didn't support.
+
+**What's fixed instead, independent of full certainty about the exact
+mechanism**: `ModelABlendCoordinator._compute_blend` was doing up to
+~8,400 individual sequential database round trips every single 10-minute
+cycle — 168 forecast hours × 5 measurements × up to 5 sources, each
+needing its own `get_forecast_values_for_valid_at` *and* `get_bucket_stats`
+call. An executor job potentially taking minutes every cycle, holding a
+thread the whole time, is a real problem regardless of whether it's the
+full explanation for the reported freeze — plausible given every affected
+coordinator shares the same executor pool, and worth fixing either way.
+
+Replaced with two bulk queries per cycle
+(`get_forecast_snapshots_in_window`, `get_all_bucket_stats`) that fetch
+everything the whole 168-hour computation needs up front; `_blend_at`
+becomes a pure in-memory dictionary lookup with zero database access.
+Same blending math, same result — just no longer paying for a round trip
+per individual (hour, measurement, source) combination. Confirmed with a
+test that counts actual SQL statements executed (via sqlite3's own
+`set_trace_callback`, since `Connection.execute` itself can't be
+monkey-patched) against a synthetic 4,200-row dataset: exactly one query
+per bulk fetch, regardless of data volume — not the roughly 8,400 queries
+the old per-lookup approach would have made against the same data.
+
+**Being honest about where this leaves the actual freeze question**: this
+is a real, independently-justified fix, not a confirmed resolution.
+Whether it's sufficient — or whether the true cause is something else
+entirely — should become clear from the next deployment's diagnostics.
+
 ## v0.1.12 — a likely root cause for the multi-hour freeze, and the fix
 
 A 5-hour diagnostics capture made the freeze question conclusive rather

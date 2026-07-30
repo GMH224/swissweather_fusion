@@ -325,6 +325,41 @@ class SwissWeatherDB:
             )
             return cur.fetchall()
 
+    def get_forecast_snapshots_in_window(
+        self, *, start_valid_at: str, end_valid_at: str
+    ) -> list[sqlite3.Row]:
+        """**v0.1.13**: one bulk query replacing what used to be up to
+        thousands of individual `get_forecast_values_for_valid_at` calls
+        per blend cycle (168 hours × 5 measurements × up to 5 sources,
+        each needing its own round trip). Returns every row in the
+        window across all sources/measurements; the caller groups by
+        (source, variable, valid_at) and keeps the freshest issued_at per
+        group in memory, replicating what the old per-call
+        `ORDER BY issued_at DESC LIMIT via [0]` pattern did — just once
+        for the whole batch instead of once per (hour, measurement,
+        source) combination.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM forecast_snapshots WHERE valid_at >= ? AND valid_at <= ? "
+                "ORDER BY source, variable, valid_at, issued_at DESC",
+                (start_valid_at, end_valid_at),
+            )
+            return cur.fetchall()
+
+    def get_all_bucket_stats(self) -> list[sqlite3.Row]:
+        """**v0.1.13**: bucket_stats is documented to stay small
+        permanently by design (a fixed number of hour/season/lead-time/
+        source/measurement combinations, not one row per observation) —
+        fetching the whole table in one query and indexing it in memory
+        is cheap, and replaces what used to be a separate
+        `get_bucket_stats` round trip for every single hour/measurement/
+        source combination in a blend cycle.
+        """
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM bucket_stats")
+            return cur.fetchall()
+
     # -- radar observations (CombiPrecip) ----------------------------------------
 
     def insert_radar_observation(

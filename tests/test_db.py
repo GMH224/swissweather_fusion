@@ -180,3 +180,44 @@ def test_get_forecast_snapshots_to_reconcile_filters_by_measurement_and_window(d
     # valid_at 2026-07-26 is outside the until_ts window.
     variables = sorted(r["variable"] for r in rows)
     assert variables == ["humidity", "temperature"]
+
+
+def test_get_forecast_snapshots_in_window_returns_everything_ordered_for_grouping(db):
+    """v0.1.13: the bulk-fetch replacement for what used to be thousands
+    of individual round-trip queries per blend cycle. Confirms it returns
+    every row in the window (all sources/measurements together) ordered
+    so the caller can group by (source, variable, valid_at) and take the
+    freshest issued_at per group in one pass.
+    """
+    db.insert_forecast_snapshot("ch1", "2026-07-25T09:00:00+00:00", "2026-07-25T12:00:00+00:00", "temperature", 20.0)
+    db.insert_forecast_snapshot("ch1", "2026-07-25T11:00:00+00:00", "2026-07-25T12:00:00+00:00", "temperature", 21.0)  # fresher issued_at, same valid_at
+    db.insert_forecast_snapshot("ch2", "2026-07-25T06:00:00+00:00", "2026-07-25T12:00:00+00:00", "humidity", 55.0)
+    db.insert_forecast_snapshot("ch1", "2026-07-26T09:00:00+00:00", "2026-07-26T12:00:00+00:00", "temperature", 18.0)  # outside window
+
+    rows = db.get_forecast_snapshots_in_window(
+        start_valid_at="2026-07-25T00:00:00+00:00", end_valid_at="2026-07-25T23:59:59+00:00"
+    )
+    assert len(rows) == 3  # the out-of-window row is excluded
+
+    # Group by (source, variable, valid_at), keep first (freshest
+    # issued_at, per the DESC ordering) — the same logic the coordinator
+    # applies to this result set.
+    latest: dict = {}
+    for row in rows:
+        key = (row["source"], row["variable"], row["valid_at"])
+        if key not in latest:
+            latest[key] = row
+    ch1_temp = latest[("ch1", "temperature", "2026-07-25T12:00:00+00:00")]
+    assert ch1_temp["value"] == 21.0  # the fresher issued_at's value won
+
+
+def test_get_all_bucket_stats_returns_whole_table(db):
+    key1 = BucketKey(hour_of_day=12, season="JJA", lead_time_bucket="short", source="ch1", measurement="temperature")
+    key2 = BucketKey(hour_of_day=15, season="JJA", lead_time_bucket="medium", source="ch2", measurement="humidity")
+    db.upsert_bucket_stats(key1, 0.1, 0.2, 1.0, 5, "2026-07-25T12:00:00+00:00")
+    db.upsert_bucket_stats(key2, 0.3, 0.4, 2.0, 8, "2026-07-25T12:00:00+00:00")
+
+    rows = db.get_all_bucket_stats()
+    assert len(rows) == 2
+    sources = sorted(r["source"] for r in rows)
+    assert sources == ["ch1", "ch2"]
