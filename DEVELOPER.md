@@ -1,5 +1,64 @@
 # Developer notes: architecture rationale
 
+## v0.1.9 — toggleable diagnostic logging, ending the screenshot-and-guess cycle
+
+Every debugging round from v0.1.1 through v0.1.8 followed the same
+pattern: a problem shows up, a few sensor states get screenshotted from a
+phone, real progress only happens once an actual log file gets uploaded —
+and even then, a fixed log-truncation length repeatedly cut off the
+useful part of SRF's response before it could be seen (500 → 4000 → 20000
+characters, three separate increases). Requested directly: a
+toggleable, downloadable diagnostic log, off by default, that ends this
+cycle.
+
+**Two pieces working together**, deliberately using an existing HA
+mechanism rather than inventing a new one:
+
+1. **`DiagnosticsRecorder`** (`diagnostics_recorder.py`) — a bounded
+   in-memory ring buffer (1000 events) that every coordinator writes
+   structured events into (poll start/success/failure, and for SRF
+   specifically, the full untruncated raw response body on both success
+   and failure) when enabled. Off by default — an options-flow toggle
+   (`diagnostic_logging_enabled`), which like every other options change
+   triggers a full reload, so flipping it naturally starts the buffer
+   fresh. Deliberately **not persisted to the database** — survives until
+   the next restart/reload, not across one. The intended workflow is
+   "enable it, let the problem happen, download before restarting," not
+   "look back at last week" — persisting this would mean a new table, a
+   purge policy, and real storage growth for what's meant to be a
+   short-lived, active-debugging tool.
+2. **`diagnostics.py`** implements Home Assistant's own
+   `async_get_config_entry_diagnostics` hook — this is what makes a
+   "Download Diagnostics" option appear natively in the integration's UI
+   (Settings → Devices & Services → the three-dot menu). No custom
+   download mechanism was built; HA already has one for exactly this.
+
+**The redaction requirement turned out to be bigger than "hide the API
+keys."** A real captured SRF response embedded `alarm_region_name`,
+`district`, and a `geolocation_names` entry with `name`/`province` —
+identifying location data from the *third-party API's own response
+body*, not just this project's configuration. Since the whole point of
+this feature is content meant to be shared (with Claude, in a GitHub
+issue, wherever), `redaction.py` runs a combined pass **before anything
+enters the buffer, not as a filter applied only at export time**:
+key-name-based redaction (catching `lat`/`lon`/`elevation`/`district`/
+`name`/etc. wherever they appear in arbitrary nested third-party JSON,
+not just a fixed set of top-level config keys) plus a text-level
+substitution of the exact configured coordinates in likely string
+formats (catching SRF's own `geolocationId`, which is literally the
+string `"46.9480,7.4474"` stored under the innocuous key name `"id"` —
+key-based redaction alone wouldn't flag that). Deliberately over-inclusive
+rather than precise: an occasionally-redacted harmless field costs far
+less than missing a genuinely identifying one from an API whose exact
+shape isn't fully known in advance. Tested directly against the real SRF
+response structure that motivated this, not just synthetic examples.
+
+Wired into all six data-fetching coordinators (Station, Open-Meteo, SRF,
+meteoblue, CombiPrecip, Meteonomiqs) for at least lightweight success/
+failure events — useful on its own for the open "is everything actually
+updating" question from earlier — with SRF specifically getting full raw-
+response capture, since it's the source under active investigation.
+
 ## v0.1.8 — SRF's real shape confirmed: daily, not hourly, and isolated accordingly
 
 The v0.1.7 truncation increase (500→4000 characters) worked exactly as

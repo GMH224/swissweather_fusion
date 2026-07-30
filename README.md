@@ -145,6 +145,37 @@ fix is different (re-enter credentials vs. just wait for the normal
 retry). `binary_sensor.*_degraded` gives one glance-able "is anything
 wrong" flag; the per-source sensors tell you which one and why.
 
+### Detailed diagnostic logging (off by default)
+
+For deeper troubleshooting than the per-source sensors give you, this
+integration has a toggleable, downloadable diagnostic log:
+
+1. **Settings → Devices & Services → SwissWeather Fusion → Configure**,
+   enable "Enable detailed diagnostic logging." This reloads the
+   integration and starts capturing detailed events (poll attempts,
+   successes, failures, and — for SRF specifically — the full raw API
+   response body) into memory.
+2. Let the problem you're investigating actually happen.
+3. **Settings → Devices & Services → SwissWeather Fusion → ⋮ (three-dot
+   menu) → Download Diagnostics.** This uses Home Assistant's own
+   built-in diagnostics mechanism — no custom download tool, just the
+   standard one every integration can use.
+4. Turn the toggle back off once you're done, if you don't want it
+   running continuously.
+
+Two things worth knowing about this file before you share it:
+- **Credentials, coordinates, and elevation are redacted automatically**,
+  including inside raw third-party API response bodies (not just this
+  integration's own configuration) — location data can be embedded in a
+  third-party response in fields this project doesn't fully control the
+  shape of, so redaction is deliberately broad rather than a fixed list
+  of known keys.
+- **The buffer is in-memory only** — it resets on restart or reload
+  (including when you toggle the setting itself, since that reloads the
+  integration). It's meant for "enable it, reproduce the problem, download
+  it" in one sitting, not a historical log you can look back at days
+  later.
+
 ## More detail
 
 See [DEVELOPER.md](DEVELOPER.md) for the full architecture rationale —

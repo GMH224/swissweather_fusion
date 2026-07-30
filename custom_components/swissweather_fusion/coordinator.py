@@ -73,6 +73,8 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         latitude: float,
         longitude: float,
         api_key: Optional[str] = None,
+        *,
+        diagnostics: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -83,6 +85,7 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         self._db = db
         self._latitude = latitude
         self._longitude = longitude
+        self._diagnostics = diagnostics
         self._client = OpenMeteoClient(async_get_clientsession(hass), api_key=api_key)
         self._last_issued_at: dict[str, datetime] = {}
         # One health tracker per model, not one for the whole coordinator —
@@ -110,9 +113,18 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                 _LOGGER.warning(
                     "Open-Meteo fetch failed for %s (%s error): %s", source, kind, err
                 )
+                if self._diagnostics is not None:
+                    self._diagnostics.record(
+                        source=source, event_type="poll_failure", detail=str(err)
+                    )
                 continue
             duration_ms = (time.monotonic() - start) * 1000
             self.health[source].record_success(duration_ms=duration_ms)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source=source, event_type="poll_success",
+                    detail=f"{len(parsed.points)} points",
+                )
 
             previous_issued = self._last_issued_at.get(source)
             if previous_issued is not None and parsed.issued_at <= previous_issued:
@@ -153,6 +165,8 @@ class SrfCoordinator(DataUpdateCoordinator):
         longitude: float,
         consumer_key: str,
         consumer_secret: str,
+        *,
+        diagnostics: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -163,13 +177,21 @@ class SrfCoordinator(DataUpdateCoordinator):
         self._db = db
         self._latitude = latitude
         self._longitude = longitude
+        self._diagnostics = diagnostics
         self._client = SrfClient(
-            async_get_clientsession(hass), consumer_key, consumer_secret
+            async_get_clientsession(hass),
+            consumer_key,
+            consumer_secret,
+            diagnostics=diagnostics,
+            latitude=latitude,
+            longitude=longitude,
         )
         self.health = SourceHealth()
 
     async def _async_update_data(self) -> list[Any]:
         start = time.monotonic()
+        if self._diagnostics is not None:
+            self._diagnostics.record(source="srf", event_type="poll_start", detail="polling")
         try:
             # v0.1.6: an outer backstop timeout, in addition to the
             # per-request timeouts added in the client itself — belt and
@@ -185,6 +207,11 @@ class SrfCoordinator(DataUpdateCoordinator):
         except Exception as err:  # noqa: BLE001
             duration_ms = (time.monotonic() - start) * 1000
             kind = self.health.record_error(err, duration_ms=duration_ms)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="srf", event_type="poll_failure",
+                    detail=f"{kind} error: {err}",
+                )
             if kind == "auth":
                 # This is the "API key expired" case specifically — surface
                 # it distinctly rather than let it look like an ordinary
@@ -197,6 +224,11 @@ class SrfCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"SRF fetch failed ({kind} error): {err}") from err
         duration_ms = (time.monotonic() - start) * 1000
         self.health.record_success(duration_ms=duration_ms)
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="srf", event_type="poll_success",
+                detail=f"{len(points)} points", extra={"point_count": len(points)},
+            )
 
         now_iso = datetime.now(timezone.utc).isoformat()
         rows = [
@@ -218,7 +250,14 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
     CHECK_INTERVAL = timedelta(minutes=5)
 
     def __init__(
-        self, hass: HomeAssistant, db: SwissWeatherDB, latitude: float, longitude: float, api_key: str
+        self,
+        hass: HomeAssistant,
+        db: SwissWeatherDB,
+        latitude: float,
+        longitude: float,
+        api_key: str,
+        *,
+        diagnostics: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -229,6 +268,7 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
         self._db = db
         self._latitude = latitude
         self._longitude = longitude
+        self._diagnostics = diagnostics
         self._client = MeteoblueClient(async_get_clientsession(hass), api_key)
         self._bonus_tracker = BonusCallTracker()
         self._last_scheduled_call_hour: Optional[datetime] = None
@@ -252,6 +292,11 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
             latitude=self._latitude, longitude=self._longitude
         )
         self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="meteoblue", event_type="poll_success",
+                detail=f"{len(parsed.points)} points ({trigger_reason})",
+            )
         rows = [
             (
                 "meteoblue",
@@ -284,6 +329,10 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
             self._last_scheduled_call_hour = local_dt
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="meteoblue", event_type="poll_failure", detail=str(err)
+                )
             raise UpdateFailed(f"meteoblue fetch failed: {err}") from err
         return None
 
@@ -295,7 +344,13 @@ class CombiPrecipCoordinator(DataUpdateCoordinator):
     """
 
     def __init__(
-        self, hass: HomeAssistant, db: SwissWeatherDB, latitude: float, longitude: float
+        self,
+        hass: HomeAssistant,
+        db: SwissWeatherDB,
+        latitude: float,
+        longitude: float,
+        *,
+        diagnostics: Any = None,
     ) -> None:
         from .const import COMBIPRECIP_POLL_INTERVAL
 
@@ -306,6 +361,7 @@ class CombiPrecipCoordinator(DataUpdateCoordinator):
             update_interval=COMBIPRECIP_POLL_INTERVAL,
         )
         self._db = db
+        self._diagnostics = diagnostics
         self._client = CombiPrecipClient(
             async_get_clientsession(hass),
             latitude,
@@ -332,8 +388,17 @@ class CombiPrecipCoordinator(DataUpdateCoordinator):
             )
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err, duration_ms=(time.monotonic() - start) * 1000)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="combiprecip", event_type="poll_failure", detail=str(err)
+                )
             raise UpdateFailed(f"CombiPrecip fetch failed: {err}") from err
         self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="combiprecip", event_type="poll_success",
+                detail=f"{len(values)} points extracted",
+            )
 
         # Only the "local" point goes into radar_observations (const.py
         # schema — one row per scan for the configured location); the
@@ -363,6 +428,8 @@ class StationCoordinator(DataUpdateCoordinator):
         temp_entity: str,
         humidity_entity: str,
         pressure_entity: str,
+        *,
+        diagnostics: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -374,6 +441,7 @@ class StationCoordinator(DataUpdateCoordinator):
         self._temp_entity = temp_entity
         self._humidity_entity = humidity_entity
         self._pressure_entity = pressure_entity
+        self._diagnostics = diagnostics
 
     def _read_float_state(self, entity_id: str) -> Optional[float]:
         state = self.hass.states.get(entity_id)
@@ -414,7 +482,13 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
     CHECK_INTERVAL = timedelta(hours=6)
 
     def __init__(
-        self, hass: HomeAssistant, latitude: float, longitude: float, api_key: str
+        self,
+        hass: HomeAssistant,
+        latitude: float,
+        longitude: float,
+        api_key: str,
+        *,
+        diagnostics: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -424,6 +498,7 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         )
         self._latitude = latitude
         self._longitude = longitude
+        self._diagnostics = diagnostics
         self._client = MeteonomiqsClient(async_get_clientsession(hass), api_key)
         self._budget = AnnualCallBudget(METEONOMIQS_ANNUAL_CALL_BUDGET)
         self._last_successful_call_date: Optional[date] = None
@@ -453,8 +528,17 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
             )
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err, duration_ms=(time.monotonic() - start) * 1000)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="meteonomiqs", event_type="poll_failure",
+                    detail=f"nowcast: {err}",
+                )
             raise
         self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="meteonomiqs", event_type="poll_success", detail="nowcast",
+            )
         self._budget.record_call(today=today)
         self._last_successful_call_date = today
 
@@ -466,8 +550,17 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
             )
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err, duration_ms=(time.monotonic() - start) * 1000)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="meteonomiqs", event_type="poll_failure",
+                    detail=f"hourly_forecast: {err}",
+                )
             raise
         self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="meteonomiqs", event_type="poll_success", detail="hourly_forecast",
+            )
         self._budget.record_call(today=today)
         self._last_successful_call_date = today
 

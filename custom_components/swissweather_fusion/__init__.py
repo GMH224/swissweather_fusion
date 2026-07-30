@@ -11,6 +11,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_DIAGNOSTIC_LOGGING_ENABLED,
     CONF_ELEVATION_EFFECTIVE,
     CONF_ELEVATION_OVERRIDE,
     CONF_LATITUDE,
@@ -24,6 +25,8 @@ from .const import (
     CONF_STATION_PRESSURE_ENTITY,
     CONF_STATION_TEMP_ENTITY,
     DB_FILENAME,
+    DEFAULT_DIAGNOSTIC_LOGGING_ENABLED,
+    DIAGNOSTIC_EVENT_BUFFER_SIZE,
     DOMAIN,
 )
 from .coordinator import (
@@ -37,6 +40,7 @@ from .coordinator import (
     SrfCoordinator,
     StationCoordinator,
 )
+from .diagnostics_recorder import DiagnosticsRecorder
 from .storage.db import SwissWeatherDB
 
 _LOGGER = logging.getLogger(__name__)
@@ -80,11 +84,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         CONF_OPEN_METEO_API_KEY, data.get(CONF_OPEN_METEO_API_KEY)
     )
 
+    # v0.1.9: toggleable diagnostic logging — off by default. Since any
+    # options change already triggers a full reload (see the update
+    # listener below), toggling this naturally recreates the recorder
+    # fresh each time, consistent with it being in-memory-only (see
+    # diagnostics_recorder.py for why that's a deliberate trade-off, not
+    # an oversight).
+    diagnostic_logging_enabled = options.get(
+        CONF_DIAGNOSTIC_LOGGING_ENABLED, DEFAULT_DIAGNOSTIC_LOGGING_ENABLED
+    )
+    diagnostics_recorder = DiagnosticsRecorder(max_events=DIAGNOSTIC_EVENT_BUFFER_SIZE)
+    diagnostics_recorder.set_enabled(diagnostic_logging_enabled)
+
     station_coordinator = StationCoordinator(
-        hass, db, temp_entity, humidity_entity, pressure_entity
+        hass, db, temp_entity, humidity_entity, pressure_entity,
+        diagnostics=diagnostics_recorder,
     )
     open_meteo_coordinator = OpenMeteoCoordinator(
-        hass, db, latitude, longitude, api_key=open_meteo_api_key
+        hass, db, latitude, longitude, api_key=open_meteo_api_key,
+        diagnostics=diagnostics_recorder,
     )
     srf_coordinator = SrfCoordinator(
         hass,
@@ -93,13 +111,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         longitude,
         srf_consumer_key,
         srf_consumer_secret,
+        diagnostics=diagnostics_recorder,
     )
     meteoblue_coordinator = MeteoblueCoordinator(
-        hass, db, latitude, longitude, meteoblue_api_key
+        hass, db, latitude, longitude, meteoblue_api_key,
+        diagnostics=diagnostics_recorder,
     )
-    combiprecip_coordinator = CombiPrecipCoordinator(hass, db, latitude, longitude)
+    combiprecip_coordinator = CombiPrecipCoordinator(
+        hass, db, latitude, longitude, diagnostics=diagnostics_recorder
+    )
     meteonomiqs_coordinator = MeteonomiqsCoordinator(
-        hass, latitude, longitude, meteonomiqs_api_key
+        hass, latitude, longitude, meteonomiqs_api_key,
+        diagnostics=diagnostics_recorder,
     )
     model_b_coordinator = ModelBCoordinator(
         hass,
@@ -191,6 +214,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "model_b_coordinator": model_b_coordinator,
         "blend_coordinator": blend_coordinator,
         "learning_coordinator": learning_coordinator,
+        "diagnostics_recorder": diagnostics_recorder,
     }
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

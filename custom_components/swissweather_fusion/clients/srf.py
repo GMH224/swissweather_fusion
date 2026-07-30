@@ -117,7 +117,7 @@ def parse_geolocation_response(payload: Any) -> Optional[str]:
     response body wasn't captured to confirm definitively.
 
     **v0.1.4**: also defends against each list entry being a bare string
-    (e.g. the coordinate itself, like "47.5536,8.9120") rather than an
+    (e.g. the coordinate itself, like "46.9480,7.4474") rather than an
     object with a geolocationId/id field — a third SRF response-shape
     surprise made this worth guarding rather than assuming a fixed shape.
     If an entry is already a string, it's presumably already usable as
@@ -222,15 +222,48 @@ def parse_forecast_response(payload: Any) -> list[SrfForecastPoint]:
 
 
 class SrfClient:
-    """Requires an aiohttp.ClientSession (HA's shared session)."""
+    """Requires an aiohttp.ClientSession (HA's shared session).
 
-    def __init__(self, session: Any, consumer_key: str, consumer_secret: str) -> None:
+    diagnostics/latitude/longitude are optional (v0.1.9) — when a
+    DiagnosticsRecorder is provided and enabled, raw response bodies for
+    the "parsed successfully but found zero usable data" cases are
+    recorded there in full (redacted first — see redaction.py), not just
+    logged as a truncated string. latitude/longitude are needed for the
+    coordinate-value redaction pass specifically.
+    """
+
+    def __init__(
+        self,
+        session: Any,
+        consumer_key: str,
+        consumer_secret: str,
+        *,
+        diagnostics: Any = None,
+        latitude: Optional[float] = None,
+        longitude: Optional[float] = None,
+    ) -> None:
         self._session = session
         self._consumer_key = consumer_key
         self._consumer_secret = consumer_secret
         self._token: Optional[CachedToken] = None
         self._geolocation_id: Optional[str] = None
         self._geolocation_coords: Optional[tuple[float, float]] = None
+        self._diagnostics = diagnostics
+        self._latitude = latitude
+        self._longitude = longitude
+
+    def _record_diagnostic(self, *, event_type: str, detail: str, raw_payload: Any) -> None:
+        if self._diagnostics is None or not getattr(self._diagnostics, "enabled", False):
+            return
+        from ..redaction import redact_diagnostic_payload
+
+        redacted = redact_diagnostic_payload(
+            raw_payload, latitude=self._latitude or 0.0, longitude=self._longitude or 0.0
+        )
+        self._diagnostics.record(
+            source="srf", event_type=event_type, detail=detail,
+            extra={"raw_response": redacted},
+        )
 
     async def _async_ensure_token(self) -> str:
         if self._token is None or self._token.is_expired():
@@ -279,6 +312,15 @@ class SrfClient:
                 "response (truncated): %s",
                 repr(payload)[:DIAGNOSTIC_LOG_TRUNCATION_CHARS],
             )
+            # v0.1.9: when diagnostic logging is enabled, also capture the
+            # FULL (redacted, not truncated) payload for download via
+            # Home Assistant's own Diagnostics button — no more guessing
+            # at a truncation length that might cut off the useful part.
+            self._record_diagnostic(
+                event_type="raw_response",
+                detail="SRF geolocation lookup returned no usable result",
+                raw_payload=payload,
+            )
             raise ValueError("SRF geolocation lookup returned no results")
         self._geolocation_id = geolocation_id
         self._geolocation_coords = (latitude, longitude)
@@ -308,5 +350,21 @@ class SrfClient:
                 "SRF forecast response produced no usable data points. Raw "
                 "response (truncated): %s",
                 repr(payload)[:DIAGNOSTIC_LOG_TRUNCATION_CHARS],
+            )
+            self._record_diagnostic(
+                event_type="raw_response",
+                detail="SRF forecast response produced no usable data points",
+                raw_payload=payload,
+            )
+        else:
+            # v0.1.9: also capture successful responses in full when
+            # diagnostics is enabled — specifically useful for the still-
+            # open question of whether the response contains an "hour" or
+            # "three_hours" array beyond what any fixed log-truncation
+            # length happened to reach (see DEVELOPER.md).
+            self._record_diagnostic(
+                event_type="raw_response",
+                detail=f"SRF forecast response parsed successfully ({len(points)} points)",
+                raw_payload=payload,
             )
         return points

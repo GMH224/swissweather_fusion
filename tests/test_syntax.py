@@ -25,6 +25,7 @@ HA_DEPENDENT_FILES = [
     "sensor.py",
     "binary_sensor.py",
     "device.py",
+    "diagnostics.py",
 ]
 
 

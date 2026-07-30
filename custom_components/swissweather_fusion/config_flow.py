@@ -26,6 +26,7 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .clients.open_meteo import OpenMeteoClient
 from .const import (
+    CONF_DIAGNOSTIC_LOGGING_ENABLED,
     CONF_ELEVATION_OVERRIDE,
     CONF_LATITUDE,
     CONF_LONGITUDE,
@@ -38,6 +39,7 @@ from .const import (
     CONF_STATION_HUMIDITY_ENTITY,
     CONF_STATION_PRESSURE_ENTITY,
     CONF_STATION_TEMP_ENTITY,
+    DEFAULT_DIAGNOSTIC_LOGGING_ENABLED,
     DEFAULT_PURGE_DAYS,
     DOMAIN,
 )
@@ -288,6 +290,12 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                 vol.Required(
                     CONF_PURGE_DAYS, default=current.get(CONF_PURGE_DAYS, DEFAULT_PURGE_DAYS)
                 ): vol.Coerce(int),
+                vol.Required(
+                    CONF_DIAGNOSTIC_LOGGING_ENABLED,
+                    default=current.get(
+                        CONF_DIAGNOSTIC_LOGGING_ENABLED, DEFAULT_DIAGNOSTIC_LOGGING_ENABLED
+                    ),
+                ): selector.BooleanSelector(),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

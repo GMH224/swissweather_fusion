@@ -30,8 +30,8 @@ def test_build_forecast_url_uses_path_parameter_not_query_string():
     the URL included an incorrect /v2/ path segment. Confirmed correct
     structure from SRG-SSR's own docs and a real working example.
     """
-    url = srf.build_forecast_url("47.5536,8.9120")
-    assert url == "https://api.srgssr.ch/srf-meteo/forecast/47.5536,8.9120"
+    url = srf.build_forecast_url("46.9480,7.4474")
+    assert url == "https://api.srgssr.ch/srf-meteo/forecast/46.9480,7.4474"
     assert "?geolocationId=" not in url
     assert "/v2/" not in url
 
@@ -82,8 +82,8 @@ def test_parse_geolocation_response_string_entry_v0_1_4_fix():
     coordinate itself) rather than an object with a geolocationId/id
     field. If it's already a string, treat it as already usable.
     """
-    assert srf.parse_geolocation_response(["47.5536,8.9120"]) == "47.5536,8.9120"
-    assert srf.parse_geolocation_response({"geolocations": ["47.5536,8.9120"]}) == "47.5536,8.9120"
+    assert srf.parse_geolocation_response(["46.9480,7.4474"]) == "46.9480,7.4474"
+    assert srf.parse_geolocation_response({"geolocations": ["46.9480,7.4474"]}) == "46.9480,7.4474"
 
 
 def test_parse_geolocation_response_unexpected_top_level_types():
@@ -104,7 +104,7 @@ def test_parse_forecast_response_matches_confirmed_real_structure():
     silently blended as if they were hourly point values.
     """
     payload = {
-        "geolocation": {"id": "47.5536,8.9120", "default_name": "Neuhuuse"},
+        "geolocation": {"id": "46.9480,7.4474", "default_name": "ExampleTown"},
         "forecast": {
             "day": [
                 {

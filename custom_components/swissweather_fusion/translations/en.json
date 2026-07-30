@@ -61,7 +61,8 @@
           "meteoblue_api_key": "meteoblue API key (leave blank to keep existing)",
           "meteonomiqs_api_key": "Meteonomiqs API key (leave blank to keep existing)",
           "open_meteo_api_key": "Open-Meteo API key (optional, paid tier only; leave blank to keep existing or stay on the free tier)",
-          "purge_days": "Database purge window (days, 0 = keep forever)"
+          "purge_days": "Database purge window (days, 0 = keep forever)",
+          "diagnostic_logging_enabled": "Enable detailed diagnostic logging (off by default — turn on to capture detailed events for the Download Diagnostics button, then download and share when done)"
         }
       }
     }

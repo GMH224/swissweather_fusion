@@ -41,6 +41,14 @@ CONF_OPEN_METEO_API_KEY = "open_meteo_api_key"
 CONF_PURGE_DAYS = "purge_days"  # 0 = forever
 DEFAULT_PURGE_DAYS = 0
 
+# Toggleable diagnostic event recorder (v0.1.9) — off by default, since it
+# only accumulates data when someone has explicitly asked to watch
+# closely, not as a standing background cost. See diagnostics_recorder.py
+# and diagnostics.py.
+CONF_DIAGNOSTIC_LOGGING_ENABLED = "diagnostic_logging_enabled"
+DEFAULT_DIAGNOSTIC_LOGGING_ENABLED = False
+DIAGNOSTIC_EVENT_BUFFER_SIZE = 1000
+
 # ---------------------------------------------------------------------------
 # Sources (Model A blend experts)
 # ---------------------------------------------------------------------------
