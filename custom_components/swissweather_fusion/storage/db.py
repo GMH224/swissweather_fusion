@@ -13,11 +13,29 @@ Every public method here is blocking (sqlite3 is a blocking library). The
 caller (coordinator.py) is responsible for wrapping calls in
 hass.async_add_executor_job() — this module does not do that itself, to
 keep it framework-independent and directly testable.
+
+**v0.1.12 fix — the likely root cause of a total, cross-coordinator
+freeze found via diagnostics**: a real deployment showed CombiPrecip
+(5-min interval), SRF (45-min), Open-Meteo (15-min), and the Model A
+learning coordinator (20-min) all succeed once in a tight ~3-second burst
+at startup, then go completely silent — every one of them, simultaneously
+— for 5+ hours. That pattern (a shared resource works fine once, then
+every consumer of it hangs together) pointed at the one thing every
+coordinator actually shares: this single SQLite connection, accessed
+concurrently from multiple executor-pool threads. `check_same_thread=False`
+only disables Python's own same-thread safety check — it does not make
+concurrent, simultaneous use of the same Connection object from different
+threads safe, and `busy_timeout` governs SQLite-level lock contention
+between separate connections, not Python-level thread-safety of a single
+shared connection object. A `threading.Lock` now serializes every access
+to `self._conn`, so concurrent executor jobs queue safely instead of
+racing on the same connection.
 """
 from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -122,10 +140,18 @@ class SwissWeatherDB:
     Every method here is a plain blocking call. Callers on the HA event loop
     must use hass.async_add_executor_job(). Tests call these methods
     directly since no event loop is involved.
+
+    **All access to self._conn is serialized via self._lock** (v0.1.12) —
+    see the module docstring for why. Every public method acquires the
+    lock for its entire body; nothing here holds the lock across an
+    executor-job boundary or an await (this class has no async methods at
+    all), so there's no risk of the lock itself becoming a new source of
+    a hang — just a brief, bounded wait if two callers overlap.
     """
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
+        self._lock = threading.Lock()
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._configure_pragmas()
@@ -154,7 +180,8 @@ class SwissWeatherDB:
             self._conn.commit()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # -- station observations -------------------------------------------------
 
@@ -165,19 +192,21 @@ class SwissWeatherDB:
         humidity: Optional[float],
         pressure: Optional[float],
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO station_observations (ts, temperature, humidity, pressure) "
-            "VALUES (?, ?, ?, ?)",
-            (ts, temperature, humidity, pressure),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO station_observations (ts, temperature, humidity, pressure) "
+                "VALUES (?, ?, ?, ?)",
+                (ts, temperature, humidity, pressure),
+            )
+            self._conn.commit()
 
     def get_station_observations_since(self, since_ts: str) -> list[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM station_observations WHERE ts >= ? ORDER BY ts ASC",
-            (since_ts,),
-        )
-        return cur.fetchall()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM station_observations WHERE ts >= ? ORDER BY ts ASC",
+                (since_ts,),
+            )
+            return cur.fetchall()
 
     def get_station_observations_between(
         self, start_ts: str, end_ts: str
@@ -187,17 +216,19 @@ class SwissWeatherDB:
         valid_at times in one query, rather than one query per forecast
         row.
         """
-        cur = self._conn.execute(
-            "SELECT * FROM station_observations WHERE ts >= ? AND ts <= ? ORDER BY ts ASC",
-            (start_ts, end_ts),
-        )
-        return cur.fetchall()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM station_observations WHERE ts >= ? AND ts <= ? ORDER BY ts ASC",
+                (start_ts, end_ts),
+            )
+            return cur.fetchall()
 
     def get_latest_station_observation(self) -> Optional[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM station_observations ORDER BY ts DESC LIMIT 1"
-        )
-        return cur.fetchone()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM station_observations ORDER BY ts DESC LIMIT 1"
+            )
+            return cur.fetchone()
 
     # -- reconciliation watermark (Model A learning, v0.1.7) ---------------------
     # Reuses schema_meta rather than a new table — this is a single small
@@ -206,19 +237,21 @@ class SwissWeatherDB:
     # bucket_stats), not worth a dedicated table for.
 
     def get_reconciliation_watermark(self) -> Optional[str]:
-        cur = self._conn.execute(
-            "SELECT value FROM schema_meta WHERE key = 'reconciliation_watermark'"
-        )
-        row = cur.fetchone()
-        return row["value"] if row else None
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'reconciliation_watermark'"
+            )
+            row = cur.fetchone()
+            return row["value"] if row else None
 
     def set_reconciliation_watermark(self, ts: str) -> None:
-        self._conn.execute(
-            "INSERT INTO schema_meta (key, value) VALUES ('reconciliation_watermark', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (ts,),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO schema_meta (key, value) VALUES ('reconciliation_watermark', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (ts,),
+            )
+            self._conn.commit()
 
     # -- forecast snapshots -----------------------------------------------------
 
@@ -231,36 +264,39 @@ class SwissWeatherDB:
         value: Optional[float],
         trigger_reason: str = "scheduled",
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO forecast_snapshots "
-            "(source, issued_at, valid_at, variable, value, trigger_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (source, issued_at, valid_at, variable, value, trigger_reason),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO forecast_snapshots "
+                "(source, issued_at, valid_at, variable, value, trigger_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (source, issued_at, valid_at, variable, value, trigger_reason),
+            )
+            self._conn.commit()
 
     def insert_forecast_snapshots_bulk(
         self, rows: Iterable[tuple[str, str, str, str, Optional[float], str]]
     ) -> None:
         """Bulk insert to keep one poll cycle to one transaction."""
-        self._conn.executemany(
-            "INSERT INTO forecast_snapshots "
-            "(source, issued_at, valid_at, variable, value, trigger_reason) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            rows,
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.executemany(
+                "INSERT INTO forecast_snapshots "
+                "(source, issued_at, valid_at, variable, value, trigger_reason) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
 
     def get_forecast_values_for_valid_at(
         self, source: str, variable: str, valid_at: str
     ) -> list[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM forecast_snapshots "
-            "WHERE source = ? AND variable = ? AND valid_at = ? "
-            "ORDER BY issued_at DESC",
-            (source, variable, valid_at),
-        )
-        return cur.fetchall()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM forecast_snapshots "
+                "WHERE source = ? AND variable = ? AND valid_at = ? "
+                "ORDER BY issued_at DESC",
+                (source, variable, valid_at),
+            )
+            return cur.fetchall()
 
     def get_forecast_snapshots_to_reconcile(
         self, *, since_ts: str, until_ts: str, measurements: tuple[str, ...]
@@ -280,43 +316,47 @@ class SwissWeatherDB:
         data point for its own lead_time_bucket.
         """
         placeholders = ",".join("?" for _ in measurements)
-        cur = self._conn.execute(
-            f"SELECT * FROM forecast_snapshots "
-            f"WHERE valid_at > ? AND valid_at <= ? AND variable IN ({placeholders}) "
-            f"ORDER BY valid_at ASC",
-            (since_ts, until_ts, *measurements),
-        )
-        return cur.fetchall()
+        with self._lock:
+            cur = self._conn.execute(
+                f"SELECT * FROM forecast_snapshots "
+                f"WHERE valid_at > ? AND valid_at <= ? AND variable IN ({placeholders}) "
+                f"ORDER BY valid_at ASC",
+                (since_ts, until_ts, *measurements),
+            )
+            return cur.fetchall()
 
     # -- radar observations (CombiPrecip) ----------------------------------------
 
     def insert_radar_observation(
         self, ts: str, precip_rate_mmh: Optional[float], precip_type: Optional[str]
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO radar_observations (ts, precip_rate_mmh, precip_type) "
-            "VALUES (?, ?, ?)",
-            (ts, precip_rate_mmh, precip_type),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO radar_observations (ts, precip_rate_mmh, precip_type) "
+                "VALUES (?, ?, ?)",
+                (ts, precip_rate_mmh, precip_type),
+            )
+            self._conn.commit()
 
     def get_latest_radar_observation(self) -> Optional[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM radar_observations ORDER BY ts DESC LIMIT 1"
-        )
-        return cur.fetchone()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM radar_observations ORDER BY ts DESC LIMIT 1"
+            )
+            return cur.fetchone()
 
     # -- bucket stats (Model A) -------------------------------------------------
 
     def get_bucket_stats(self, key: BucketKey) -> Optional[BucketStats]:
-        cur = self._conn.execute(
-            "SELECT ema_bias, ema_abs_error, ema_weight, sample_count, last_updated "
-            "FROM bucket_stats "
-            "WHERE hour_of_day = ? AND season = ? AND lead_time_bucket = ? "
-            "AND source = ? AND measurement = ?",
-            (key.hour_of_day, key.season, key.lead_time_bucket, key.source, key.measurement),
-        )
-        row = cur.fetchone()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT ema_bias, ema_abs_error, ema_weight, sample_count, last_updated "
+                "FROM bucket_stats "
+                "WHERE hour_of_day = ? AND season = ? AND lead_time_bucket = ? "
+                "AND source = ? AND measurement = ?",
+                (key.hour_of_day, key.season, key.lead_time_bucket, key.source, key.measurement),
+            )
+            row = cur.fetchone()
         if row is None:
             return None
         return BucketStats(
@@ -336,31 +376,32 @@ class SwissWeatherDB:
         sample_count: int,
         last_updated: str,
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO bucket_stats "
-            "(hour_of_day, season, lead_time_bucket, source, measurement, "
-            " ema_bias, ema_abs_error, ema_weight, sample_count, last_updated) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(hour_of_day, season, lead_time_bucket, source, measurement) "
-            "DO UPDATE SET ema_bias=excluded.ema_bias, "
-            "ema_abs_error=excluded.ema_abs_error, "
-            "ema_weight=excluded.ema_weight, "
-            "sample_count=excluded.sample_count, "
-            "last_updated=excluded.last_updated",
-            (
-                key.hour_of_day,
-                key.season,
-                key.lead_time_bucket,
-                key.source,
-                key.measurement,
-                ema_bias,
-                ema_abs_error,
-                ema_weight,
-                sample_count,
-                last_updated,
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO bucket_stats "
+                "(hour_of_day, season, lead_time_bucket, source, measurement, "
+                " ema_bias, ema_abs_error, ema_weight, sample_count, last_updated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(hour_of_day, season, lead_time_bucket, source, measurement) "
+                "DO UPDATE SET ema_bias=excluded.ema_bias, "
+                "ema_abs_error=excluded.ema_abs_error, "
+                "ema_weight=excluded.ema_weight, "
+                "sample_count=excluded.sample_count, "
+                "last_updated=excluded.last_updated",
+                (
+                    key.hour_of_day,
+                    key.season,
+                    key.lead_time_bucket,
+                    key.source,
+                    key.measurement,
+                    ema_bias,
+                    ema_abs_error,
+                    ema_weight,
+                    sample_count,
+                    last_updated,
+                ),
+            )
+            self._conn.commit()
 
     def get_all_bucket_stats_for_measurement_hour(
         self, hour_of_day: int, season: str, lead_time_bucket: str, measurement: str
@@ -368,12 +409,13 @@ class SwissWeatherDB:
         """All sources' stats for one (hour, season, lead_time, measurement) —
         this is exactly the set the blend needs to renormalize weights over.
         """
-        cur = self._conn.execute(
-            "SELECT * FROM bucket_stats WHERE hour_of_day = ? AND season = ? "
-            "AND lead_time_bucket = ? AND measurement = ?",
-            (hour_of_day, season, lead_time_bucket, measurement),
-        )
-        return cur.fetchall()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM bucket_stats WHERE hour_of_day = ? AND season = ? "
+                "AND lead_time_bucket = ? AND measurement = ?",
+                (hour_of_day, season, lead_time_bucket, measurement),
+            )
+            return cur.fetchall()
 
     # -- storm events (Model B ground truth) -------------------------------------
 
@@ -386,35 +428,39 @@ class SwissWeatherDB:
         peak_precip_rate: Optional[float],
         notes: Optional[str] = None,
     ) -> int:
-        cur = self._conn.execute(
-            "INSERT INTO storm_events "
-            "(start_ts, end_ts, peak_pressure_drop, peak_temp_drop, peak_precip_rate, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (start_ts, end_ts, peak_pressure_drop, peak_temp_drop, peak_precip_rate, notes),
-        )
-        self._conn.commit()
-        return cur.lastrowid
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO storm_events "
+                "(start_ts, end_ts, peak_pressure_drop, peak_temp_drop, peak_precip_rate, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (start_ts, end_ts, peak_pressure_drop, peak_temp_drop, peak_precip_rate, notes),
+            )
+            self._conn.commit()
+            return cur.lastrowid
 
     def get_all_storm_events(self) -> list[sqlite3.Row]:
-        cur = self._conn.execute("SELECT * FROM storm_events ORDER BY start_ts ASC")
-        return cur.fetchall()
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM storm_events ORDER BY start_ts ASC")
+            return cur.fetchall()
 
     # -- storm predictions (Model B live output, for calibration later) ---------
 
     def insert_storm_prediction(
         self, ts: str, probability: float, features: dict[str, Any]
     ) -> None:
-        self._conn.execute(
-            "INSERT INTO storm_predictions (ts, probability, features) VALUES (?, ?, ?)",
-            (ts, probability, json.dumps(features)),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO storm_predictions (ts, probability, features) VALUES (?, ?, ?)",
+                (ts, probability, json.dumps(features)),
+            )
+            self._conn.commit()
 
     def get_storm_predictions_since(self, since_ts: str) -> list[sqlite3.Row]:
-        cur = self._conn.execute(
-            "SELECT * FROM storm_predictions WHERE ts >= ? ORDER BY ts ASC", (since_ts,)
-        )
-        return cur.fetchall()
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM storm_predictions WHERE ts >= ? ORDER BY ts ASC", (since_ts,)
+            )
+            return cur.fetchall()
 
     # -- purge (high-volume tables only — see plan doc §5) -----------------------
 
@@ -426,15 +472,16 @@ class SwissWeatherDB:
         Returns a dict of table -> rows deleted, for logging/audit.
         """
         deleted: dict[str, int] = {}
-        for table, ts_col in (
-            ("station_observations", "ts"),
-            ("forecast_snapshots", "valid_at"),
-            ("radar_observations", "ts"),
-            ("storm_predictions", "ts"),
-        ):
-            cur = self._conn.execute(
-                f"DELETE FROM {table} WHERE {ts_col} < ?", (cutoff_ts,)
-            )
-            deleted[table] = cur.rowcount
-        self._conn.commit()
+        with self._lock:
+            for table, ts_col in (
+                ("station_observations", "ts"),
+                ("forecast_snapshots", "valid_at"),
+                ("radar_observations", "ts"),
+                ("storm_predictions", "ts"),
+            ):
+                cur = self._conn.execute(
+                    f"DELETE FROM {table} WHERE {ts_col} < ?", (cutoff_ts,)
+                )
+                deleted[table] = cur.rowcount
+            self._conn.commit()
         return deleted

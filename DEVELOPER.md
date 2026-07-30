@@ -1,5 +1,61 @@
 # Developer notes: architecture rationale
 
+## v0.1.12 — a likely root cause for the multi-hour freeze, and the fix
+
+A 5-hour diagnostics capture made the freeze question conclusive rather
+than merely suspicious. All 8 recorded events — spanning CH1, CH2, D2,
+SRF (including its own token/geolocation/forecast sequence), CombiPrecip,
+and Meteonomiqs — landed within **3.1 seconds** of each other
+(07:26:46.330 to 07:26:49.415), matching exactly the startup first-refresh
+sequence. Then nothing, from any of them, for over 5 hours.
+`internal_coordinators` (new in v0.1.11) showed the learning coordinator
+(20-minute interval) at 3.56 hours since its last run — roughly 10-11
+missed cycles — with its `last_run_time` landing in that exact same
+3-second window as everything else. Four coordinators with four
+completely different intervals (5, 15, 20, 45 minutes), all frozen at the
+identical instant. That rules out a bug specific to any one source.
+
+**Leading theory, and the fix applied regardless of full certainty**:
+every one of those coordinators shares exactly one thing —
+`SwissWeatherDB`'s single SQLite connection, accessed via
+`hass.async_add_executor_job()` from whichever thread Home Assistant's
+executor pool happens to assign. `check_same_thread=False` (set from the
+start of this project) only disables Python's own same-thread safety
+check; it does not make truly concurrent, simultaneous access to the same
+Connection object from multiple threads safe. `busy_timeout` governs
+SQLite-level lock contention between separate connections — it does
+nothing for Python-level thread-safety of one shared connection object
+being used from more than one thread at once. A burst of coordinators all
+firing their first refresh within a few seconds of each other at startup
+(exactly what the timestamps show) is precisely the condition most likely
+to trigger this: multiple executor threads touching the same connection
+object simultaneously. If that produces a genuine hang (rather than an
+error `busy_timeout` would have caught), the affected coordinator's
+`_async_update_data()` never returns — and since Home Assistant only
+schedules a coordinator's next check after the current one completes,
+that coordinator would appear to freeze forever, exactly as observed.
+
+**Fix**: `threading.Lock` now serializes every access to the shared
+connection, in `storage/db.py`. Every method's body — reads and writes
+alike — runs inside `with self._lock:`. This is a defensively correct fix
+independent of the exact mechanism: unsynchronized concurrent access to a
+single mutable shared resource from multiple threads is always a risk
+worth eliminating, whether or not it's confirmed as *the* cause here.
+
+**Being honest about what this does and doesn't prove**: this can't be
+verified against the actual failure without reproducing it live, which
+wasn't practical here. What's confirmed instead is a dedicated
+concurrency test (`test_db_concurrency.py`) simulating the closest
+practical approximation — many threads hammering the same
+`SwissWeatherDB` instance simultaneously, both write-heavy and mixed
+read/write patterns — with a bounded join timeout so an actual deadlock
+would fail the test loudly rather than hang the suite. All of it
+completes correctly now. Whether this was truly the root cause of the
+reported freeze, or just a fix for a related but distinct hazard, should
+become clear from the next real deployment's diagnostics — worth
+explicitly checking that the "everything succeeds once, then nothing"
+pattern doesn't recur.
+
 ## v0.1.11 — the "frozen" question gets much stronger evidence, and diagnostics gets wider coverage
 
 A follow-up detail changed the read on v0.1.10's finding significantly:
