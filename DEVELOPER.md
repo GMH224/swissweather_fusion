@@ -1,5 +1,74 @@
 # Developer notes: architecture rationale
 
+## v0.1.11 — the "frozen" question gets much stronger evidence, and diagnostics gets wider coverage
+
+A follow-up detail changed the read on v0.1.10's finding significantly:
+the diagnostic-logging toggle had been on for roughly 2 hours before that
+file was downloaded, not seconds. With a 2-hour window, CombiPrecip alone
+(5-minute interval) should have attempted roughly 24 more polls — and
+left literally zero trace of any of them: no new success timestamp, no
+incremented failure count, no new diagnostic event. That rules out
+"downloaded too soon after reload" as the explanation and makes this
+real, credible evidence of an actual scheduling problem, not an
+artifact of when the file was captured.
+
+**A real gap in what was being measured, found in the process of taking
+this seriously**: `diagnostics.py` only ever reported the six source-
+fetching coordinators. It said nothing about `ModelABlendCoordinator`,
+`ModelALearningCoordinator`, or `ModelBCoordinator` — the exact three
+whose apparent freezing raised this question in the first place, several
+versions ago. They were invisible in every diagnostics capture so far.
+Fixed: all three now appear under a new `internal_coordinators` key.
+
+**Also added, so the next capture is self-explanatory rather than
+requiring elapsed-time arithmetic by hand every time**: every coordinator
+(source-fetching and internal alike) now reports Home Assistant's own
+built-in `last_update_success` (a signal independent of this project's
+own health bookkeeping, in case that bookkeeping itself has a bug) and a
+computed `overdue` flag — comparing how long it's actually been since the
+last success against the coordinator's own configured interval, with a
+3x-interval margin before flagging anything (so ordinary jitter doesn't
+get flagged as if it were the same problem this exists to catch). A
+5-minute-interval coordinator sitting at 2 hours since its last success
+will now show `"overdue": true` directly in the file, rather than needing
+that conclusion worked out from raw timestamps each time.
+
+This still doesn't explain *why* — that requires whatever the next
+capture actually shows — but it's now positioned to actually show it.
+
+## v0.1.10 — a real redaction gap, found in the first actual diagnostics download
+
+The very first diagnostics file downloaded and shared back confirmed the
+feature works (real health data, correctly redacted config), but also
+caught a genuine gap in the redaction itself: an Open-Meteo 503 error's
+message was literally the full request URL, which embeds latitude and
+longitude as query parameters (`?latitude=...&longitude=...`). The
+original `diagnostics.py` redacted `config_data`/`config_options` (this
+project's own settings) but assumed `last_data_error`/`last_auth_error`
+"needed no redacting" since they're short status strings, not structured
+config — that assumption was wrong. Any error message built from
+`str(err)` on an aiohttp exception can carry a full URL. Fixed: both
+fields now go through the same coordinate-string redaction pass as
+everything else, using the real (pre-redaction) coordinates extracted
+from `entry.data` specifically for this purpose. This is the same class
+of problem as SRF's own `geolocationId` being a bare coordinate string
+under an innocuous key — value-embedded location data, not just a
+structured field with an obviously sensitive key name.
+
+**Also worth being honest about**: that same download showed
+`diagnostics_events: []` despite SRF, CombiPrecip, and Meteonomiqs all
+showing genuine successful poll timestamps in the same capture. Code
+review of the recording wiring (SrfClient → SrfCoordinator →
+DiagnosticsRecorder → diagnostics.py) shows it correctly connected — the
+same shared recorder instance, enabled before any coordinator is
+constructed, with recording calls in the right places. No bug was found
+by inspection, but the observed behavior isn't explained either. The
+timestamps suggest this capture was taken very close to a reload
+(enabling the toggle itself triggers one), which is the most likely
+factor, but this is flagged as unresolved rather than quietly assumed
+fixed — worth downloading diagnostics again after letting more poll
+cycles complete, to see whether events populate on a later capture.
+
 ## v0.1.9 — toggleable diagnostic logging, ending the screenshot-and-guess cycle
 
 Every debugging round from v0.1.1 through v0.1.8 followed the same
