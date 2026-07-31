@@ -265,6 +265,50 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     ):
         entry.async_on_unload(coordinator.async_shutdown)
 
+    # v0.1.16 fix — very likely the actual root cause of the reported
+    # multi-hour freeze, found from a third outside review and confirmed
+    # directly against Home Assistant's own source history (a core PR
+    # titled "Only schedule a refresh if listeners", changing
+    # DataUpdateCoordinator to stop automatically rescheduling itself once
+    # it has zero registered listeners — this was intentional, added to
+    # prevent a coordinator nobody reads from polling forever). Checked
+    # directly against this project's own entities: CoordinatorEntity is
+    # used in exactly two places (the weather entity and
+    # ExpertWeightSensor), and both are tied to blend_coordinator only.
+    # Every other coordinator here — station, open_meteo, srf, meteoblue,
+    # combiprecip, meteonomiqs, model_b, learning — has never had a single
+    # registered listener. That's an exact match for the observed
+    # pattern: one guaranteed first refresh via
+    # async_config_entry_first_refresh(), then nothing, forever, for
+    # every one of them simultaneously — because Home Assistant's own
+    # coordinator framework had no reason to reschedule any of them.
+    # Every previous fix attempt (the SQLite lock, the query-count
+    # reduction, the HTTP/coordinator timeouts) addressed real, separate
+    # problems, but none of them touched this — a coordinator that isn't
+    # even being asked to run again isn't helped by making its own run
+    # faster or safer.
+    #
+    # Fixed with a genuine (if functionally no-op) listener registered for
+    # every coordinator lacking one, removed cleanly on unload. Sensors
+    # reading these coordinators' data still do so via plain attribute
+    # access (not a CoordinatorEntity conversion) — a larger refactor
+    # deferred in favor of this minimal, direct, low-risk fix for the
+    # actual scheduling problem.
+    def _noop() -> None:
+        return None
+
+    for coordinator in (
+        station_coordinator,
+        open_meteo_coordinator,
+        srf_coordinator,
+        meteoblue_coordinator,
+        combiprecip_coordinator,
+        meteonomiqs_coordinator,
+        model_b_coordinator,
+        learning_coordinator,
+    ):
+        entry.async_on_unload(coordinator.async_add_listener(_noop))
+
     # v0.1.15 fix — the shutdown registrations above only fire when Home
     # Assistant unloads this entry normally; they do nothing if setup
     # itself fails partway through. Without this, a failure in

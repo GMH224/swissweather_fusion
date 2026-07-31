@@ -1,5 +1,59 @@
 # Developer notes: architecture rationale
 
+## v0.1.16 — the actual root cause of the multi-hour freeze, most likely found
+
+A third outside review proposed something genuinely different from every
+previous theory: not a resource contention problem, not a slow
+computation, but a Home Assistant framework behavior — `DataUpdateCoordinator`
+stops automatically rescheduling itself once it has zero registered
+listeners. Checked directly against Home Assistant's own source history
+before acting on it, the same discipline as every other finding in this
+project: a core PR titled "Only schedule a refresh if listeners" confirms
+this is real, intentional behavior (added specifically to stop a
+coordinator nobody reads from polling forever and leaking memory), not a
+guess about undocumented internals.
+
+Checked directly against this project's own entities: `CoordinatorEntity`
+is used in exactly two places — the weather entity and
+`ExpertWeightSensor` — and both are tied to `blend_coordinator` only.
+Every other coordinator (station, open_meteo, srf, meteoblue,
+combiprecip, meteonomiqs, model_b, learning) has never had a single
+registered listener, because every sensor reading their data does so via
+plain attribute access (`self._runtime["x_coordinator"].health`, `.data`,
+`.current_probability`) rather than the `CoordinatorEntity` pattern that
+would have registered one automatically. That's an exact match for the
+observed pattern across every diagnostics capture this project has taken:
+one guaranteed first refresh via `async_config_entry_first_refresh()`,
+then total silence, forever, for every affected coordinator
+simultaneously — not because anything hung or crashed, but because Home
+Assistant's own coordinator framework had no reason to ask any of them to
+run again.
+
+**This also explains why v0.1.12, v0.1.13, and v0.1.14 didn't resolve
+it.** Each of those fixes addressed a real, separate problem — but a
+coordinator that Home Assistant isn't even asking to run again isn't
+helped by making its own run safer (the SQLite lock), faster (the
+query-count reduction), or more bounded (the HTTP/coordinator timeouts).
+None of them touch *whether the coordinator gets invoked at all*.
+
+**Fixed** with a genuine (functionally no-op) listener registered for
+every coordinator that lacked one, removed cleanly via
+`entry.async_on_unload()` on unload — `blend_coordinator` deliberately
+excluded, since it already has real listeners. A larger refactor
+(converting every sensor to a proper `CoordinatorEntity` of its own
+coordinator, which would also get live push-based updates instead of
+Home Assistant's default ~30s polling) is a reasonable follow-up but was
+not the priority for this specific fix — the goal here was the smallest,
+most direct change that closes the actual scheduling gap.
+
+**Being honest about confidence here**: this is the strongest, most
+directly-confirmed candidate found so far — a specific, checkable HA
+framework behavior, an exact structural match against this project's own
+entity code, and a coherent explanation for why three prior fixes didn't
+help. But "most likely" isn't "confirmed" until it's been watched running
+for the same several-hour window that made every previous freeze
+undeniable.
+
 ## v0.1.15 — an independent, from-scratch review, plus two outside code reviews, all reconciled into one pass
 
 Prompted directly: "stop debugging reactively, review this as if it were
