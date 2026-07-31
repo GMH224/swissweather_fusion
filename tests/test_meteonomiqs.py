@@ -82,6 +82,23 @@ def test_annual_call_budget_rollover():
     assert budget.calls_remaining_this_year == 1000
 
 
+def test_annual_call_budget_try_call_atomic():
+    """v0.1.15: the atomic check-and-record method added to close the
+    same class of TOCTOU race as BonusCallTracker.try_use_bonus_call.
+    Not used by the Meteonomiqs coordinator's bonus-call path itself
+    (that path's shared fetch method already records internally — using
+    try_call() there would double-count), but confirmed correct here as
+    a general-purpose addition to the class.
+    """
+    budget = mq.AnnualCallBudget(annual_budget=2)
+    today = date(2026, 7, 25)
+    assert budget.try_call(today=today) is True
+    assert budget.calls_remaining_this_year == 1
+    assert budget.try_call(today=today) is True
+    assert budget.calls_remaining_this_year == 0
+    assert budget.try_call(today=today) is False  # budget exhausted
+
+
 def test_needs_keepalive_call():
     today = date(2026, 7, 25)
     assert mq.needs_keepalive_call(last_successful_call_date=None, today=today, max_days_between_calls=30)

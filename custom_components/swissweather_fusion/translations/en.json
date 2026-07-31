@@ -62,7 +62,9 @@
           "meteonomiqs_api_key": "Meteonomiqs API key (leave blank to keep existing)",
           "open_meteo_api_key": "Open-Meteo API key (optional, paid tier only; leave blank to keep existing or stay on the free tier)",
           "purge_days": "Database purge window (days, 0 = keep forever)",
-          "diagnostic_logging_enabled": "Enable detailed diagnostic logging (off by default — turn on to capture detailed events for the Download Diagnostics button, then download and share when done)"
+          "diagnostic_logging_enabled": "Enable detailed diagnostic logging (off by default — turn on to capture detailed events for the Download Diagnostics button, then download and share when done)",
+          "elevation_override": "Elevation override (m) — set the number to change it, or check the box below to clear it and revert to automatic lookup",
+          "clear_elevation_override": "Clear elevation override (revert to automatic lookup)"
         }
       }
     }

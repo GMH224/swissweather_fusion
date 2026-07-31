@@ -252,22 +252,26 @@ def find_nearest_observation(
     return best_value
 
 
-def aggregate_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def aggregate_daily_forecast(
+    hourly_forecast: list[dict[str, Any]], *, local_tz: timezone = timezone.utc
+) -> list[dict[str, Any]]:
     """Groups the already-computed hourly blend entries into daily
     high/low temperature and total precipitation — no additional data
     access needed, this is purely a reshaping of what the hourly
     forecast already produced.
 
-    **Known simplification**: groups by UTC calendar day, not the
-    configured local timezone. Hours near midnight can land in the
-    "wrong" local day as a result. Correcting this needs the HA-configured
-    timezone threaded through, which is straightforward to add later but
-    was not the priority for the first real version of this feature.
+    **v0.1.15 fix**: this used to always group by UTC calendar day,
+    regardless of the configured local timezone — confirmed by an
+    outside code review as a real bug (hours near midnight could land in
+    the "wrong" local day). `local_tz` defaults to UTC so any caller not
+    yet passing a real timezone gets the exact same behavior as before —
+    the caller (coordinator.py) is expected to pass HA's actual
+    configured timezone.
     """
     by_day: dict[Any, list[dict[str, Any]]] = {}
     for entry in hourly_forecast:
-        day = datetime.fromisoformat(entry["datetime"]).date()
-        by_day.setdefault(day, []).append(entry)
+        local_dt = datetime.fromisoformat(entry["datetime"]).astimezone(local_tz)
+        by_day.setdefault(local_dt.date(), []).append(entry)
 
     results: list[dict[str, Any]] = []
     for day in sorted(by_day):
@@ -279,7 +283,7 @@ def aggregate_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> list[dict
         total_precip = sum(precips) if precips else None
         results.append(
             {
-                "datetime": datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc).isoformat(),
+                "datetime": datetime.combine(day, datetime.min.time(), tzinfo=local_tz).isoformat(),
                 "native_temperature": max(temps) if temps else None,
                 "native_templow": min(temps) if temps else None,
                 "native_precipitation": total_precip,
@@ -289,21 +293,26 @@ def aggregate_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> list[dict
     return results
 
 
-# UTC-hour boundaries for the day/night split — same "not localized yet"
-# simplification as aggregate_daily_forecast above.
+# Local-hour boundaries for the day/night split (interpreted against
+# whatever local_tz is passed to aggregate_twice_daily_forecast below).
 TWICE_DAILY_DAY_START_HOUR = 6
 TWICE_DAILY_DAY_END_HOUR = 18
 
 
-def aggregate_twice_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Splits each day into a daytime period (06:00-18:00 UTC) and a
-    nighttime period (18:00-06:00 UTC), each with its own representative
+def aggregate_twice_daily_forecast(
+    hourly_forecast: list[dict[str, Any]], *, local_tz: timezone = timezone.utc
+) -> list[dict[str, Any]]:
+    """Splits each day into a daytime period (06:00-18:00 local) and a
+    nighttime period (18:00-06:00 local), each with its own representative
     temperature and total precipitation — same source data as the daily
     aggregation above, just grouped differently.
+
+    **v0.1.15 fix**: same timezone bug and fix as aggregate_daily_forecast
+    above — `local_tz` defaults to UTC for backward compatibility.
     """
     by_period: dict[tuple[Any, bool], list[dict[str, Any]]] = {}
     for entry in hourly_forecast:
-        dt = datetime.fromisoformat(entry["datetime"])
+        dt = datetime.fromisoformat(entry["datetime"]).astimezone(local_tz)
         is_daytime = TWICE_DAILY_DAY_START_HOUR <= dt.hour < TWICE_DAILY_DAY_END_HOUR
         if is_daytime:
             period_day = dt.date()
@@ -329,7 +338,7 @@ def aggregate_twice_daily_forecast(hourly_forecast: list[dict[str, Any]]) -> lis
         results.append(
             {
                 "datetime": datetime.combine(
-                    day, datetime.min.time(), tzinfo=timezone.utc
+                    day, datetime.min.time(), tzinfo=local_tz
                 ).replace(hour=period_start_hour).isoformat(),
                 "is_daytime": is_daytime,
                 "native_temperature": max(temps) if temps else None,

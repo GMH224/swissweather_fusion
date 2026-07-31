@@ -4,6 +4,7 @@ classifier. See DEVELOPER.md for the full architecture rationale.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -52,7 +53,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     data = entry.data
     latitude = data[CONF_LATITUDE]
     longitude = data[CONF_LONGITUDE]
-    elevation_effective = data.get(CONF_ELEVATION_OVERRIDE) or data.get("elevation_looked_up")
+    # v0.1.15 fix: this used to be `data.get(CONF_ELEVATION_OVERRIDE) or
+    # data.get("elevation_looked_up")`, which treats a legitimate 0.0
+    # override as falsy and silently falls through to the looked-up value
+    # instead — confirmed by an outside code review, same root bug as the
+    # config_flow.py write side. Also now checks entry.options first
+    # (options-first, data-fallback, same pattern as everything else) —
+    # the elevation override field just added to the options flow would
+    # otherwise have no actual effect, the same gap already fixed for
+    # credentials back in v0.1.2.
+    options_first = entry.options or {}
+    override = options_first.get(CONF_ELEVATION_OVERRIDE, data.get(CONF_ELEVATION_OVERRIDE))
+    elevation_effective = override if override is not None else data.get("elevation_looked_up")
 
     db_path = hass.config.path(f".storage/{DOMAIN}_{entry.entry_id}_{DB_FILENAME}")
     db = await hass.async_add_executor_job(SwissWeatherDB, db_path)
@@ -103,6 +115,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     open_meteo_coordinator = OpenMeteoCoordinator(
         hass, db, latitude, longitude, api_key=open_meteo_api_key,
         diagnostics=diagnostics_recorder,
+        actual_elevation_m=elevation_effective,
     )
     srf_coordinator = SrfCoordinator(
         hass,
@@ -155,49 +168,56 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # data (its entities show unavailable/unknown until its own next
     # scheduled refresh succeeds), rather than blocking setup for sources
     # that are working.
-    for coordinator in (
+    #
+    # v0.1.14 fix: this used to be a strictly sequential for-loop —
+    # await'ing all six source coordinators' first refreshes one after
+    # another. An outside code review flagged this directly: nine
+    # coordinators' worth of sequential awaits (some involving multiple
+    # HTTP calls, like SRF's token+geolocation+forecast sequence) could
+    # make async_setup_entry itself take long enough to risk Home
+    # Assistant's own setup-timeout handling — and critically, this issue
+    # would be essentially unique to an integration with this many
+    # coordinators, which fits the reported symptom of only this
+    # integration (not others) freezing. Now: the six source coordinators
+    # run concurrently via asyncio.gather, then the three coordinators
+    # that depend on the sources' data (Model B reads combiprecip's data
+    # directly; blend/learning read what the sources already wrote to the
+    # database) run as a second concurrent group — preserving the real
+    # dependency order between the two groups while making each group's
+    # own execution concurrent rather than fully sequential.
+    source_coordinators = (
         station_coordinator,
         open_meteo_coordinator,
         srf_coordinator,
         meteoblue_coordinator,
         combiprecip_coordinator,
         meteonomiqs_coordinator,
-    ):
-        try:
-            await coordinator.async_config_entry_first_refresh()
-        except Exception as err:  # noqa: BLE001
+    )
+    results = await asyncio.gather(
+        *(c.async_config_entry_first_refresh() for c in source_coordinators),
+        return_exceptions=True,
+    )
+    for coordinator, result in zip(source_coordinators, results):
+        if isinstance(result, Exception):
             _LOGGER.warning(
                 "Initial refresh failed for %s, continuing setup with the "
                 "other sources — this coordinator will retry on its own "
                 "schedule: %s",
                 coordinator.name,
-                err,
+                result,
             )
 
-    try:
-        await model_b_coordinator.async_config_entry_first_refresh()
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.warning(
-            "Initial Model B scoring failed, will retry on its own schedule: %s", err
-        )
-
-    try:
-        await blend_coordinator.async_config_entry_first_refresh()
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.warning(
-            "Initial Model A blend computation failed, will retry on its own "
-            "schedule: %s",
-            err,
-        )
-
-    try:
-        await learning_coordinator.async_config_entry_first_refresh()
-    except Exception as err:  # noqa: BLE001
-        _LOGGER.warning(
-            "Initial Model A learning reconciliation failed, will retry on its "
-            "own schedule: %s",
-            err,
-        )
+    derived_coordinators = (model_b_coordinator, blend_coordinator, learning_coordinator)
+    derived_labels = ("Model B scoring", "Model A blend computation", "Model A learning reconciliation")
+    derived_results = await asyncio.gather(
+        *(c.async_config_entry_first_refresh() for c in derived_coordinators),
+        return_exceptions=True,
+    )
+    for label, result in zip(derived_labels, derived_results):
+        if isinstance(result, Exception):
+            _LOGGER.warning(
+                "Initial %s failed, will retry on its own schedule: %s", label, result
+            )
 
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {
@@ -217,7 +237,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "diagnostics_recorder": diagnostics_recorder,
     }
 
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    # v0.1.15 fix — critical resource-lifecycle gap found in a clean,
+    # independent review: nothing ever registered a shutdown for any of
+    # the 9 coordinators. A coordinator's periodic refresh isn't
+    # automatically tied to the entities that read it — Home Assistant's
+    # own documented pattern is `entry.async_on_unload(coordinator.async_shutdown)`
+    # per coordinator, which is what actually cancels its scheduled
+    # refresh. Without this, every reload of this integration (any
+    # options change, every redeploy during this project's own extensive
+    # debugging) could have left the *previous* set of coordinators still
+    # running in the background — holding a reference to an
+    # already-closed database connection — while a brand new set also
+    # started, all sharing the same underlying executor pool. That's a
+    # plausible contributor to some of the confusing, hard-to-reproduce
+    # symptoms seen throughout this project, though it can't be confirmed
+    # in hindsight without reproducing the exact failure.
+    for coordinator in (
+        station_coordinator,
+        open_meteo_coordinator,
+        srf_coordinator,
+        meteoblue_coordinator,
+        combiprecip_coordinator,
+        meteonomiqs_coordinator,
+        model_b_coordinator,
+        blend_coordinator,
+        learning_coordinator,
+    ):
+        entry.async_on_unload(coordinator.async_shutdown)
+
+    # v0.1.15 fix — the shutdown registrations above only fire when Home
+    # Assistant unloads this entry normally; they do nothing if setup
+    # itself fails partway through. Without this, a failure in
+    # async_forward_entry_setups (all 9 coordinators already started and
+    # refreshed by this point) would leave those coordinators running
+    # with no cleanup, while Home Assistant retries the whole setup from
+    # scratch — a second full set of coordinators, sharing the same
+    # database path as the first.
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        for coordinator in (
+            station_coordinator,
+            open_meteo_coordinator,
+            srf_coordinator,
+            meteoblue_coordinator,
+            combiprecip_coordinator,
+            meteonomiqs_coordinator,
+            model_b_coordinator,
+            blend_coordinator,
+            learning_coordinator,
+        ):
+            await coordinator.async_shutdown()
+        await hass.async_add_executor_job(db.close)
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        raise
 
     # v0.1.2 fix: nothing reloaded the integration when options changed —
     # station sensor edits or credential updates via Configure would sit

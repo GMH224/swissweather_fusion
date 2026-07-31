@@ -103,6 +103,13 @@ class ForecastPoint:
 class ParsedForecast:
     issued_at: datetime
     points: list[ForecastPoint]
+    # v0.1.15: the model grid cell's own elevation, confirmed present as a
+    # top-level field in every real Open-Meteo response (not per-hour,
+    # per-query — one number for the whole response). This is what makes
+    # the lapse-rate pre-correction in models/model_a.py usable: without
+    # knowing the grid's own elevation, there's nothing to compare the
+    # configured actual elevation against.
+    grid_elevation_m: Optional[float] = None
 
 
 # Maps Open-Meteo's hourly response keys back to this project's internal
@@ -139,6 +146,7 @@ def parse_forecast_response(payload: dict[str, Any]) -> ParsedForecast:
     hourly = payload.get("hourly", {})
     times = hourly.get("time", [])
     issued_at = datetime.now(timezone.utc)
+    grid_elevation_m = payload.get("elevation")
 
     points: list[ForecastPoint] = []
     for open_meteo_key, internal_name in _VARIABLE_NAME_MAP.items():
@@ -150,7 +158,7 @@ def parse_forecast_response(payload: dict[str, Any]) -> ParsedForecast:
             points.append(
                 ForecastPoint(variable=internal_name, valid_at=valid_at, value=value)
             )
-    return ParsedForecast(issued_at=issued_at, points=points)
+    return ParsedForecast(issued_at=issued_at, points=points, grid_elevation_m=grid_elevation_m)
 
 
 def parse_elevation_response(payload: dict[str, Any]) -> Optional[float]:
@@ -195,10 +203,20 @@ class OpenMeteoClient:
     async def async_fetch_forecast(
         self, *, source: str, latitude: float, longitude: float
     ) -> ParsedForecast:
+        import aiohttp
+
         url = build_forecast_url(
             source=source, latitude=latitude, longitude=longitude, api_key=self._api_key
         )
-        async with self._session.get(url) as resp:
+        # v0.1.14: none of this client's HTTP calls had an explicit
+        # timeout — an outside code review caught this directly against
+        # the source (confirmed real: only srf.py had one, from the
+        # v0.1.6 fix). Same 30s bound as SRF, for the same reason: a
+        # stalled connection should raise something catchable, not hang
+        # the coordinator's await indefinitely.
+        async with self._session.get(
+            url, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
             if resp.status == 400:
                 # Read the body before raise_for_status discards it — this
                 # is what should have caught the v0.1.1 wrong-model-name
@@ -214,8 +232,12 @@ class OpenMeteoClient:
     async def async_fetch_elevation(
         self, *, latitude: float, longitude: float
     ) -> Optional[float]:
+        import aiohttp
+
         url = build_elevation_url(latitude=latitude, longitude=longitude, api_key=self._api_key)
-        async with self._session.get(url) as resp:
+        async with self._session.get(
+            url, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
         return parse_elevation_response(payload)

@@ -75,6 +75,7 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         api_key: Optional[str] = None,
         *,
         diagnostics: Any = None,
+        actual_elevation_m: Optional[float] = None,
     ) -> None:
         super().__init__(
             hass,
@@ -86,6 +87,17 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         self._latitude = latitude
         self._longitude = longitude
         self._diagnostics = diagnostics
+        # v0.1.15 fix: apply_lapse_rate_precorrection existed and was
+        # tested since early in this project, but nothing ever called it
+        # — confirmed by an outside code review as unused configuration.
+        # Applied here specifically, to Open-Meteo's temperature values,
+        # since Open-Meteo's response confirmed includes the model grid
+        # cell's own elevation as a top-level field — the one piece of
+        # data the correction actually needs and the only source this
+        # project has confirmed elevation data for. Not applied to
+        # SRF/meteoblue/Meteonomiqs, since their responses' own grid/
+        # station elevation isn't currently captured.
+        self._actual_elevation_m = actual_elevation_m
         self._client = OpenMeteoClient(async_get_clientsession(hass), api_key=api_key)
         self._last_issued_at: dict[str, datetime] = {}
         # One health tracker per model, not one for the whole coordinator —
@@ -100,13 +112,20 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         }
 
     async def _async_update_data(self) -> dict[str, Any]:
+        from .models import model_a
+
         results: dict[str, Any] = {}
         for source in (SOURCE_CH1, SOURCE_CH2, SOURCE_ICON_D2):
             start = time.monotonic()
             try:
-                parsed = await self._client.async_fetch_forecast(
-                    source=source, latitude=self._latitude, longitude=self._longitude
-                )
+                # v0.1.14: an outer backstop timeout, per source — same
+                # defense-in-depth reasoning as SRF's existing one (v0.1.6),
+                # applied here after an outside code review confirmed most
+                # coordinators had no equivalent protection at all.
+                async with asyncio.timeout(60):
+                    parsed = await self._client.async_fetch_forecast(
+                        source=source, latitude=self._latitude, longitude=self._longitude
+                    )
             except Exception as err:  # noqa: BLE001
                 duration_ms = (time.monotonic() - start) * 1000
                 kind = self.health[source].record_error(err, duration_ms=duration_ms)
@@ -138,17 +157,35 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                 continue
             self._last_issued_at[source] = parsed.issued_at
 
-            rows = [
-                (
-                    source,
-                    parsed.issued_at.isoformat(),
-                    point.valid_at.isoformat(),
-                    point.variable,
-                    point.value,
-                    "scheduled",
+            # v0.1.15 fix: wires apply_lapse_rate_precorrection into the
+            # actual blend path — see __init__'s comment for the full
+            # story. Only applied to temperature, and only when both the
+            # grid's own elevation (from this response) and the
+            # configured actual elevation are known; otherwise values
+            # pass through unchanged, same as before this fix existed.
+            grid_elevation = parsed.grid_elevation_m
+            apply_correction = (
+                grid_elevation is not None and self._actual_elevation_m is not None
+            )
+            rows = []
+            for point in parsed.points:
+                value = point.value
+                if apply_correction and point.variable == "temperature" and value is not None:
+                    value = model_a.apply_lapse_rate_precorrection(
+                        raw_temperature=value,
+                        source_grid_elevation_m=grid_elevation,
+                        actual_elevation_m=self._actual_elevation_m,
+                    )
+                rows.append(
+                    (
+                        source,
+                        parsed.issued_at.isoformat(),
+                        point.valid_at.isoformat(),
+                        point.variable,
+                        value,
+                        "scheduled",
+                    )
                 )
-                for point in parsed.points
-            ]
             await self.hass.async_add_executor_job(
                 self._db.insert_forecast_snapshots_bulk, rows
             )
@@ -280,17 +317,27 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
         allowance was already used.
         """
         today = datetime.now(timezone.utc).date()
-        if not self._bonus_tracker.can_use_bonus_call(today=today):
+        # v0.1.15 fix: reserves the slot atomically before the fetch, not
+        # after — the original race window was specifically the await
+        # below (the HTTP call), where a second concurrent trigger could
+        # pass the same can_use_bonus_call check before either recorded
+        # usage. This does mean a failed fetch still counts against the
+        # daily allowance rather than being refunded — a deliberate,
+        # simpler trade-off given how rare and already-protected (by the
+        # calling coordinator's own overlap protection) this path is.
+        if not self._bonus_tracker.try_use_bonus_call(today=today):
             return False
         await self._async_fetch_and_store(trigger_reason="storm_trigger")
-        self._bonus_tracker.record_bonus_call_used(today=today)
         return True
 
     async def _async_fetch_and_store(self, *, trigger_reason: str) -> None:
         start = time.monotonic()
-        parsed = await self._client.async_fetch_forecast(
-            latitude=self._latitude, longitude=self._longitude
-        )
+        # v0.1.14: same defense-in-depth backstop added to every other
+        # coordinator — see OpenMeteoCoordinator's comment for the reason.
+        async with asyncio.timeout(60):
+            parsed = await self._client.async_fetch_forecast(
+                latitude=self._latitude, longitude=self._longitude
+            )
         self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
         if self._diagnostics is not None:
             self._diagnostics.record(
@@ -382,10 +429,16 @@ class CombiPrecipCoordinator(DataUpdateCoordinator):
             # happening synchronously on the event loop. Now: async
             # download only, then the entire blocking sequence (temp dir,
             # write, h5py parse, cleanup) runs via one executor job.
-            data = await self._client.async_fetch_latest_bytes()
-            values = await self.hass.async_add_executor_job(
-                self._client.write_temp_and_extract, data
-            )
+            #
+            # v0.1.14: outer backstop timeout, longer than most other
+            # coordinators' (120s vs 60s) since this is the one client
+            # downloading an actual binary file plus running an
+            # executor-wrapped HDF5 parse, not just a small JSON response.
+            async with asyncio.timeout(120):
+                data = await self._client.async_fetch_latest_bytes()
+                values = await self.hass.async_add_executor_job(
+                    self._client.write_temp_and_extract, data
+                )
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err, duration_ms=(time.monotonic() - start) * 1000)
             if self._diagnostics is not None:
@@ -457,9 +510,12 @@ class StationCoordinator(DataUpdateCoordinator):
         humidity = self._read_float_state(self._humidity_entity)
         pressure = self._read_float_state(self._pressure_entity)
         now_iso = datetime.now(timezone.utc).isoformat()
-        await self.hass.async_add_executor_job(
-            self._db.insert_station_observation, now_iso, temperature, humidity, pressure
-        )
+        # v0.1.14: same defense-in-depth backstop as every other
+        # coordinator now has.
+        async with asyncio.timeout(30):
+            await self.hass.async_add_executor_job(
+                self._db.insert_station_observation, now_iso, temperature, humidity, pressure
+            )
         return {"temperature": temperature, "humidity": humidity, "pressure": pressure}
 
 
@@ -512,6 +568,16 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         immediate storm check, not the daily outlook the noon call gives.
         """
         today = datetime.now(timezone.utc).date()
+        # v0.1.15: AnnualCallBudget.try_call() exists (added alongside
+        # BonusCallTracker.try_use_bonus_call() for the same TOCTOU fix),
+        # but is deliberately NOT used here — _async_fetch_nowcast below
+        # already calls self._budget.record_call() internally on success
+        # (shared with the regular daily-keepalive path), so reserving
+        # via try_call() here too would double-count every bonus call.
+        # This check remains a plain pre-filter, not a full atomic
+        # reservation — an acceptable, low-risk gap given how rarely this
+        # path fires and the overlap protection already provided by
+        # ModelBCoordinator being a single, non-reentrant coordinator.
         if not self._budget.can_call(today=today):
             _LOGGER.warning(
                 "Meteonomiqs annual budget exhausted; skipping bonus call"
@@ -523,9 +589,12 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
     async def _async_fetch_nowcast(self, *, today: date) -> None:
         start = time.monotonic()
         try:
-            self.last_nowcast = await self._client.async_fetch_nowcast(
-                latitude=self._latitude, longitude=self._longitude
-            )
+            # v0.1.14: same defense-in-depth backstop as every other
+            # coordinator now has.
+            async with asyncio.timeout(60):
+                self.last_nowcast = await self._client.async_fetch_nowcast(
+                    latitude=self._latitude, longitude=self._longitude
+                )
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err, duration_ms=(time.monotonic() - start) * 1000)
             if self._diagnostics is not None:
@@ -545,9 +614,10 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
     async def _async_fetch_hourly_forecast(self, *, today: date) -> None:
         start = time.monotonic()
         try:
-            self.last_hourly_forecast = await self._client.async_fetch_hourly_forecast(
-                latitude=self._latitude, longitude=self._longitude
-            )
+            async with asyncio.timeout(60):
+                self.last_hourly_forecast = await self._client.async_fetch_hourly_forecast(
+                    latitude=self._latitude, longitude=self._longitude
+                )
         except Exception as err:  # noqa: BLE001
             self.health.record_error(err, duration_ms=(time.monotonic() - start) * 1000)
             if self._diagnostics is not None:
@@ -565,36 +635,62 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         self._last_successful_call_date = today
 
     async def _async_update_data(self) -> None:
-        local_now = datetime.now(timezone.utc)
+        # v0.1.15 fix: "local_now" used to be datetime.now(timezone.utc) —
+        # the same class of bug already fixed for meteoblue in v0.1.6, but
+        # never checked here too, caught by an outside code review. In
+        # Switzerland (CEST = UTC+2) this shifted the noon cutoff by 2
+        # hours. Now uses HA's own configured-timezone helper, matching
+        # the meteoblue fix.
+        local_now = dt_util.now()
         today = local_now.date()
 
-        if not needs_keepalive_call(
+        # v0.1.15 fix: this used to be gated behind needs_keepalive_call()
+        # (only True once ~30 days had passed since the last successful
+        # call) wrapping the entire method below — meaning the "daily"
+        # seasonal forecast call this project's own design docs describe
+        # never actually fired more than once every 30 days, contradicting
+        # the documented intent. Confirmed by an outside code review
+        # against this exact code. The daily-once-per-day check below is
+        # now the actual gate; the 30-day threshold is only a loud warning
+        # if the daily logic somehow hasn't produced a successful call in
+        # that long — a real problem worth surfacing, not something that
+        # should have been gating every attempt in the first place.
+        if needs_keepalive_call(
             last_successful_call_date=self._last_successful_call_date,
             today=today,
             max_days_between_calls=METEONOMIQS_KEEPALIVE_MAX_DAYS_BETWEEN_CALLS,
         ):
+            _LOGGER.warning(
+                "Meteonomiqs hasn't had a successful call in %s+ days — "
+                "the daily keepalive logic may not be working, and the "
+                "API key risks revocation from inactivity.",
+                METEONOMIQS_KEEPALIVE_MAX_DAYS_BETWEEN_CALLS,
+            )
+
+        if self._last_successful_call_date == today:
             return None
 
         in_forecast_season = local_now.month in METEONOMIQS_FORECAST_SEASON_MONTHS
-        already_called_today = self._last_successful_call_date == today
         past_noon = local_now.hour >= METEONOMIQS_FORECAST_CALL_HOUR_LOCAL
 
         try:
-            if in_forecast_season and not already_called_today and past_noon:
+            if in_forecast_season and past_noon:
                 await self._async_fetch_hourly_forecast(today=today)
-            else:
-                # Either outside the summer window, or summer but noon
-                # hasn't arrived yet today (this coordinator checks every
-                # 6h, so it may run before noon) — nowcast keeps the key
-                # alive in the meantime without pre-empting the richer
-                # noon call. If needs_keepalive_call is still true days
-                # later, this branch also acts as the ultimate fallback so
-                # a day is never silently missed.
+            elif not in_forecast_season:
+                # Nov-Feb: nowcast is a pure keepalive with no time-of-day
+                # data-quality reason to wait, unlike the seasonal forecast
+                # call above — fire as soon as a new day starts.
                 await self._async_fetch_nowcast(today=today)
+            # else: in forecast season but before local noon today — this
+            # coordinator checks every 6h and may run before noon; simply
+            # wait for a later check today (guaranteed within the same day,
+            # since a 6h interval always has at least one check past noon).
         except Exception as err:  # noqa: BLE001
             # A failed keep-alive is worth logging loudly — losing API
             # access entirely from inactivity is worse than a routine
-            # data-fetch error elsewhere in this system.
+            # data-fetch error elsewhere in this system. Deliberately not
+            # re-raised: the next scheduled check today (or tomorrow) will
+            # retry via the same daily-gate logic above.
             _LOGGER.error("Meteonomiqs keep-alive call failed: %s", err)
         return None
 
@@ -653,7 +749,13 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         self._db = db
 
     async def _async_update_data(self) -> dict[str, Any]:
-        return await self.hass.async_add_executor_job(self._compute_blend)
+        # v0.1.14: same defense-in-depth backstop as every other
+        # coordinator now has. Generous (120s) since this job now does
+        # two bulk queries plus in-memory processing of a potentially
+        # large result set (v0.1.13's fix), still bounded but with
+        # headroom.
+        async with asyncio.timeout(120):
+            return await self.hass.async_add_executor_job(self._compute_blend)
 
     def _blend_at(
         self,
@@ -741,6 +843,25 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             for m in self.MEASUREMENTS
         }
 
+        # v0.1.14 fix: ExpertWeightSensor used to call self._db.get_bucket_stats()
+        # directly inside its native_value property — a plain (non-
+        # CoordinatorEntity) property that HA polls directly on the event
+        # loop, completely bypassing the executor-job pattern used
+        # everywhere else in this project. Computed here instead, for
+        # free — bucket_lookup is already fetched above for the blend
+        # itself, so extracting the "current hour/season/short lead time"
+        # weight per source costs nothing extra.
+        from .const import LEAD_TIME_SHORT
+        from .models import model_a as _model_a_for_weights
+
+        season_now = _model_a_for_weights.derive_season(now)
+        expert_weights: dict[str, Optional[float]] = {}
+        for source in ALL_FORECAST_SOURCES:
+            bucket = bucket_lookup.get(
+                (now.hour, season_now, LEAD_TIME_SHORT, source, "temperature")
+            )
+            expert_weights[source] = bucket.ema_weight if bucket else None
+
         hourly_forecast: list[dict[str, Any]] = []
         for i in range(self.FORECAST_HOURS_AHEAD):
             target = now + timedelta(hours=i)
@@ -769,13 +890,23 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
 
         return {
             "current": current,
+            "expert_weights": expert_weights,
             "hourly_forecast": hourly_forecast,
             # Built from the same hourly data above — no extra DB access,
             # just reshaped, per the request to have precipitation (mm)
             # available at daily and twice-daily granularity too, not just
             # hourly.
-            "daily_forecast": model_a.aggregate_daily_forecast(hourly_forecast),
-            "twice_daily_forecast": model_a.aggregate_twice_daily_forecast(hourly_forecast),
+            # v0.1.15 fix: these used to always group by UTC calendar day
+            # regardless of the configured local timezone — confirmed by
+            # an outside code review. dt_util.now().tzinfo is the same
+            # proven pattern already used for meteoblue/Meteonomiqs's own
+            # local-time fixes (v0.1.6/v0.1.15), not a new API.
+            "daily_forecast": model_a.aggregate_daily_forecast(
+                hourly_forecast, local_tz=dt_util.now().tzinfo
+            ),
+            "twice_daily_forecast": model_a.aggregate_twice_daily_forecast(
+                hourly_forecast, local_tz=dt_util.now().tzinfo
+            ),
         }
 
 
@@ -810,6 +941,19 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
     # (meteoblue's ~7-10 days is the longest) without trying to reconcile
     # an unbounded amount of history in one go.
     INITIAL_LOOKBACK = timedelta(days=14)
+    # v0.1.15 fix: how long to keep retrying a row that couldn't find a
+    # matching station reading, before treating the gap as permanent and
+    # letting the watermark advance past it. Without this, the watermark
+    # used to advance to "now" unconditionally every cycle regardless of
+    # skipped rows — a station outage lasting even a few minutes longer
+    # than the matching tolerance would permanently drop that hour's
+    # learning sample forever, with no distinction between "genuinely
+    # unrecoverable" and "just hasn't been retried yet". Confirmed by an
+    # outside code review against this exact loop. 48 hours gives several
+    # retry cycles (every 20 minutes) before concluding a gap is real,
+    # without letting the retry window grow unbounded if a gap turns out
+    # to be permanent.
+    RETRY_GIVE_UP_AGE = timedelta(hours=48)
 
     def __init__(self, hass: HomeAssistant, db: SwissWeatherDB) -> None:
         super().__init__(
@@ -822,7 +966,10 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         self.last_reconciled_count: int = 0
 
     async def _async_update_data(self) -> Optional[datetime]:
-        return await self.hass.async_add_executor_job(self._reconcile)
+        # v0.1.14: same defense-in-depth backstop as every other
+        # coordinator now has.
+        async with asyncio.timeout(120):
+            return await self.hass.async_add_executor_job(self._reconcile)
 
     def _reconcile(self) -> datetime:
         """Synchronous — only ever called via the executor job above."""
@@ -869,8 +1016,19 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
             candidates_by_measurement["pressure"].append((ts, row["pressure"]))
 
         reconciled_count = 0
+        # v0.1.15 fix: tracks the earliest valid_at among rows that
+        # couldn't be matched to a station reading but are still young
+        # enough to be worth retrying (see RETRY_GIVE_UP_AGE above) — the
+        # watermark below only advances up to this point, not
+        # unconditionally to "now", so these rows get another chance on
+        # the next cycle instead of being silently dropped forever.
+        earliest_retry_valid_at: Optional[datetime] = None
         for fs_row in rows_to_reconcile:
             if fs_row["value"] is None:
+                # The stored forecast value itself is null — this can
+                # never change no matter how many times it's retried, so
+                # there's nothing to gain by holding the watermark back
+                # for it specifically.
                 continue
             measurement = fs_row["variable"]
             valid_at = datetime.fromisoformat(fs_row["valid_at"])
@@ -880,6 +1038,14 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
                 target=valid_at, candidates=candidates_by_measurement[measurement]
             )
             if actual_value is None:
+                if (now - valid_at) < self.RETRY_GIVE_UP_AGE:
+                    if earliest_retry_valid_at is None or valid_at < earliest_retry_valid_at:
+                        earliest_retry_valid_at = valid_at
+                # else: old enough that this gap is treated as permanent
+                # (e.g. a genuine, lasting station outage) — let the
+                # watermark advance past it rather than holding the retry
+                # window open forever for something that will never
+                # resolve.
                 continue
 
             key = BucketKey(
@@ -915,7 +1081,15 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
             )
             reconciled_count += 1
 
-        self._db.set_reconciliation_watermark(until_iso)
+        # v0.1.15 fix: cap the new watermark at the earliest still-retryable
+        # skipped row's valid_at, if there is one — otherwise advance fully
+        # to now, same as before. See the loop above and RETRY_GIVE_UP_AGE.
+        new_watermark = (
+            earliest_retry_valid_at.isoformat()
+            if earliest_retry_valid_at is not None
+            else until_iso
+        )
+        self._db.set_reconciliation_watermark(new_watermark)
         self.last_reconciled_count = reconciled_count
         _LOGGER.debug(
             "Model A learning: reconciled %d of %d due forecast snapshots",
@@ -956,6 +1130,15 @@ class ModelBCoordinator(DataUpdateCoordinator):
         self.current_probability = 0.0
 
     async def _async_update_data(self) -> float:
+        # v0.1.14: same defense-in-depth backstop as every other
+        # coordinator now has. Generous (90s) since this method can also
+        # trigger meteoblue/Meteonomiqs bonus calls (each already
+        # independently timed-out, but bounding the whole cycle here too
+        # is cheap insurance).
+        async with asyncio.timeout(90):
+            return await self._async_update_data_inner()
+
+    async def _async_update_data_inner(self) -> float:
         rows = await self.hass.async_add_executor_job(
             self._db.get_station_observations_since,
             (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
@@ -981,18 +1164,8 @@ class ModelBCoordinator(DataUpdateCoordinator):
             now_epoch_seconds=time.time(),
             radar_points=radar_points,
         )
-        probability = model_b.score_v0_graduated(features)
-
-        await self.hass.async_add_executor_job(
-            self._db.insert_storm_prediction,
-            datetime.now(timezone.utc).isoformat(),
-            probability,
-            {
-                "delta_pressure_30min": features.delta_pressure_30min,
-                "delta_humidity_30min": features.delta_humidity_30min,
-                "radar_points": {p.label: p.precip_rate_mmh for p in radar_points},
-            },
-        )
+        base_probability = model_b.score_v0_graduated(features)
+        probability = base_probability
 
         decision = model_b.evaluate_cross_model_trigger(
             previous_probability=self._previous_probability,
@@ -1005,19 +1178,60 @@ class ModelBCoordinator(DataUpdateCoordinator):
                 "requesting bonus meteoblue + Meteonomiqs calls",
                 probability,
             )
-            await self._meteoblue_coordinator.async_request_bonus_call()
-            got_meteonomiqs = await self._meteonomiqs_coordinator.async_request_bonus_call()
-            if got_meteonomiqs and self._meteonomiqs_coordinator.last_nowcast:
-                risk_values = [
-                    item.precip_risk_value
-                    for item in self._meteonomiqs_coordinator.last_nowcast.items
-                    if item.precip_risk_value is not None
-                ]
-                if risk_values:
-                    probability = model_b.refine_with_meteonomiqs(
-                        base_probability=probability,
-                        meteonomiqs_risk_value=max(risk_values),
-                    )
+            # v0.1.15 fix: these bonus calls used to be unguarded — a
+            # transient failure in either (a timeout, a rate limit —
+            # plausible exactly during a real storm scenario when these
+            # APIs may be under more load) would raise all the way out of
+            # this method, meaning the freshly computed probability above
+            # was never saved to current_probability at all. Confirmed by
+            # an independent review as a real bug in the specific feature
+            # (storm-onset detection for blinds automation) this project
+            # was built for — exactly the moment reliability matters most.
+            # Now isolated: a bonus-call failure is logged but never
+            # prevents the base scoring result from being persisted and
+            # exposed below.
+            try:
+                await self._meteoblue_coordinator.async_request_bonus_call()
+                got_meteonomiqs = await self._meteonomiqs_coordinator.async_request_bonus_call()
+                if got_meteonomiqs and self._meteonomiqs_coordinator.last_nowcast:
+                    risk_values = [
+                        item.precip_risk_value
+                        for item in self._meteonomiqs_coordinator.last_nowcast.items
+                        if item.precip_risk_value is not None
+                    ]
+                    if risk_values:
+                        probability = model_b.refine_with_meteonomiqs(
+                            base_probability=probability,
+                            meteonomiqs_risk_value=max(risk_values),
+                        )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning(
+                    "Cross-model trigger's bonus calls failed (base "
+                    "probability %.2f is still saved normally): %s",
+                    base_probability,
+                    err,
+                )
+
+        # v0.1.15 fix: this used to persist the pre-refinement probability
+        # (computed before the trigger/refinement block above), while
+        # current_probability below got the post-refinement value — the
+        # same storm event could show two different numbers depending on
+        # whether you looked at history or the live sensor. Now persists
+        # after refinement, and stores both values explicitly so the
+        # refinement's effect (when it fires) stays visible in history
+        # rather than being silently overwritten.
+        await self.hass.async_add_executor_job(
+            self._db.insert_storm_prediction,
+            datetime.now(timezone.utc).isoformat(),
+            probability,
+            {
+                "delta_pressure_30min": features.delta_pressure_30min,
+                "delta_humidity_30min": features.delta_humidity_30min,
+                "radar_points": {p.label: p.precip_rate_mmh for p in radar_points},
+                "base_probability": base_probability,
+                "refined_probability": probability,
+            },
+        )
 
         self._previous_probability = probability
         self.current_probability = probability

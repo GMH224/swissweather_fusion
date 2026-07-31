@@ -121,6 +121,22 @@ def test_bonus_call_tracker_daily_allowance():
     assert tracker.can_use_bonus_call(today=tomorrow)
 
 
+def test_bonus_call_tracker_try_use_bonus_call_atomic():
+    """v0.1.15: the atomic check-and-record method added to close a
+    TOCTOU race — confirms it behaves identically to the separate
+    can_use_bonus_call + record_bonus_call_used calls, just in one step.
+    """
+    tracker = mb.BonusCallTracker()
+    today = date(2026, 7, 25)
+    assert tracker.try_use_bonus_call(today=today) is True
+    # Allowance now used — a second attempt the same day must fail.
+    assert tracker.try_use_bonus_call(today=today) is False
+    assert not tracker.can_use_bonus_call(today=today)
+
+    tomorrow = date(2026, 7, 26)
+    assert tracker.try_use_bonus_call(today=tomorrow) is True
+
+
 def test_parse_forecast_response():
     payload = {
         "metadata": {

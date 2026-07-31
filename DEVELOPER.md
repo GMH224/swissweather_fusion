@@ -1,5 +1,166 @@
 # Developer notes: architecture rationale
 
+## v0.1.15 — an independent, from-scratch review, plus two outside code reviews, all reconciled into one pass
+
+Prompted directly: "stop debugging reactively, review this as if it were
+new code, ICS-grade." A full, independent pass through every file,
+followed by two additional outside code review reports (one focused on
+production risk, one addendum on the elevation override), with every
+claim from all three checked directly against the actual source before
+acting on it — nothing here was assumed correct or incorrect based on how
+confidently it was written.
+
+**One specific correction worth calling out**: the person pushed back on
+the Meteonomiqs 30-day finding, believing a daily forecast call was
+already keeping the API key alive independently of the nowcast-specific
+30-day check. Tracing the actual code showed this belief didn't match
+reality — `needs_keepalive_call()` gated the *entire* method, both the
+seasonal forecast branch and the nowcast fallback, meaning neither ever
+fired more often than once per 30 days regardless of season or time of
+day. Worth remembering: an outside review's finding matched the code:
+even a mismatch between design intent (documented elsewhere as "daily")
+and implementation reality can survive quietly for a long time.
+
+**Fixed, all confirmed against the current source before touching anything:**
+
+1. **No coordinator was ever explicitly shut down** — `entry.async_on_unload(coordinator.async_shutdown)`
+   now registered for all 9. Independent review.
+2. **No cleanup on partial setup failure** — a failed `async_forward_entry_setups`
+   now shuts down every already-started coordinator and closes the
+   database before re-raising, instead of leaving them orphaned for a
+   retry to duplicate. Independent review.
+3. **Meteonomiqs keepalive redesigned**: daily-once-per-day is now the
+   actual gate; the 30-day threshold is a warning-only backstop, not
+   something that blocked every call. Outside report, confirmed above.
+4. **Zero elevation overrides silently discarded** — fixed on both the
+   config-flow write side and the `__init__.py` read side; both used to
+   treat `0.0` as falsy. Outside report, confirmed.
+5. **Learning watermark advanced past permanently-skipped rows** — now
+   bounded: a row that can't find a matching station reading gets
+   retried for up to 48 hours (`RETRY_GIVE_UP_AGE`) before the gap is
+   treated as genuinely permanent, instead of being dropped on the first
+   miss. Outside report, confirmed.
+6. **A transient bonus-call failure discarded the freshly computed storm
+   probability** — isolated in its own try/except; the base scoring
+   result is now always saved regardless of whether the meteoblue/
+   Meteonomiqs bonus calls succeed. Independent review.
+7. **Meteonomiqs's "local noon" decision used UTC, not local time** —
+   same class of bug already fixed for meteoblue in v0.1.6, never
+   checked here; fixed alongside item 3 above. Outside report, confirmed.
+8. **Persisted storm probability could differ from the live sensor
+   value** — now persisted *after* Meteonomiqs refinement, with both
+   `base_probability` and `refined_probability` stored explicitly rather
+   than the refined value silently overwriting what was saved. Outside
+   report, confirmed.
+9. **`apply_lapse_rate_precorrection` existed and was tested since early
+   in this project, but nothing ever called it** — now wired into
+   `OpenMeteoCoordinator` specifically, since Open-Meteo's response
+   confirmed includes the model grid cell's own elevation as a top-level
+   field (verified via search, not assumed) — the one piece of data the
+   correction needs, and the only source with confirmed elevation data
+   available. Not applied to SRF/meteoblue/Meteonomiqs, whose own grid/
+   station elevation isn't currently captured. Outside report, confirmed.
+10. **Health/degraded status could look fine while a source was actually
+    down** — `DegradedBinarySensor` used to check only the 6 source
+    coordinators' coarse `last_update_success` flags, which can't see
+    one Open-Meteo model failing while the others succeed, or a
+    Meteonomiqs failure (that coordinator catches every internal error
+    and always returns normally). Now uses the same per-source health
+    check `StatusSensor` already used correctly. Outside report,
+    confirmed, combined with an independent-review variant of the same
+    root issue.
+11. **Elevation wasn't editable after initial setup** — added to the
+    options flow with an explicit "clear to revert to auto-lookup"
+    checkbox, rather than relying on fragile empty-string-to-float
+    coercion to distinguish "cleared" from "left alone". Addendum,
+    confirmed.
+12. **Daily/twice-daily aggregation used UTC calendar-day boundaries**
+    regardless of configured local timezone — `local_tz` now threaded
+    through from `dt_util.now().tzinfo` (the same proven pattern already
+    used for the meteoblue/Meteonomiqs local-time fixes), defaulting to
+    UTC for any caller not yet passing a real timezone. Outside report,
+    confirmed (this had also already been documented as a known
+    simplification before the outside review flagged it).
+13. **TOCTOU race in `BonusCallTracker`/`AnnualCallBudget`** — atomic
+    `try_use_bonus_call()`/`try_call()` methods added. Used for
+    meteoblue's bonus-call path (a clean fix, since that path solely
+    owns its own recording); deliberately *not* used for Meteonomiqs's
+    bonus-call path, since that coordinator's shared fetch method already
+    records usage internally on success — using the atomic method there
+    too would have double-counted every bonus call. Outside report,
+    confirmed, with the double-counting risk caught and avoided during
+    the fix itself rather than after.
+
+**Explicitly not changed, and why:**
+- The `asyncio.timeout` limitation (a genuinely stuck executor thread
+  isn't freed by the coordinator-level timeout) is a real architectural
+  constraint of the executor-job pattern itself, not a bug with a
+  fix — documented, not "fixed".
+- Non-`CoordinatorEntity` sensors relying on default polling — a minor
+  staleness characteristic (up to ~30s lag), not a correctness issue,
+  left as-is to avoid unnecessary risk in an already large batch of
+  changes.
+
+## v0.1.14 — an outside code review, checked and confirmed against the actual source
+
+After the huawei_solar/Modbus theory was ruled out (a different Claude
+instance working on that integration rejected it, and the person
+confirmed every *other* integration kept working fine throughout the
+freeze — ruling out a genuine system-wide event loop stall, which is what
+would be needed for a Modbus hang elsewhere to explain this), that same
+external review turned its attention to this project's own source and
+produced a numbered list of concrete, checkable claims. Every one of them
+was verified directly against the actual code before acting on it — not
+assumed correct because it came with confident framing, and not dismissed
+either. All four of the following were confirmed real:
+
+1. **`ExpertWeightSensor` called `self._db.get_bucket_stats()` directly
+   inside `native_value`** — a plain property with no `CoordinatorEntity`
+   backing. Home Assistant polls such properties directly on the event
+   loop, exactly the class of bug fixed for weather.py back in v0.1.5,
+   but never caught here. This is the one fix in this batch most likely
+   to be the actual root cause: it's the only confirmed bug genuinely
+   *unique* to this integration — no other integration would have this
+   specific pattern — which fits the reported symptom (only SwissWeather
+   Fusion freezes, everything else keeps working) far better than any
+   previous theory did. Worse, combined with v0.1.12's `threading.Lock`,
+   a blocking `.acquire()` call sitting directly on the event loop while
+   an executor job holds the lock is precisely the kind of thing that
+   could produce exactly what's been observed. Fixed: the value is now
+   computed for free during `ModelABlendCoordinator`'s existing bulk
+   `bucket_stats` fetch (v0.1.13), and the sensor reads it as a cached
+   `CoordinatorEntity` value — zero direct database access.
+2. **Four of five HTTP clients (open_meteo, meteoblue, meteonomiqs,
+   combiprecip) had no explicit request timeout at all** — only SRF did,
+   from the v0.1.6 fix, because SRF was the one under active
+   investigation at the time. The other four were simply never revisited
+   with the same discipline. All four now have explicit
+   `aiohttp.ClientTimeout` (30s each, 60s for CombiPrecip's actual file
+   download).
+3. **Only SRF's coordinator had an outer `asyncio.timeout` backstop.**
+   All nine coordinators now have one, sized to what each actually does
+   (30-120s).
+4. **Startup was strictly sequential** — nine coordinators' first
+   refreshes, awaited one after another, some involving multiple HTTP
+   calls each (SRF's token+geolocation+forecast sequence alone). This
+   could make `async_setup_entry` itself slow enough to risk interacting
+   badly with Home Assistant's own setup-timing expectations — and,
+   notably, this specific risk scales with coordinator *count*, which is
+   again something close to unique to an integration with nine of them
+   compared to a typical integration's one or two. Converted to two
+   concurrent groups via `asyncio.gather` (source coordinators first,
+   then the three that depend on the sources' output), preserving the
+   real data dependency while no longer paying for it sequentially.
+
+**Being honest about where this leaves things**: fix #1 is a genuinely
+strong candidate, and fixes #2-4 are correct regardless of whether they
+turn out to be *the* cause — unbounded HTTP calls and sequential startup
+scaling with coordinator count are real risks on their own. But three
+previous fix attempts (v0.1.12, v0.1.13) were also reasonable and didn't
+resolve the reported freeze, so this is not being presented as confirmed
+— it's the best-evidenced attempt yet, and whether it holds should become
+clear from the next deployment.
+
 ## v0.1.13 — the lock fix didn't work; a real performance problem, fixed regardless
 
 A 50-minute post-deploy diagnostics capture showed the v0.1.12 lock fix

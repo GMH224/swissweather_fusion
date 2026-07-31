@@ -94,6 +94,32 @@ def test_parse_forecast_response():
     assert temps[0].value == 20.1
 
 
+def test_parse_forecast_response_extracts_grid_elevation():
+    """v0.1.15: confirmed against Open-Meteo's real documented response
+    shape (a top-level "elevation" field, not per-hour) — this is what
+    makes apply_lapse_rate_precorrection usable at all, since it needs
+    the grid cell's own elevation to compare against the configured
+    actual elevation. An outside code review found the correction
+    function existed but was never wired into anything; this is the
+    piece of data that wiring needed.
+    """
+    payload = {
+        "elevation": 44.812,
+        "hourly": {"time": ["2026-07-25T12:00"], "temperature_2m": [20.0]},
+    }
+    parsed = om.parse_forecast_response(payload)
+    assert parsed.grid_elevation_m == 44.812
+
+
+def test_parse_forecast_response_missing_elevation_defaults_none():
+    """Should never crash if a response happens to omit this field —
+    the coordinator treats None as "skip the correction", not an error.
+    """
+    payload = {"hourly": {"time": ["2026-07-25T12:00"], "temperature_2m": [20.0]}}
+    parsed = om.parse_forecast_response(payload)
+    assert parsed.grid_elevation_m is None
+
+
 def test_pressure_requests_sea_level_not_surface():
     """v0.1.2 regression test: requesting surface_pressure instead of
     pressure_msl silently mixed two different physical quantities across

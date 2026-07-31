@@ -12,6 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .device import build_device_info
+from .sensor import ALL_TELEMETRY_SOURCES, _get_health
 
 
 async def async_setup_entry(
@@ -33,12 +34,21 @@ class DegradedBinarySensor(BinarySensorEntity):
 
     @property
     def is_on(self) -> bool:
-        coordinators = [
-            self._runtime["station_coordinator"],
-            self._runtime["open_meteo_coordinator"],
-            self._runtime["srf_coordinator"],
-            self._runtime["meteoblue_coordinator"],
-            self._runtime["combiprecip_coordinator"],
-            self._runtime["meteonomiqs_coordinator"],
-        ]
-        return any(not c.last_update_success for c in coordinators)
+        # v0.1.15 fix: this used to check only the 6 source coordinators'
+        # own last_update_success flags — a coarse, coordinator-level
+        # signal that can't see CH1/CH2/D2 individually (they share one
+        # coordinator, so one model failing while the others succeed
+        # never made the coordinator itself report failure) or a
+        # Meteonomiqs failure specifically (that coordinator catches every
+        # internal error and always returns normally, so its own
+        # last_update_success stays True regardless). Confirmed by an
+        # outside code review as a real gap: this sensor could show
+        # "not degraded" while a source was genuinely down. Now uses the
+        # same per-source health check StatusSensor already correctly
+        # uses — every individual source, not just the coordinator
+        # wrapping it.
+        return any(
+            health.consecutive_failures > 0
+            for source in ALL_TELEMETRY_SOURCES
+            if (health := _get_health(self._runtime, source)) is not None
+        )

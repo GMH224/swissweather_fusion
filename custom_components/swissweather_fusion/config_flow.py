@@ -44,6 +44,11 @@ from .const import (
     DOMAIN,
 )
 
+# v0.1.15: transient options-flow-only signal for clearing the elevation
+# override (see SwissWeatherFusionOptionsFlow.async_step_init) — never
+# read anywhere else, so it lives here rather than in const.py.
+CONF_CLEAR_ELEVATION_OVERRIDE = "clear_elevation_override"
+
 
 class SwissWeatherFusionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handles the multi-step setup flow."""
@@ -61,8 +66,15 @@ class SwissWeatherFusionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             self._data[CONF_LATITUDE] = user_input[CONF_LATITUDE]
             self._data[CONF_LONGITUDE] = user_input[CONF_LONGITUDE]
+            # v0.1.15 fix: this used to be `override if override else None`,
+            # which treats 0.0 (a legitimate sea-level override) as falsy
+            # and silently discards it — confirmed by an outside code
+            # review. An explicit `is not None` check is required here:
+            # `.get()` already returns None for a field the user left
+            # blank, so there's no ambiguity to resolve with truthiness in
+            # the first place.
             override = user_input.get(CONF_ELEVATION_OVERRIDE)
-            self._data[CONF_ELEVATION_OVERRIDE] = override if override else None
+            self._data[CONF_ELEVATION_OVERRIDE] = override
 
             # Auto-lookup via Open-Meteo's free Elevation API — this is why
             # the override above is optional, not required.
@@ -221,6 +233,15 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
         self, user_input: Optional[dict[str, Any]] = None
     ) -> FlowResult:
         current = self._config_entry.options or {}
+        # v0.1.15: options-first, data-fallback — same pattern used for
+        # every other field here — but note current.get(key, fallback)
+        # correctly distinguishes "key present with value None" (the user
+        # explicitly cleared it before) from "key never set" (falls
+        # through to entry.data), since dict.get only uses its fallback
+        # when the key is absent, not when its value is None.
+        current_elevation_override = current.get(
+            CONF_ELEVATION_OVERRIDE, self._config_entry.data.get(CONF_ELEVATION_OVERRIDE)
+        )
 
         if user_input is not None:
             # v0.1.2 fix: credential fields were entirely missing from
@@ -244,6 +265,22 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                         result[key] = existing
                     else:
                         result.pop(key, None)
+
+            # v0.1.15 fix (addendum finding): elevation override had no
+            # options-flow field at all — the only way to change or clear
+            # it was to reinstall the integration. Unlike the credential
+            # fields above, "leave blank to keep existing" isn't the right
+            # semantic here — an explicit checkbox controls clearing
+            # instead, since a numeric field can't unambiguously
+            # distinguish "the user cleared this" from "the user left the
+            # pre-filled value alone" the way a blank password field can.
+            # Explicit `is not None` throughout — 0.0 is a legitimate
+            # override (sea level) and must never be treated as "unset".
+            if result.pop(CONF_CLEAR_ELEVATION_OVERRIDE, False):
+                result[CONF_ELEVATION_OVERRIDE] = None
+            # else: result[CONF_ELEVATION_OVERRIDE] already holds whatever
+            # numeric value the form submitted, including 0.0.
+
             return self.async_create_entry(title="", data=result)
 
         text_password = selector.TextSelector(
@@ -295,6 +332,16 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                     default=current.get(
                         CONF_DIAGNOSTIC_LOGGING_ENABLED, DEFAULT_DIAGNOSTIC_LOGGING_ENABLED
                     ),
+                ): selector.BooleanSelector(),
+                vol.Optional(
+                    CONF_ELEVATION_OVERRIDE,
+                    default=current_elevation_override
+                    if current_elevation_override is not None
+                    else 0.0,
+                ): vol.Coerce(float),
+                vol.Optional(
+                    CONF_CLEAR_ELEVATION_OVERRIDE,
+                    default=current_elevation_override is None,
                 ): selector.BooleanSelector(),
             }
         )

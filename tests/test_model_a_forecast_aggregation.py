@@ -1,6 +1,56 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from swissweather_fusion.models import model_a
+
+
+def test_aggregate_daily_forecast_uses_local_timezone_not_utc():
+    """v0.1.15 regression test: confirms the actual fix, not just that the
+    UTC default is preserved. 23:00 UTC on the 25th is 01:00 CEST on the
+    26th — with local_tz passed correctly, that hour must land in the
+    26th's bucket, not the 25th's (which is what the old UTC-only
+    grouping would have done).
+    """
+    from datetime import timezone as _timezone
+
+    cest = _timezone(timedelta(hours=2))  # Switzerland summer time, fixed offset
+    hourly = [
+        _hourly_entry("2026-07-25T22:00:00+00:00", 15.0, 0.0),  # 00:00 CEST on the 26th
+        _hourly_entry("2026-07-25T23:00:00+00:00", 14.0, 0.0),  # 01:00 CEST on the 26th
+        _hourly_entry("2026-07-26T10:00:00+00:00", 25.0, 1.0),  # 12:00 CEST on the 26th
+    ]
+    daily_utc = model_a.aggregate_daily_forecast(hourly)  # default: UTC grouping
+    daily_local = model_a.aggregate_daily_forecast(hourly, local_tz=cest)
+
+    # Under UTC grouping, the two late-evening-UTC hours land on the 25th.
+    assert len(daily_utc) == 2
+    day1_utc = daily_utc[0]
+    assert day1_utc["native_temperature"] == 15.0  # only the 22:00 UTC hour
+
+    # Under correct local (CEST) grouping, all three hours are actually
+    # the same local calendar day (the 26th) — one bucket, not two.
+    assert len(daily_local) == 1
+    assert daily_local[0]["native_temperature"] == 25.0  # max across all 3 hours
+    assert daily_local[0]["native_templow"] == 14.0
+
+
+def test_aggregate_twice_daily_forecast_uses_local_timezone_not_utc():
+    from datetime import timezone as _timezone
+
+    cest = _timezone(timedelta(hours=2))
+    # 10:00 UTC = 12:00 CEST (daytime under local tz); under UTC-only
+    # grouping this is still daytime too (both are within 06-18), so use
+    # a boundary-crossing hour instead: 16:30 UTC = 18:30 CEST (night
+    # under local tz, but still "daytime" by raw UTC hour since 16 < 18).
+    hourly = [_hourly_entry("2026-07-25T16:00:00+00:00", 20.0, 0.0)]  # UTC hour 16
+
+    utc_periods = model_a.aggregate_twice_daily_forecast(hourly)
+    local_periods = model_a.aggregate_twice_daily_forecast(hourly, local_tz=cest)
+
+    # UTC hour 16 is "daytime" (06-18 UTC).
+    assert utc_periods[0]["is_daytime"] is True
+    # The same instant, correctly localized to CEST, is hour 18 — which is
+    # the boundary itself, "night" per TWICE_DAILY_DAY_END_HOUR (>=18).
+    assert local_periods[0]["is_daytime"] is False
 
 
 def _hourly_entry(dt_str: str, temp: float, precip: float) -> dict:

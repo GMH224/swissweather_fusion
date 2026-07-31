@@ -69,7 +69,7 @@ async def async_setup_entry(
         StormOnsetProbabilitySensor(entry, runtime),
     ]
     for source in ALL_FORECAST_SOURCES:
-        entities.append(ExpertWeightSensor(entry, db, source))
+        entities.append(ExpertWeightSensor(entry, runtime, source))
     for source in ALL_TELEMETRY_SOURCES:
         entities.append(LastSuccessSensor(entry, runtime, source))
         entities.append(LastPollDurationSensor(entry, runtime, source))
@@ -213,35 +213,34 @@ class LastLearningBSensor(_BaseSensor):
                      # fixed rule, not something that "learns" per se
 
 
-class ExpertWeightSensor(_BaseSensor):
+class ExpertWeightSensor(CoordinatorEntity, _BaseSensor):
     """One per Model A source — for debugging the live blend, per plan
     doc §7. Exposes the current-hour/season/short-lead-time weight as a
     representative snapshot rather than every bucket (which would be a lot
     of numbers for a single sensor state).
+
+    **v0.1.14 fix**: this used to call self._db.get_bucket_stats()
+    directly inside native_value — a plain property with no
+    CoordinatorEntity backing, meaning HA's own polling called it directly
+    on the event loop, completely bypassing the executor-job pattern used
+    everywhere else in this project. An outside code review (checked
+    directly against the actual source, not assumed) confirmed this was
+    real. Now reads a cached value from ModelABlendCoordinator, which
+    computes it during its own executor-job-wrapped refresh — no direct
+    database access from this entity at all.
     """
 
-    def __init__(self, entry: ConfigEntry, db: SwissWeatherDB, source: str) -> None:
-        super().__init__(entry, f"expert_weight_{source}", f"Expert weight: {source}")
-        self._db = db
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], source: str) -> None:
+        super().__init__(runtime["blend_coordinator"])
+        _BaseSensor.__init__(self, entry, f"expert_weight_{source}", f"Expert weight: {source}")
         self._source = source
 
     @property
     def native_value(self) -> Optional[float]:
-        from .models.model_a import derive_season, utcnow
-        from .const import LEAD_TIME_SHORT
-        from .storage.db import BucketKey
-
-        now = utcnow()
-        bucket = self._db.get_bucket_stats(
-            BucketKey(
-                hour_of_day=now.hour,
-                season=derive_season(now),
-                lead_time_bucket=LEAD_TIME_SHORT,
-                source=self._source,
-                measurement="temperature",
-            )
-        )
-        return bucket.ema_weight if bucket else None
+        data = self.coordinator.data
+        if not data:
+            return None
+        return data.get("expert_weights", {}).get(self._source)
 
 
 class StormOnsetProbabilitySensor(_BaseSensor):

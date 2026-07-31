@@ -149,6 +149,19 @@ class AnnualCallBudget:
         self._roll_if_new_year(today=today)
         self._calls_used_this_year += 1
 
+    def try_call(self, *, today: date) -> bool:
+        """v0.1.15 fix: combines can_call + record_call into one atomic
+        check-and-record, same TOCTOU fix as BonusCallTracker.try_use_bonus_call
+        above, for the bonus-call path specifically (the daily keepalive
+        path deliberately still calls record_call() unconditionally with
+        no check at all — see the class docstring for why that's
+        intentional, not an oversight to also "fix" here).
+        """
+        if not self.can_call(today=today):
+            return False
+        self.record_call(today=today)
+        return True
+
     @property
     def calls_remaining_this_year(self) -> int:
         return max(0, self._annual_budget - self._calls_used_this_year)
@@ -157,12 +170,20 @@ class AnnualCallBudget:
 def needs_keepalive_call(
     *, last_successful_call_date: Optional[date], today: date, max_days_between_calls: int
 ) -> bool:
-    """True if enough time has passed since the last successful call that
-    a keep-alive is due. Deliberately checked against a much shorter
-    interval (const.py: METEONOMIQS_KEEPALIVE_INTERVAL, polled daily) than
-    the actual revocation window (max_days_between_calls, ~30 days per
-    Meteonomiqs's own stated policy) — daily polling gives a large safety
-    margin rather than cutting it close to the actual limit.
+    """True if it's been long enough since the last successful call that
+    the API key risks revocation from inactivity.
+
+    **v0.1.15 fix**: this used to be the single gate deciding whether the
+    coordinator's daily call logic ran at all — meaning the actual API
+    calls (both the seasonal forecast branch and the nowcast fallback)
+    never fired more than once every max_days_between_calls (~30 days per
+    Meteonomiqs's stated policy), contradicting this project's own
+    documented intent of a daily call. Confirmed by an outside code
+    review against the exact coordinator code. Now used only as a
+    warning signal in the coordinator (see coordinator.py) — the actual
+    daily-once-per-day logic is the real gate; this function just flags
+    if that daily logic has somehow failed to produce a successful call
+    for this long, which is worth knowing loudly rather than silently.
     """
     if last_successful_call_date is None:
         return True
@@ -180,9 +201,16 @@ class MeteonomiqsClient:
     async def async_fetch_nowcast(
         self, *, latitude: float, longitude: float
     ) -> ParsedNowcast:
+        import aiohttp
+
         url = build_nowcast_url(latitude=latitude, longitude=longitude)
         headers = build_auth_headers(self._api_key)
-        async with self._session.get(url, headers=headers) as resp:
+        # v0.1.14: no explicit timeout existed on either call in this
+        # client — same fix as every other client, caught by an outside
+        # code review checked directly against the source.
+        async with self._session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
         return parse_nowcast_response(payload)
@@ -190,9 +218,13 @@ class MeteonomiqsClient:
     async def async_fetch_hourly_forecast(
         self, *, latitude: float, longitude: float
     ) -> list[HourlyForecastPoint]:
+        import aiohttp
+
         url = build_forecast_hourly_url(latitude=latitude, longitude=longitude)
         headers = build_auth_headers(self._api_key)
-        async with self._session.get(url, headers=headers) as resp:
+        async with self._session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
         return parse_hourly_forecast(payload)

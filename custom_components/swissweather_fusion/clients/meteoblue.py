@@ -112,6 +112,23 @@ class BonusCallTracker:
     def record_bonus_call_used(self, *, today: date) -> None:
         self._calls_used_by_date[today] = self._calls_used_by_date.get(today, 0) + 1
 
+    def try_use_bonus_call(self, *, today: date) -> bool:
+        """v0.1.15 fix: combines can_use_bonus_call + record_bonus_call_used
+        into one atomic check-and-record, closing a TOCTOU race an
+        independent review flagged — the two separate calls (with an
+        await for the actual HTTP request in between, in the caller) left
+        a window where two concurrent triggers could both pass the check
+        before either recorded usage, allowing more bonus calls than the
+        allowance intends. Low practical likelihood given the coordinator
+        calling this already has its own overlap protection, but a cheap,
+        correct fix either way. Prefer this over the two separate methods
+        above (kept for compatibility, not removed).
+        """
+        if not self.can_use_bonus_call(today=today):
+            return False
+        self.record_bonus_call_used(today=today)
+        return True
+
     def prune_old_dates(self, *, keep_since: date) -> None:
         self._calls_used_by_date = {
             d: c for d, c in self._calls_used_by_date.items() if d >= keep_since
@@ -187,8 +204,15 @@ class MeteoblueClient:
     async def async_fetch_forecast(
         self, *, latitude: float, longitude: float
     ) -> ParsedMeteoblueForecast:
+        import aiohttp
+
         url = build_forecast_url(latitude=latitude, longitude=longitude, api_key=self._api_key)
-        async with self._session.get(url) as resp:
+        # v0.1.14: no explicit timeout existed here before — same fix as
+        # every other client, caught by an outside code review checked
+        # directly against the source.
+        async with self._session.get(
+            url, timeout=aiohttp.ClientTimeout(total=30)
+        ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
         return parse_forecast_response(payload)

@@ -287,8 +287,21 @@ class CombiPrecipClient:
         all — that's handled separately by write_temp_and_extract, which
         must be called via an executor job, not awaited directly.
         """
+        import aiohttp
+
+        # v0.1.14: no explicit timeout existed on either call here — same
+        # fix as every other client, caught by an outside code review
+        # checked directly against the source. This is arguably the most
+        # important one to fix of the four: the second call downloads an
+        # actual binary file, not just a small JSON response, so a
+        # stalled connection here would hang the longest of any client in
+        # this project. A longer allowance (60s) than the other clients'
+        # 30s, since a genuine slow-but-working download of a real file
+        # shouldn't get killed as if it were a stuck connection.
         async with self._session.get(
-            STAC_ITEMS_URL, params={"limit": 1, "sortby": "-datetime"}
+            STAC_ITEMS_URL,
+            params={"limit": 1, "sortby": "-datetime"},
+            timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             resp.raise_for_status()
             payload = await resp.json()
@@ -298,7 +311,9 @@ class CombiPrecipClient:
             raise ValueError("No CombiPrecip assets found in STAC response")
         latest = assets[0]
 
-        async with self._session.get(latest.href) as resp:
+        async with self._session.get(
+            latest.href, timeout=aiohttp.ClientTimeout(total=60)
+        ) as resp:
             resp.raise_for_status()
             return await resp.read()
 
