@@ -6,6 +6,184 @@ import pytest
 from swissweather_fusion.clients import srf
 
 
+# v0.1.18: real sample entries confirmed from a live API response (not
+# fabricated) — one hours entry, one three_hours entry with an
+# overlapping-adjacent timestamp, one days entry, matching exactly what
+# was captured from the actual v2/forecastpoint endpoint.
+_REAL_HOURS_ENTRY = {
+    "TTT_C": 22, "TTL_C": 20.4, "TTH_C": 23.2, "DEWPOINT_C": 14.0,
+    "RELHUM_PERCENT": 62, "FRESHSNOW_MM": 0, "PRESSURE_HPA": 1018,
+    "SUN_MIN": 0, "IRRADIANCE_WM2": 0, "TTTFEEL_C": 23,
+    "cur_color": {"temperature": 22, "background_color": "#fcd804", "text_color": "#000000"},
+    "date_time": "2026-07-31T00:00:00+02:00",
+    "symbol_code": -1, "symbol24_code": 100,
+    "PROBPCP_PERCENT": 1, "RRR_MM": 0.0, "FF_KMH": 4, "FX_KMH": 7, "DD_DEG": 110,
+}
+_REAL_THREE_HOURS_ENTRY = {
+    "TTT_C": 19, "TTL_C": 17.6, "TTH_C": 20.0, "DEWPOINT_C": 14.0,
+    "RELHUM_PERCENT": 75, "FRESHSNOW_MM": 0, "PRESSURE_HPA": 1019,
+    "SUN_MIN": 0, "IRRADIANCE_WM2": 0, "TTTFEEL_C": 20,
+    "cur_color": {"temperature": 19, "background_color": "#fce404", "text_color": "#000000"},
+    "date_time": "2026-07-31T02:00:00+02:00",
+    "symbol_code": -1, "symbol24_code": 100,
+    "PROBPCP_PERCENT": 1, "RRR_MM": 0.0, "FF_KMH": 4, "FX_KMH": 9, "DD_DEG": 160,
+}
+_REAL_DAYS_ENTRY = {
+    "SUNSET": "2026-07-31T21:03:00+02:00", "SUNRISE": "2026-07-31T06:09:00+02:00",
+    "SUN_H": 8, "UVI": 6, "TX_C": 31, "TN_C": 16,
+    "min_color": {"temperature": 16, "background_color": "#e4e20c", "text_color": "#000000"},
+    "max_color": {"temperature": 31, "background_color": "#fc8404", "text_color": "#000000"},
+    "date_time": "2026-07-31T00:00:00+02:00",
+    "symbol_code": 11, "symbol24_code": 21,
+    "PROBPCP_PERCENT": 64, "RRR_MM": 2.0, "FF_KMH": 6, "FX_KMH": 33, "DD_DEG": 280,
+}
+
+
+def test_parse_forecastpoint_response_extracts_core_measurements():
+    """The five measurements Model A's blend actually looks up must use
+    the exact same variable names every other source uses — this is what
+    finally lets SRF participate in the blend instead of being
+    permanently excluded from it.
+    """
+    payload = {"hours": [_REAL_HOURS_ENTRY], "three_hours": [], "days": []}
+    points = srf.parse_forecastpoint_response(payload)
+    by_variable = {p.variable: p.value for p in points}
+    assert by_variable["temperature"] == 22
+    assert by_variable["humidity"] == 62
+    assert by_variable["pressure"] == 1018
+    assert by_variable["precip"] == 0.0
+
+
+def test_parse_forecastpoint_response_converts_wind_speed_kmh_to_ms():
+    """v0.1.18: SRF reports wind in km/h; every other source uses m/s
+    (v0.1.5's Open-Meteo fix). Storing the raw km/h value under the same
+    "wind_speed" name would silently corrupt Model A's blend.
+    """
+    payload = {"hours": [_REAL_HOURS_ENTRY], "three_hours": [], "days": []}
+    points = srf.parse_forecastpoint_response(payload)
+    by_variable = {p.variable: p.value for p in points}
+    assert by_variable["wind_speed"] == pytest.approx(4 / 3.6)
+    assert by_variable["srf_wind_gust"] == pytest.approx(7 / 3.6)
+
+
+def test_parse_forecastpoint_response_prefixes_extras_with_srf():
+    """Every confirmed field beyond the core five must be prefixed so it
+    can never be mistaken for one of the standard cross-source
+    measurement names and accidentally picked up by the blend.
+    """
+    payload = {"hours": [_REAL_HOURS_ENTRY], "three_hours": [], "days": []}
+    points = srf.parse_forecastpoint_response(payload)
+    by_variable = {p.variable: p.value for p in points}
+    assert by_variable["srf_dewpoint"] == 14.0
+    assert by_variable["srf_feels_like"] == 23
+    assert by_variable["srf_temp_low_bound"] == 20.4
+    assert by_variable["srf_temp_high_bound"] == 23.2
+    assert by_variable["srf_freshsnow"] == 0
+    assert by_variable["srf_sun_minutes"] == 0
+    assert by_variable["srf_irradiance"] == 0
+    assert by_variable["srf_precip_probability"] == 1
+    assert by_variable["srf_wind_direction"] == 110
+    assert by_variable["srf_symbol_code"] == -1
+    assert by_variable["srf_symbol24_code"] == 100
+    # cur_color is a nested UI color hint, not weather data — deliberately
+    # not stored anywhere; confirms nothing crashes trying to store it as
+    # a number, and that it doesn't leak through under any variable name.
+    assert not any("color" in v for v in by_variable)
+
+
+def test_parse_forecastpoint_response_daily_fields():
+    payload = {"hours": [], "three_hours": [], "days": [_REAL_DAYS_ENTRY]}
+    points = srf.parse_forecastpoint_response(payload)
+    by_variable = {p.variable: p.value for p in points}
+    assert by_variable["temperature_daily_max"] == 31
+    assert by_variable["temperature_daily_min"] == 16
+    assert by_variable["precip_daily_total"] == 2.0
+    assert by_variable["wind_speed_daily_avg"] == pytest.approx(6 / 3.6)
+    assert by_variable["srf_daily_wind_gust"] == pytest.approx(33 / 3.6)
+    assert by_variable["srf_daily_uv_index"] == 6
+    assert by_variable["srf_daily_sun_hours"] == 8
+    assert by_variable["srf_daily_precip_probability"] == 64
+    assert by_variable["srf_daily_wind_direction"] == 280
+    assert by_variable["srf_daily_symbol_code"] == 11
+    assert by_variable["srf_daily_symbol24_code"] == 21
+    # SUNRISE/SUNSET are timestamps, not stored as forecast_snapshots
+    # values (a REAL/float column) — confirms they don't crash anything
+    # and aren't silently coerced into garbage numbers.
+    assert "srf_sunrise" not in by_variable
+    assert "srf_sunset" not in by_variable
+
+
+def test_parse_forecastpoint_response_hours_wins_over_three_hours_for_same_timestamp():
+    """v0.1.18: hours and three_hours can both cover the same timestamp —
+    without deduplication, both would insert a row for the same (source,
+    variable, valid_at), and which one a later query picks up would
+    depend on insertion order rather than being a deliberate choice.
+    hours (finer native granularity) must win.
+    """
+    same_time = "2026-07-31T00:00:00+02:00"
+    hours_entry = {**_REAL_HOURS_ENTRY, "date_time": same_time, "TTT_C": 22}
+    three_hours_entry = {**_REAL_THREE_HOURS_ENTRY, "date_time": same_time, "TTT_C": 999}
+    payload = {"hours": [hours_entry], "three_hours": [three_hours_entry], "days": []}
+    points = srf.parse_forecastpoint_response(payload)
+    temps = [p.value for p in points if p.variable == "temperature"]
+    assert temps == [22]  # hours' value, not three_hours' 999
+
+
+def test_parse_forecastpoint_response_three_hours_fills_beyond_hours_coverage():
+    """For a timestamp only three_hours covers, that data must still be
+    included — it's not redundant, it extends coverage further out.
+    """
+    payload = {
+        "hours": [_REAL_HOURS_ENTRY],  # covers 00:00
+        "three_hours": [_REAL_THREE_HOURS_ENTRY],  # covers 02:00, not in hours
+        "days": [],
+    }
+    points = srf.parse_forecastpoint_response(payload)
+    temps_by_time = {p.valid_at: p.value for p in points if p.variable == "temperature"}
+    assert len(temps_by_time) == 2  # both timestamps present, not merged into one
+
+
+def test_parse_forecastpoint_response_stores_valid_at_as_utc():
+    """The API returns +02:00 (CEST) offsets; this project stores
+    everything in UTC throughout, so these must be converted, not stored
+    with the original offset attached.
+    """
+    payload = {"hours": [_REAL_HOURS_ENTRY], "three_hours": [], "days": []}
+    points = srf.parse_forecastpoint_response(payload)
+    temp_point = next(p for p in points if p.variable == "temperature")
+    assert temp_point.valid_at.tzinfo == timezone.utc
+    assert temp_point.valid_at == datetime(2026, 7, 30, 22, 0, tzinfo=timezone.utc)  # 00:00 CEST - 2h
+
+
+def test_parse_forecastpoint_response_defensive_against_missing_fields():
+    """Confirms an entry missing some fields doesn't crash — just skips
+    what's not present, same defensive philosophy as every other parser
+    in this file given SRF's history of response-shape surprises.
+    """
+    sparse_entry = {"date_time": "2026-07-31T00:00:00+02:00", "TTT_C": 20}
+    payload = {"hours": [sparse_entry], "three_hours": [], "days": []}
+    points = srf.parse_forecastpoint_response(payload)
+    by_variable = {p.variable: p.value for p in points}
+    assert by_variable == {"temperature": 20}
+
+
+def test_parse_forecastpoint_response_not_a_dict_returns_empty():
+    assert srf.parse_forecastpoint_response([1, 2, 3]) == []
+    assert srf.parse_forecastpoint_response(None) == []
+
+
+def test_parse_forecastpoint_response_missing_arrays_returns_empty():
+    assert srf.parse_forecastpoint_response({}) == []
+    assert srf.parse_forecastpoint_response({"geolocation": {"id": "x"}}) == []
+
+
+def test_build_forecastpoint_url():
+    assert (
+        srf.build_forecastpoint_url("46.9471,7.4441")
+        == "https://api.srgssr.ch/srf-meteo/v2/forecastpoint/46.9471,7.4441"
+    )
+
+
 def test_client_timeout_configured():
     """v0.1.6: confirms the timeout helper actually produces a bounded
     timeout, added after SRF's polling appeared to silently stop for

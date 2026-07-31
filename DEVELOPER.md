@@ -1,5 +1,95 @@
 # Developer notes: architecture rationale
 
+## v0.1.18 — SRF's real hourly endpoint, confirmed and fully wired in
+
+Built, NOT yet deployed — held pending a joint decision on timing, same
+as the previous UI-text and probe-script work, given the ongoing
+stability soak test.
+
+**Background**: v0.1.8 confirmed SRF's `/forecast/{id}` endpoint (the
+only one this project had ever found) returns daily-only data — genuine
+evidence, not a defensive guess made out of freeze-suspicion (worth
+being precise about that distinction, since it came up). A separate,
+untested reference implementation later suggested a different endpoint
+(`v2/forecastpoint`) might return real hourly data, but its own assumed
+response shape didn't match anything this project had ever confirmed,
+and no network access exists in this environment to verify SRF's API
+directly. Rather than guess a second time, a standalone probe script
+(not part of this codebase) was built and run directly against the real
+API. Confirmed:
+
+- `v2/forecastpoint/{geo_id}` is real and working (200 OK).
+- It returns `days`, `three_hours`, and `hours` as **top-level siblings**
+  alongside `geolocation` — not wrapped in a `"forecast"` key, which
+  neither this project's own prior assumption nor the reference
+  implementation's guess had right either. SRF's response shape has now
+  surprised this project four separate times across its history.
+- Confirmed field names differ from the reference's guesses in several
+  places — `TTTFEEL_C` not `FEELSTTT_C`, `UVI` not `UV_INDEX` — verified
+  against a real response body, not assumed.
+
+**Built, in full, from the confirmed real data — nothing skipped**:
+- `parse_forecastpoint_response()` extracts every confirmed numeric
+  field from `hours`, `three_hours`, and `days`. The five measurements
+  Model A's blend actually looks up (temperature, humidity, pressure,
+  precip, wind_speed) use the exact same variable names every other
+  source already uses — meaning SRF can finally participate in the
+  hourly blend at all, ending its permanently-"Unknown" expert weight.
+  Every other confirmed field (dewpoint, feels-like, uncertainty bounds,
+  snow, irradiance, sun minutes, wind gust/direction, precip
+  probability, symbol codes, and the daily equivalents) is stored
+  prefixed `srf_`/`srf_daily_`, specifically so none of it can ever be
+  mistaken for one of the five core measurements and accidentally picked
+  up by the blend coordinator's generic bulk queries.
+- **One HTTP call, not several** — the new endpoint already returns
+  hours+three_hours+days together, so there was never a reason to also
+  call the old endpoint separately. `SrfCoordinator` tries the new
+  endpoint first and falls back to the old daily-only one only if it
+  fails for any reason — daily data is better than none, and SRF's API
+  has surprised this project enough times that keeping a working
+  fallback seemed worth the small amount of extra code.
+- **Unit conversion, made explicit and impossible to miss**: SRF reports
+  wind in km/h; every other source reports `wind_speed` in m/s (the
+  v0.1.5 Open-Meteo fix). `KMH_TO_MS` converts both `FF_KMH` (→
+  `wind_speed`) and `FX_KMH` (→ `srf_wind_gust`) — storing the raw km/h
+  value under the same name other sources use would have silently
+  corrupted the blend exactly the way the original v0.1.5 bug did.
+- **`hours`/`three_hours` overlap, deduplicated deliberately**: both
+  arrays cover some of the same timestamps (confirmed: hours starts at
+  the top of the current day, three_hours starts 2 hours later the same
+  day). Without deduplication, both would insert a row for the same
+  (source, variable, valid_at), and which one a later query picked up
+  would depend on insertion order, not a deliberate choice. `hours`
+  (finer native granularity) wins for any timestamp both cover;
+  `three_hours` fills in whatever extends beyond `hours`' own range.
+- **What's deliberately NOT persisted, and why**: `SUNRISE`/`SUNSET` are
+  timestamps, not numbers — `forecast_snapshots.value` is a REAL/float
+  column, and sunrise/sunset isn't a learning-relevant quantity in the
+  first place (Home Assistant's own `sun` entity already tracks this
+  astronomically). The `cur_color`/`min_color`/`max_color` fields are
+  UI color hints entirely derived from a temperature value already being
+  stored — not independent weather data. Neither is "lost" data so much
+  as genuinely redundant or out of scope for a time-series weather
+  database.
+
+**Test coverage**: 11 new tests using the actual confirmed sample
+entries from the real API response (not fabricated data) — core
+measurement extraction, unit conversion, srf_ prefixing, daily fields,
+the hours-wins-over-three_hours deduplication (and its inverse — that
+three_hours-only timestamps still come through), UTC conversion, and
+defensive handling of missing fields and malformed input.
+
+**Deliberately out of scope for this build** (functionality first, per
+the established priority): no new sensors or weather-entity exposure for
+the srf_ extras (dewpoint, UV, feels-like, etc.) — that's a UI/display
+question, not a functionality one. SRF's confirmed symbol_code values
+(-1, 100, 11, 21) don't match the existing 1-16 SYMBOL_MAPPING table, but
+this doesn't currently matter: the blended weather entity's own
+condition logic is a simple precipitation-based heuristic that never
+reads any source's symbol code, so there's nothing depending on that
+mapping being correct right now. Worth revisiting only if SRF's own
+condition ever needs to be surfaced independently of the blend.
+
 ## v0.1.17 — an urgent, confirmed budget-drain gap in Meteonomiqs's bonus-call path
 
 Reported directly, with real evidence: `sensor.*_meteonomiqs_last_success`

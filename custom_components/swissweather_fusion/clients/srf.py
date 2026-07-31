@@ -50,12 +50,12 @@ REQUEST_TIMEOUT_SECONDS = 30
 # entirely consumed by the geolocation metadata plus a 5-7 day forecast
 # array, cut off mid-array, before ever reaching whatever comes after it
 # in the response. That capture is what confirmed the real "day" array
-# structure (see _DAY_FIELD_MAP below) — but it's still unknown whether
-# the response also contains an "hour" or "three_hours" sibling array
-# with genuine hourly data (a community-documented example of this same
-# API family shows day/three_hours/hour arrays all present together).
-# Raised well past what the full day array needs, so the next capture (if
-# still needed) can confirm one way or the other.
+# structure (see _DAY_FIELD_MAP below), for THIS endpoint specifically —
+# a genuinely different endpoint (v2/forecastpoint, see
+# FORECASTPOINT_URL_TEMPLATE below), confirmed in v0.1.18 via a
+# standalone probe script run against the real API, does return "hours"
+# and "three_hours" siblings with real hourly data. Still kept high in
+# case a future response from either endpoint needs full capture again.
 DIAGNOSTIC_LOG_TRUNCATION_CHARS = 20000
 
 
@@ -76,6 +76,33 @@ GEOLOCATION_URL = "https://api.srgssr.ch/srf-meteo/geolocations"
 
 def build_forecast_url(geolocation_id: str) -> str:
     return f"https://api.srgssr.ch/srf-meteo/forecast/{geolocation_id}"
+
+
+# v0.1.18: confirmed working via a standalone probe script (not part of
+# this codebase) run directly against the real API — returns "hours",
+# "three_hours", and "days" as top-level siblings alongside
+# "geolocation", NOT wrapped in a "forecast" key the way both this
+# project's own v0.1.8 finding (for the OLD endpoint above) and an
+# outside reference's assumption both expected. Confirmed field names
+# also differ from that reference's guesses in places (e.g. TTTFEEL_C,
+# not FEELSTTT_C; UVI, not UV_INDEX) — see parse_forecastpoint_response
+# below for the full, confirmed mapping. This supersedes the old
+# endpoint entirely: it returns everything build_forecast_url's daily
+# data did, plus genuine hourly and three-hourly granularity, in the
+# same one HTTP call.
+FORECASTPOINT_URL_TEMPLATE = "https://api.srgssr.ch/srf-meteo/v2/forecastpoint/{geolocation_id}"
+
+
+def build_forecastpoint_url(geolocation_id: str) -> str:
+    return FORECASTPOINT_URL_TEMPLATE.format(geolocation_id=geolocation_id)
+
+
+# SRF reports wind in km/h; every other source in this project reports
+# wind_speed in m/s (v0.1.5: &wind_speed_unit=ms for Open-Meteo). Storing
+# SRF's raw km/h value under the same "wind_speed" variable name other
+# sources use would silently corrupt Model A's blend — this constant
+# makes the conversion explicit and impossible to miss in review.
+KMH_TO_MS = 1.0 / 3.6
 
 TOKEN_LIFETIME = timedelta(days=7)
 # Refresh a bit before actual expiry rather than reacting only to a 401.
@@ -218,6 +245,166 @@ def parse_forecast_response(payload: Any) -> list[SrfForecastPoint]:
                         variable=internal_name, valid_at=valid_at, value=entry[srf_key]
                     )
                 )
+    return points
+
+
+# v0.1.18: field names confirmed against a real, successful response from
+# the NEW v2/forecastpoint endpoint (build_forecastpoint_url above) —
+# same discipline as every other SRF field mapping in this file: verified
+# against a live call, not assumed from documentation or another
+# reference's guesses (which turned out wrong in places — TTTFEEL_C not
+# FEELSTTT_C, UVI not UV_INDEX).
+#
+# Split into two maps because "hours"/"three_hours" entries and "days"
+# entries have genuinely different field sets (days adds SUNRISE/SUNSET/
+# SUN_H/UVI/TX_C/TN_C in place of a single current temperature).
+#
+# The five measurements Model A's blend actually looks up
+# (temperature/humidity/pressure/precip/wind_speed) use the SAME names
+# every other source uses, so SRF's hourly data can finally participate
+# in the blend rather than being permanently excluded from it. Every
+# other confirmed field is prefixed srf_ specifically so it can never be
+# mistaken for one of those five and accidentally picked up by the blend
+# coordinator's generic queries.
+_HOURLY_SIMPLE_FIELD_MAP = {
+    "TTT_C": "temperature",
+    "RELHUM_PERCENT": "humidity",
+    "PRESSURE_HPA": "pressure",
+    "RRR_MM": "precip",
+    "TTL_C": "srf_temp_low_bound",
+    "TTH_C": "srf_temp_high_bound",
+    "DEWPOINT_C": "srf_dewpoint",
+    "TTTFEEL_C": "srf_feels_like",
+    "FRESHSNOW_MM": "srf_freshsnow",
+    "SUN_MIN": "srf_sun_minutes",
+    "IRRADIANCE_WM2": "srf_irradiance",
+    "PROBPCP_PERCENT": "srf_precip_probability",
+    "DD_DEG": "srf_wind_direction",
+    "symbol_code": "srf_symbol_code",
+    "symbol24_code": "srf_symbol24_code",
+}
+# FF_KMH (-> wind_speed) and FX_KMH (-> srf_wind_gust) both need the
+# km/h -> m/s conversion, handled separately from the simple map above —
+# see KMH_TO_MS.
+_HOURLY_WIND_FIELD_MAP = {"FF_KMH": "wind_speed", "FX_KMH": "srf_wind_gust"}
+
+# Daily fields keep the existing v0.1.8 naming for the four already in
+# use (temperature_daily_max/min, precip_daily_total) — new confirmed
+# extras are prefixed the same way the hourly ones are. wind_speed_daily_avg
+# also needs the km/h conversion, handled alongside FX_KMH below.
+# SUNRISE/SUNSET are timestamps, not numbers — not stored in
+# forecast_snapshots (a REAL/float column, and not a learning-relevant
+# quantity in the first place — Home Assistant's own sun entity already
+# tracks this astronomically). Not "lost" so much as genuinely redundant
+# with something HA already provides.
+_DAILY_SIMPLE_FIELD_MAP = {
+    "TX_C": "temperature_daily_max",
+    "TN_C": "temperature_daily_min",
+    "RRR_MM": "precip_daily_total",
+    "UVI": "srf_daily_uv_index",
+    "SUN_H": "srf_daily_sun_hours",
+    "PROBPCP_PERCENT": "srf_daily_precip_probability",
+    "DD_DEG": "srf_daily_wind_direction",
+    "symbol_code": "srf_daily_symbol_code",
+    "symbol24_code": "srf_daily_symbol24_code",
+}
+_DAILY_WIND_FIELD_MAP = {"FF_KMH": "wind_speed_daily_avg", "FX_KMH": "srf_daily_wind_gust"}
+
+
+def _parse_entry_datetime(entry: dict[str, Any]) -> Optional[datetime]:
+    date_time_str = entry.get("date_time")
+    if not date_time_str:
+        return None
+    try:
+        valid_at = datetime.fromisoformat(date_time_str)
+    except ValueError:
+        return None
+    if valid_at.tzinfo is None:
+        valid_at = valid_at.replace(tzinfo=timezone.utc)
+    # Stored in UTC throughout this project, regardless of the offset
+    # (+02:00 CEST, confirmed) the API itself returns.
+    return valid_at.astimezone(timezone.utc)
+
+
+def _points_from_hourly_entries(entries: list) -> dict[datetime, list[SrfForecastPoint]]:
+    """Returns points grouped by valid_at, not a flat list — the caller
+    merges "hours" and "three_hours" results together, preferring "hours"
+    for any timestamp both cover, so this needs to be keyed for that.
+    """
+    by_valid_at: dict[datetime, list[SrfForecastPoint]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        valid_at = _parse_entry_datetime(entry)
+        if valid_at is None:
+            continue
+        points: list[SrfForecastPoint] = []
+        for srf_key, internal_name in _HOURLY_SIMPLE_FIELD_MAP.items():
+            if srf_key in entry and entry[srf_key] is not None:
+                points.append(SrfForecastPoint(variable=internal_name, valid_at=valid_at, value=entry[srf_key]))
+        for srf_key, internal_name in _HOURLY_WIND_FIELD_MAP.items():
+            if srf_key in entry and entry[srf_key] is not None:
+                points.append(
+                    SrfForecastPoint(
+                        variable=internal_name, valid_at=valid_at, value=entry[srf_key] * KMH_TO_MS
+                    )
+                )
+        by_valid_at[valid_at] = points
+    return by_valid_at
+
+
+def parse_forecastpoint_response(payload: Any) -> list[SrfForecastPoint]:
+    """**v0.1.18**: parses the NEW v2/forecastpoint endpoint's confirmed
+    response shape — "hours", "three_hours", and "days" as top-level
+    siblings alongside "geolocation", not wrapped in a "forecast" key.
+
+    "hours" and "three_hours" cover overlapping time ranges (confirmed:
+    99 hourly entries starting at the top of the current day, 70
+    three-hourly entries starting 2 hours later the same day) — for any
+    timestamp both provide data for, "hours" wins (finer granularity),
+    with "three_hours" filling in whatever extends beyond what "hours"
+    covers. Without this merge, both would insert rows for the same
+    (source, variable, valid_at), and which one the blend coordinator's
+    bulk query picks up would depend on insertion order rather than being
+    a deliberate choice.
+    """
+    if not isinstance(payload, dict):
+        return []
+
+    # three_hours populated first (broader, coarser coverage), then
+    # overwritten by hours for any timestamp both have — see docstring.
+    merged: dict[datetime, list[SrfForecastPoint]] = {}
+    three_hours = payload.get("three_hours")
+    if isinstance(three_hours, list):
+        merged.update(_points_from_hourly_entries(three_hours))
+    hours = payload.get("hours")
+    if isinstance(hours, list):
+        merged.update(_points_from_hourly_entries(hours))
+
+    points: list[SrfForecastPoint] = []
+    for entry_points in merged.values():
+        points.extend(entry_points)
+
+    days = payload.get("days")
+    if isinstance(days, list):
+        for entry in days:
+            if not isinstance(entry, dict):
+                continue
+            valid_at = _parse_entry_datetime(entry)
+            if valid_at is None:
+                continue
+            for srf_key, internal_name in _DAILY_SIMPLE_FIELD_MAP.items():
+                if srf_key in entry and entry[srf_key] is not None:
+                    points.append(
+                        SrfForecastPoint(variable=internal_name, valid_at=valid_at, value=entry[srf_key])
+                    )
+            for srf_key, internal_name in _DAILY_WIND_FIELD_MAP.items():
+                if srf_key in entry and entry[srf_key] is not None:
+                    points.append(
+                        SrfForecastPoint(
+                            variable=internal_name, valid_at=valid_at, value=entry[srf_key] * KMH_TO_MS
+                        )
+                    )
     return points
 
 
@@ -365,6 +552,51 @@ class SrfClient:
             self._record_diagnostic(
                 event_type="raw_response",
                 detail=f"SRF forecast response parsed successfully ({len(points)} points)",
+                raw_payload=payload,
+            )
+        return points
+
+    async def async_fetch_forecastpoint(
+        self, *, latitude: float, longitude: float
+    ) -> list[SrfForecastPoint]:
+        """**v0.1.18**: the primary fetch method going forward — one HTTP
+        call to the confirmed-working v2/forecastpoint endpoint, returning
+        genuine hourly, three-hourly, AND daily data together (superseding
+        async_fetch_forecast above, which only ever had daily data).
+        Deliberately still one call, not two — this endpoint already
+        returns everything the old one did plus much more, so there's no
+        reason to also call the old endpoint separately.
+
+        If this fails for any reason (confirmed working today, but SRF's
+        API has surprised this project enough times that a graceful
+        fallback is worth having), the caller falls back to
+        async_fetch_forecast — daily-only data is better than none.
+        """
+        token = await self._async_ensure_token()
+        geolocation_id = await self._async_ensure_geolocation_id(latitude, longitude)
+        headers = {"Authorization": f"Bearer {token}"}
+        url = build_forecastpoint_url(geolocation_id)
+        async with self._session.get(
+            url, headers=headers, timeout=_client_timeout()
+        ) as resp:
+            resp.raise_for_status()
+            payload = await resp.json()
+        points = parse_forecastpoint_response(payload)
+        if not points:
+            _LOGGER.warning(
+                "SRF forecastpoint response produced no usable data points. "
+                "Raw response (truncated): %s",
+                repr(payload)[:DIAGNOSTIC_LOG_TRUNCATION_CHARS],
+            )
+            self._record_diagnostic(
+                event_type="raw_response",
+                detail="SRF forecastpoint response produced no usable data points",
+                raw_payload=payload,
+            )
+        else:
+            self._record_diagnostic(
+                event_type="raw_response",
+                detail=f"SRF forecastpoint response parsed successfully ({len(points)} points)",
                 raw_payload=payload,
             )
         return points

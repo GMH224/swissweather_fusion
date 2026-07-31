@@ -230,6 +230,7 @@ class SrfCoordinator(DataUpdateCoordinator):
         start = time.monotonic()
         if self._diagnostics is not None:
             self._diagnostics.record(source="srf", event_type="poll_start", detail="polling")
+        used_fallback = False
         try:
             # v0.1.6: an outer backstop timeout, in addition to the
             # per-request timeouts added in the client itself — belt and
@@ -239,9 +240,28 @@ class SrfCoordinator(DataUpdateCoordinator):
             # again see a coordinator silently stop updating with no
             # error recorded.
             async with asyncio.timeout(60):
-                points = await self._client.async_fetch_forecast(
-                    latitude=self._latitude, longitude=self._longitude
-                )
+                try:
+                    # v0.1.18: the confirmed-working v2/forecastpoint
+                    # endpoint is now the primary fetch — genuine hourly
+                    # data, not just daily. Falls back to the old
+                    # daily-only endpoint below if this fails for any
+                    # reason; better to have some data than none, and SRF's
+                    # API has surprised this project enough times that a
+                    # graceful fallback is worth keeping rather than
+                    # removing the old code path entirely.
+                    points = await self._client.async_fetch_forecastpoint(
+                        latitude=self._latitude, longitude=self._longitude
+                    )
+                except Exception as primary_err:  # noqa: BLE001
+                    _LOGGER.warning(
+                        "SRF v2/forecastpoint fetch failed, falling back to "
+                        "the daily-only endpoint: %s",
+                        primary_err,
+                    )
+                    used_fallback = True
+                    points = await self._client.async_fetch_forecast(
+                        latitude=self._latitude, longitude=self._longitude
+                    )
         except Exception as err:  # noqa: BLE001
             duration_ms = (time.monotonic() - start) * 1000
             kind = self.health.record_error(err, duration_ms=duration_ms)
@@ -265,7 +285,8 @@ class SrfCoordinator(DataUpdateCoordinator):
         if self._diagnostics is not None:
             self._diagnostics.record(
                 source="srf", event_type="poll_success",
-                detail=f"{len(points)} points", extra={"point_count": len(points)},
+                detail=f"{len(points)} points" + (" (fallback endpoint)" if used_fallback else ""),
+                extra={"point_count": len(points), "used_fallback": used_fallback},
             )
 
         now_iso = datetime.now(timezone.utc).isoformat()
