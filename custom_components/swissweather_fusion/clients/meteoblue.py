@@ -92,22 +92,32 @@ def should_fire_scheduled_call(
 
 @dataclass
 class BonusCallTracker:
-    """Tracks the one-bonus-call-per-storm-scenario allowance (const.py:
-    METEOBLUE_MAX_BONUS_CALLS_PER_EVENT). Per calendar day, not per event
-    duration — a new storm scenario on the same day does not reset this;
-    that's a deliberate conservative choice to protect the annual credit
-    budget, worth revisiting once real storm clustering is observed
-    (see DEVELOPER.md).
+    """Tracks a per-day bonus-call allowance from the cross-model trigger.
+    Per calendar day, not per event duration — a new storm scenario on the
+    same day does not reset this; that's a deliberate conservative choice
+    to protect the annual credit budget, worth revisiting once real storm
+    clustering is observed (see DEVELOPER.md).
+
+    **v0.1.17 fix**: `max_calls_per_day` used to be hardcoded to
+    `METEOBLUE_MAX_BONUS_CALLS_PER_EVENT`, meaning this class could only
+    ever be used for meteoblue. Confirmed in production: Meteonomiqs's own
+    bonus-call path had no equivalent per-day cap at all — only the
+    overall annual budget check — so if the cross-model trigger fired
+    repeatedly (a separate, still-being-investigated question), meteoblue
+    was protected and Meteonomiqs wasn't, burning through its 1000-
+    calls/year budget in days instead of months. Now parameterized so the
+    same tracker (and the same tested logic) protects both.
     """
 
     _calls_used_by_date: dict[date, int]
 
-    def __init__(self) -> None:
+    def __init__(self, max_calls_per_day: int = METEOBLUE_MAX_BONUS_CALLS_PER_EVENT) -> None:
         self._calls_used_by_date = {}
+        self._max_calls_per_day = max_calls_per_day
 
     def can_use_bonus_call(self, *, today: date) -> bool:
         used = self._calls_used_by_date.get(today, 0)
-        return used < METEOBLUE_MAX_BONUS_CALLS_PER_EVENT
+        return used < self._max_calls_per_day
 
     def record_bonus_call_used(self, *, today: date) -> None:
         self._calls_used_by_date[today] = self._calls_used_by_date.get(today, 0) + 1

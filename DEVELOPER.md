@@ -1,5 +1,47 @@
 # Developer notes: architecture rationale
 
+## v0.1.17 — an urgent, confirmed budget-drain gap in Meteonomiqs's bonus-call path
+
+Reported directly, with real evidence: `sensor.*_meteonomiqs_last_success`
+advancing every 5 minutes, not once a day as designed. Confirmed against
+the actual diagnostics events log — `meteonomiqs | poll_success | nowcast`
+firing at 04:56, 05:01, 05:06, 05:11, 05:16, exactly matching `ModelBCoordinator`'s
+5-minute scoring interval, not Meteonomiqs's own 6-hour
+`CHECK_INTERVAL` (verified directly, ruling out the coordinator's own
+schedule as the cause).
+
+**The actual gap, found by comparing the two symmetric code paths
+directly**: `MeteoblueCoordinator.async_request_bonus_call()` has always
+been protected by `BonusCallTracker` — capped at one bonus call per
+calendar day regardless of how many times the cross-model trigger fires.
+`MeteonomiqsCoordinator.async_request_bonus_call()` never had the
+equivalent — it only checked the overall 1000-calls/year budget, with no
+per-day cap at all. If the trigger condition kept re-evaluating true
+(a separate question, not yet fully resolved — see below),
+meteoblue was protected and Meteonomiqs wasn't, on an otherwise identical
+code path.
+
+**Fixed**: `BonusCallTracker`'s daily cap (previously hardcoded to
+`METEOBLUE_MAX_BONUS_CALLS_PER_EVENT`) is now parameterized, and
+Meteonomiqs's coordinator gets its own instance with the same one-per-day
+philosophy (`METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT`). This bounds the
+worst case to one extra call per day regardless of the underlying
+trigger-firing question.
+
+**Being honest about what's still open**: `evaluate_cross_model_trigger`'s
+own logic (`previous_probability < threshold <= current_probability`,
+requiring an upward crossing, not just staying elevated) looks correct on
+inspection, and the diagnostics snapshot's `current_probability` (0.375)
+sits below the 0.5 threshold — which shouldn't be triggering at all under
+that logic. The most likely explanation, not yet confirmed, is early
+cold-start noise in `compute_tendency_features` (sparse station history
+right after startup producing a probability that briefly crossed above
+threshold on several early cycles before settling) — but this is a
+hypothesis, not a verified root cause. The daily cap added here contains
+the *consequence* regardless of the exact mechanism; if the trigger keeps
+firing even once a day going forward, that's worth investigating further
+with more targeted logging of the per-cycle probability values.
+
 ## v0.1.16 — the actual root cause of the multi-hour freeze, most likely found
 
 A third outside review proposed something genuinely different from every

@@ -39,6 +39,7 @@ from .const import (
     METEONOMIQS_FORECAST_CALL_HOUR_LOCAL,
     METEONOMIQS_FORECAST_SEASON_MONTHS,
     METEONOMIQS_KEEPALIVE_MAX_DAYS_BETWEEN_CALLS,
+    METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT,
     MODEL_B_SCORING_INTERVAL,
     OPEN_METEO_CHECK_INTERVAL,
     SOURCE_CH1,
@@ -557,6 +558,12 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         self._diagnostics = diagnostics
         self._client = MeteonomiqsClient(async_get_clientsession(hass), api_key)
         self._budget = AnnualCallBudget(METEONOMIQS_ANNUAL_CALL_BUDGET)
+        # v0.1.17 fix: previously had no per-day cap on bonus calls at
+        # all — see async_request_bonus_call and const.py's
+        # METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT for the full story.
+        self._bonus_tracker = BonusCallTracker(
+            max_calls_per_day=METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT
+        )
         self._last_successful_call_date: Optional[date] = None
         self.last_nowcast: Optional[Any] = None
         self.last_hourly_forecast: Optional[list[Any]] = None
@@ -568,6 +575,17 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         immediate storm check, not the daily outlook the noon call gives.
         """
         today = datetime.now(timezone.utc).date()
+        # v0.1.17 fix: this used to only check the overall annual budget
+        # (self._budget.can_call), with no per-day cap at all — confirmed
+        # in production allowing it to fire every 5 minutes (whatever the
+        # underlying reason the trigger kept re-evaluating true), unlike
+        # meteoblue's equivalent path which was always protected by
+        # BonusCallTracker. This check is deliberately placed FIRST and
+        # short-circuits before the annual-budget check — a repeatedly
+        # firing trigger should be stopped by the daily cap long before
+        # it's even a question of remaining annual budget.
+        if not self._bonus_tracker.can_use_bonus_call(today=today):
+            return False
         # v0.1.15: AnnualCallBudget.try_call() exists (added alongside
         # BonusCallTracker.try_use_bonus_call() for the same TOCTOU fix),
         # but is deliberately NOT used here — _async_fetch_nowcast below
@@ -583,6 +601,7 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
                 "Meteonomiqs annual budget exhausted; skipping bonus call"
             )
             return False
+        self._bonus_tracker.record_bonus_call_used(today=today)
         await self._async_fetch_nowcast(today=today)
         return True
 

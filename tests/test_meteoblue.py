@@ -121,6 +121,31 @@ def test_bonus_call_tracker_daily_allowance():
     assert tracker.can_use_bonus_call(today=tomorrow)
 
 
+def test_bonus_call_tracker_max_calls_per_day_is_configurable():
+    """v0.1.17 regression test: BonusCallTracker's cap used to be
+    hardcoded to METEOBLUE_MAX_BONUS_CALLS_PER_EVENT, meaning it could
+    only ever be used for meteoblue — confirmed in production that
+    Meteonomiqs's own bonus-call path had no equivalent daily cap at all,
+    allowing it to fire repeatedly (every 5 minutes, in the reported
+    case) instead of being capped like meteoblue's identical code path.
+    Confirms the tracker now enforces whatever limit it's given, not a
+    fixed constant.
+    """
+    tracker = mb.BonusCallTracker(max_calls_per_day=3)
+    today = date(2026, 7, 25)
+    for _ in range(3):
+        assert tracker.can_use_bonus_call(today=today)
+        tracker.record_bonus_call_used(today=today)
+    assert not tracker.can_use_bonus_call(today=today)  # 4th call blocked
+
+    # A tracker with the default (1/day) cap is still unaffected by the
+    # one above — separate instances, separate state.
+    default_tracker = mb.BonusCallTracker()
+    assert default_tracker.can_use_bonus_call(today=today)
+    default_tracker.record_bonus_call_used(today=today)
+    assert not default_tracker.can_use_bonus_call(today=today)
+
+
 def test_bonus_call_tracker_try_use_bonus_call_atomic():
     """v0.1.15: the atomic check-and-record method added to close a
     TOCTOU race — confirms it behaves identically to the separate

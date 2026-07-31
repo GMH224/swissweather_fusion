@@ -92,6 +92,13 @@ METEOBLUE_SUMMER_MONTHS = (3, 4, 5, 6, 7, 8, 9, 10)  # Mar-Oct
 METEOBLUE_SUMMER_HOURS_LOCAL = (12, 16, 20)
 METEOBLUE_WINTER_HOURS_LOCAL = (6, 12, 18)
 METEOBLUE_MAX_BONUS_CALLS_PER_EVENT = 1
+# v0.1.17 fix: Meteonomiqs's bonus-call path had no per-day cap at all —
+# only the overall 1000-calls/year budget check — confirmed in production
+# to allow it firing every 5 minutes if the cross-model trigger kept
+# re-evaluating true, burning the annual budget in days. Same daily
+# philosophy as meteoblue's cap above: one bonus call per storm scenario,
+# per day, regardless of how many times the trigger condition re-fires.
+METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT = 1
 
 COMBIPRECIP_POLL_INTERVAL = timedelta(minutes=5)
 
