@@ -110,6 +110,22 @@ class ParsedForecast:
     # knowing the grid's own elevation, there's nothing to compare the
     # configured actual elevation against.
     grid_elevation_m: Optional[float] = None
+    # v0.1.19 fix: names of hourly variables whose value array length
+    # didn't match the "time" axis length. Previously `zip(times, values)`
+    # would silently stop at the shorter of the two with no signal
+    # anywhere that it happened, hiding provider regressions/malformed
+    # responses behind what still looked like a normal, if slightly
+    # short, forecast. The mismatched variable's points for the
+    # unmatched tail are simply not included (same truncation as before —
+    # this field only adds visibility, it doesn't change what data is
+    # kept), so callers (the coordinator) can log/record a diagnostic
+    # event instead of the mismatch being invisible.
+    array_length_mismatches: tuple[str, ...] = ()
+    # v0.1.19: deterministic content hash of the hourly time/value series
+    # — see _compute_run_fingerprint and parse_forecast_response's
+    # docstring. Used by OpenMeteoCoordinator to detect an unchanged
+    # upstream run instead of the always-advancing issued_at.
+    run_fingerprint: Optional[str] = None
 
 
 # Maps Open-Meteo's hourly response keys back to this project's internal
@@ -132,6 +148,26 @@ _VARIABLE_NAME_MAP = {
 }
 
 
+def _compute_run_fingerprint(hourly: dict[str, Any]) -> str:
+    """A deterministic identity for "this specific set of hourly values",
+    independent of wall-clock poll time — see parse_forecast_response's
+    docstring and the v0.1.19 fix note on OpenMeteoCoordinator for why
+    this exists. Built only from the "time" axis plus the variables this
+    project actually maps (_VARIABLE_NAME_MAP), sorted deterministically,
+    so it isn't sensitive to unrelated response fields (e.g. irrelevant
+    metadata) or to Open-Meteo's own key ordering.
+    """
+    import hashlib
+    import json
+
+    fingerprint_source = {"time": hourly.get("time", [])}
+    for open_meteo_key in _VARIABLE_NAME_MAP:
+        if open_meteo_key in hourly:
+            fingerprint_source[open_meteo_key] = hourly[open_meteo_key]
+    serialized = json.dumps(fingerprint_source, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def parse_forecast_response(payload: dict[str, Any]) -> ParsedForecast:
     """Parse Open-Meteo's JSON response into a flat list of forecast points.
 
@@ -142,23 +178,52 @@ def parse_forecast_response(payload: dict[str, Any]) -> ParsedForecast:
     "time of this successful poll" as issued_at. This is a deliberate
     simplification worth revisiting if lead-time bucketing looks wrong
     against real accuracy data once the system is running.
+
+    **v0.1.19 fix (DEF-02)**: because `issued_at` is always
+    `datetime.now(timezone.utc)`, the coordinator's old dedup check
+    (`parsed.issued_at <= previous_issued`) could essentially never be
+    true — every poll looked like a brand-new model run even when the
+    upstream data hadn't changed at all, inflating forecast_snapshots and
+    learning samples. `run_fingerprint` is a hash of the actual returned
+    time/value series (see _compute_run_fingerprint), so the coordinator
+    can now detect "nothing changed since last poll" by comparing content,
+    not an always-advancing poll timestamp.
     """
     hourly = payload.get("hourly", {})
     times = hourly.get("time", [])
     issued_at = datetime.now(timezone.utc)
     grid_elevation_m = payload.get("elevation")
+    run_fingerprint = _compute_run_fingerprint(hourly)
 
     points: list[ForecastPoint] = []
+    mismatches: list[str] = []
     for open_meteo_key, internal_name in _VARIABLE_NAME_MAP.items():
         values = hourly.get(open_meteo_key)
         if values is None:
             continue
+        # v0.1.19 fix: `zip(times, values)` alone silently stops at the
+        # shorter of the two arrays with no signal anywhere that it
+        # happened — a provider regression or a malformed/partial
+        # response would just look like a normal, slightly-short
+        # forecast. Recording the mismatch here (see
+        # ParsedForecast.array_length_mismatches) lets the coordinator
+        # log a warning and record a diagnostics event instead. The
+        # truncation behavior itself is unchanged (still pairs by index,
+        # front-aligned) — this only adds visibility.
+        if len(values) != len(times):
+            mismatches.append(internal_name)
         for t_str, value in zip(times, values):
             valid_at = datetime.fromisoformat(t_str).replace(tzinfo=timezone.utc)
             points.append(
                 ForecastPoint(variable=internal_name, valid_at=valid_at, value=value)
             )
-    return ParsedForecast(issued_at=issued_at, points=points, grid_elevation_m=grid_elevation_m)
+    return ParsedForecast(
+        issued_at=issued_at,
+        points=points,
+        grid_elevation_m=grid_elevation_m,
+        array_length_mismatches=tuple(mismatches),
+        run_fingerprint=run_fingerprint,
+    )
 
 
 def parse_elevation_response(payload: dict[str, Any]) -> Optional[float]:

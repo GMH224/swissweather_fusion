@@ -32,9 +32,24 @@ def db():
     os.remove(path)
 
 
-def _reconcile_once(db: SwissWeatherDB, *, since: datetime, now: datetime) -> int:
+RETRY_GIVE_UP_AGE = timedelta(hours=48)
+
+
+def _reconcile_once(
+    db: SwissWeatherDB, *, since: datetime, now: datetime
+) -> int:
     """Mirrors ModelALearningCoordinator._reconcile's logic exactly,
-    without the Home Assistant coordinator wrapper around it.
+    without the Home Assistant coordinator wrapper around it — including
+    the retry-watermark-capping behavior (v0.1.15, fixed for real in
+    v0.1.19; see coordinator.py's _reconcile for the full explanation).
+
+    v0.1.19: this mirror previously always advanced the watermark to
+    `until_iso` unconditionally, regardless of unmatched-but-retryable
+    rows — meaning it didn't actually mirror the coordinator's real retry
+    logic at all, and the retry-drop bug wasn't exercised by any test in
+    this file. Now mirrors the fixed production logic exactly, including
+    backing the watermark off by one microsecond so a retry row remains
+    eligible on the very next pass.
     """
     measurements = ("temperature", "humidity", "pressure")
     since_iso = since.isoformat()
@@ -59,6 +74,7 @@ def _reconcile_once(db: SwissWeatherDB, *, since: datetime, now: datetime) -> in
         candidates_by_measurement["pressure"].append((ts, row["pressure"]))
 
     reconciled = 0
+    earliest_retry_valid_at = None
     for fs_row in rows_to_reconcile:
         if fs_row["value"] is None:
             continue
@@ -70,6 +86,9 @@ def _reconcile_once(db: SwissWeatherDB, *, since: datetime, now: datetime) -> in
             target=valid_at, candidates=candidates_by_measurement[measurement]
         )
         if actual_value is None:
+            if (now - valid_at) < RETRY_GIVE_UP_AGE:
+                if earliest_retry_valid_at is None or valid_at < earliest_retry_valid_at:
+                    earliest_retry_valid_at = valid_at
             continue
 
         key = BucketKey(
@@ -105,7 +124,12 @@ def _reconcile_once(db: SwissWeatherDB, *, since: datetime, now: datetime) -> in
         )
         reconciled += 1
 
-    db.set_reconciliation_watermark(until_iso)
+    new_watermark = (
+        (earliest_retry_valid_at - timedelta(microseconds=1)).isoformat()
+        if earliest_retry_valid_at is not None
+        else until_iso
+    )
+    db.set_reconciliation_watermark(new_watermark)
     return reconciled
 
 
@@ -182,6 +206,91 @@ def test_reconciliation_skips_when_no_station_reading_within_tolerance(db):
 
     key = BucketKey(hour_of_day=15, season="JJA", lead_time_bucket="short", source="ch1", measurement="temperature")
     assert db.get_bucket_stats(key) is None
+
+
+def test_reconciliation_retries_unmatched_row_on_next_pass(db):
+    """v0.1.19 regression test for the watermark boundary bug: a forecast
+    row with no matching station observation yet must still be returned
+    by get_forecast_snapshots_to_reconcile on the VERY NEXT pass, not
+    permanently excluded from it.
+
+    Before the fix, the watermark was capped at exactly the retry row's
+    valid_at, but the query is `valid_at > since_ts` (strict) — so the
+    row became its own exclusion boundary on the next pass and got zero
+    further retries, contradicting the RETRY_GIVE_UP_AGE machinery that
+    implies it should get repeated chances for up to 48 hours.
+    """
+    issued_at = datetime(2026, 7, 25, 9, 0, tzinfo=timezone.utc)
+    valid_at = datetime(2026, 7, 25, 15, 0, tzinfo=timezone.utc)
+    db.insert_forecast_snapshot(
+        "ch1", issued_at.isoformat(), valid_at.isoformat(), "temperature", 22.0
+    )
+    # No station observation yet — this row cannot be reconciled on pass 1.
+
+    now_1 = valid_at + timedelta(minutes=10)
+    reconciled_1 = _reconcile_once(db, since=issued_at - timedelta(hours=1), now=now_1)
+    assert reconciled_1 == 0
+
+    # The critical assertion: the watermark must NOT have advanced past
+    # (or exactly to) the unmatched row's valid_at — it must still be
+    # reachable by a `valid_at > watermark` query.
+    watermark_after_pass_1 = datetime.fromisoformat(db.get_reconciliation_watermark())
+    assert watermark_after_pass_1 < valid_at
+
+    # Pass 2: still no station data. The row must be returned again
+    # (that's the fix) — with the pre-v0.1.19 bug, this returned 0 rows
+    # to even consider retrying because the query itself excluded it.
+    now_2 = now_1 + timedelta(minutes=20)
+    rows_pass_2 = db.get_forecast_snapshots_to_reconcile(
+        since_ts=db.get_reconciliation_watermark(),
+        until_ts=now_2.isoformat(),
+        measurements=("temperature", "humidity", "pressure"),
+    )
+    assert len(rows_pass_2) == 1
+    assert rows_pass_2[0]["valid_at"] == valid_at.isoformat()
+
+    # Now the station observation finally arrives, and pass 2 actually
+    # reconciles it — proving the retry path is not just "returned by the
+    # query" but genuinely usable end to end.
+    db.insert_station_observation(valid_at.isoformat(), 20.0, 55.0, 1013.0)
+    reconciled_2 = _reconcile_once(
+        db, since=watermark_after_pass_1, now=now_2
+    )
+    assert reconciled_2 == 1
+
+    key = BucketKey(
+        hour_of_day=15, season="JJA", lead_time_bucket="short",
+        source="ch1", measurement="temperature",
+    )
+    stats = db.get_bucket_stats(key)
+    assert stats is not None
+    assert stats.sample_count == 1
+
+
+def test_reconciliation_gives_up_on_retry_after_max_age(db):
+    """A row that never finds a matching station observation must
+    eventually stop being retried once it's older than RETRY_GIVE_UP_AGE
+    — otherwise a permanent station outage would hold the watermark back
+    forever. This isn't new behavior from the v0.1.19 fix (the give-up
+    age check already existed) — it's a regression test confirming the
+    fix didn't accidentally remove the give-up path while fixing the
+    retry-inclusion boundary.
+    """
+    issued_at = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+    valid_at = datetime(2026, 1, 1, 15, 0, tzinfo=timezone.utc)
+    db.insert_forecast_snapshot(
+        "ch1", issued_at.isoformat(), valid_at.isoformat(), "temperature", 22.0
+    )
+    # No matching station observation ever arrives for this row.
+
+    now_far_future = valid_at + RETRY_GIVE_UP_AGE + timedelta(hours=1)
+    reconciled = _reconcile_once(
+        db, since=issued_at - timedelta(hours=1), now=now_far_future
+    )
+    assert reconciled == 0
+    # Old enough now — the watermark advances fully past it rather than
+    # holding the retry window open forever for a permanent gap.
+    assert db.get_reconciliation_watermark() == now_far_future.isoformat()
 
 
 def test_reconciliation_second_observation_moves_ema_not_replaces(db):

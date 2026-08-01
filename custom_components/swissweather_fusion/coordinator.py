@@ -101,6 +101,12 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         self._actual_elevation_m = actual_elevation_m
         self._client = OpenMeteoClient(async_get_clientsession(hass), api_key=api_key)
         self._last_issued_at: dict[str, datetime] = {}
+        # v0.1.19 fix (DEF-02): issued_at alone couldn't detect an
+        # unchanged upstream run (see open_meteo.py's docstring) — this
+        # tracks the last actually-stored run's content fingerprint per
+        # source so a repeated identical poll can be recognized and
+        # skipped, the way the dedup check was always meant to behave.
+        self._last_run_fingerprint: dict[str, Optional[str]] = {}
         # One health tracker per model, not one for the whole coordinator —
         # CH1 can fail while CH2/D2 succeed (e.g. a MeteoSwiss-side issue
         # specific to one model), and that distinction is exactly what
@@ -146,17 +152,44 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                     detail=f"{len(parsed.points)} points",
                 )
 
-            previous_issued = self._last_issued_at.get(source)
-            if previous_issued is not None and parsed.issued_at <= previous_issued:
+            # v0.1.19 fix (DEF-02): previously compared parsed.issued_at
+            # to the last stored issued_at, but issued_at is always
+            # datetime.now(timezone.utc) — it only ever increases, so
+            # that comparison could essentially never suppress a repeat
+            # poll of an unchanged upstream run. Now compares a content
+            # fingerprint of the actual returned series instead (see
+            # open_meteo.py's parse_forecast_response), which is stable
+            # across polls when nothing has actually changed upstream.
+            previous_fingerprint = self._last_run_fingerprint.get(source)
+            if (
+                previous_fingerprint is not None
+                and parsed.run_fingerprint == previous_fingerprint
+            ):
                 # No new run since last successful fetch — nothing to store.
-                # (Simplification note: this project treats "poll time" as
-                # issued_at rather than the upstream model's true reference
-                # time, per open_meteo.py's own docstring — this comparison
-                # is therefore approximate, not a precise run-identity
-                # check. Revisit if lead-time bucketing looks wrong once
-                # real accuracy data exists.)
                 continue
             self._last_issued_at[source] = parsed.issued_at
+            self._last_run_fingerprint[source] = parsed.run_fingerprint
+
+            if parsed.array_length_mismatches and self._diagnostics is not None:
+                # v0.1.19 fix: surface Open-Meteo array-length mismatches
+                # (a variable's value array shorter/longer than the time
+                # axis, previously silently truncated by zip()) instead of
+                # letting them pass with no trace anywhere.
+                self._diagnostics.record(
+                    source=source, event_type="parse_warning",
+                    detail=(
+                        "hourly array length mismatch for: "
+                        + ", ".join(parsed.array_length_mismatches)
+                    ),
+                )
+            if parsed.array_length_mismatches:
+                _LOGGER.warning(
+                    "Open-Meteo %s: hourly array length mismatch for %s — "
+                    "the shorter array's tail was truncated silently by "
+                    "design (see open_meteo.py), this is just visibility.",
+                    source,
+                    ", ".join(parsed.array_length_mismatches),
+                )
 
             # v0.1.15 fix: wires apply_lapse_rate_precorrection into the
             # actual blend path — see __init__'s comment for the full
@@ -1124,8 +1157,21 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         # v0.1.15 fix: cap the new watermark at the earliest still-retryable
         # skipped row's valid_at, if there is one — otherwise advance fully
         # to now, same as before. See the loop above and RETRY_GIVE_UP_AGE.
+        #
+        # v0.1.19 fix: the v0.1.15 fix capped the watermark AT the retry
+        # row's exact valid_at, but get_forecast_snapshots_to_reconcile
+        # queries with `valid_at > since_ts` (strict). That meant the very
+        # row the cap was meant to protect became the new lower bound and
+        # was then excluded by the strict inequality on the *next* pass —
+        # so it silently got zero retries rather than the intended chances
+        # up to RETRY_GIVE_UP_AGE. Confirmed by direct simulation: a row
+        # set as the watermark is provably ineligible on the very next
+        # query. Backing off by one microsecond keeps the row on the right
+        # side of the strict inequality without re-including anything that
+        # was already fully reconciled before it (nothing can legitimately
+        # sit in that 1-microsecond gap).
         new_watermark = (
-            earliest_retry_valid_at.isoformat()
+            (earliest_retry_valid_at - timedelta(microseconds=1)).isoformat()
             if earliest_retry_valid_at is not None
             else until_iso
         )

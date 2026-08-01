@@ -93,6 +93,67 @@ def test_redact_coordinate_strings_catches_combined_id_format():
     assert "unrelated" in redacted  # untouched, unrelated content survives
 
 
+def test_redact_coordinate_strings_various_decimal_precisions():
+    """v0.1.19 regression test: before this fix, only str(value)/.4f/.2f
+    were matched, so coordinates embedded at other precisions (3, 5, 6
+    decimals — all plausible from a third-party API/JSON serializer)
+    slipped through untouched.
+    """
+    for decimals in (2, 3, 5, 6, 8):
+        text = f'{{"loc": "{TEST_LAT:.{decimals}f},{TEST_LON:.{decimals}f}"}}'
+        redacted = redaction.redact_coordinate_strings(
+            text, latitude=TEST_LAT, longitude=TEST_LON
+        )
+        assert f"{TEST_LAT:.{decimals}f}" not in redacted, f"leaked at {decimals} decimals"
+        assert f"{TEST_LON:.{decimals}f}" not in redacted, f"leaked at {decimals} decimals"
+        assert "[LAT_REDACTED]" in redacted
+        assert "[LON_REDACTED]" in redacted
+
+
+def test_redact_coordinate_strings_bracketed_format():
+    """A bracketed [lat, lon] pair, as might appear in a GeoJSON-style
+    payload or an error message — a format the original 3-variant list
+    wouldn't have matched at all precisions.
+    """
+    text = f"location=[{TEST_LAT:.5f}, {TEST_LON:.5f}]"
+    redacted = redaction.redact_coordinate_strings(
+        text, latitude=TEST_LAT, longitude=TEST_LON
+    )
+    assert f"{TEST_LAT:.5f}" not in redacted
+    assert f"{TEST_LON:.5f}" not in redacted
+    assert "[LAT_REDACTED]" in redacted
+    assert "[LON_REDACTED]" in redacted
+
+
+def test_redact_coordinate_strings_does_not_clobber_unrelated_longer_number():
+    """Guards against the substitution being too eager: a longer, unrelated
+    number that merely contains the configured coordinate as a substring
+    (e.g. a station ID or an elevation-adjacent figure) must survive
+    intact — only an actual coordinate-boundary match should be redacted.
+    """
+    text = f"station_reading=146.9480 unrelated_id=7.44740001"
+    redacted = redaction.redact_coordinate_strings(
+        text, latitude=TEST_LAT, longitude=TEST_LON
+    )
+    # Neither of these is genuinely the configured coordinate — the first
+    # is a different number that happens to end the same way, the second
+    # has extra trailing digits — so both must be left alone.
+    assert "146.9480" in redacted
+    assert "7.44740001" in redacted
+
+
+def test_redact_coordinate_strings_prefers_longest_match():
+    """The most precise/longest representation must be matched before a
+    shorter one that's a strict prefix of it, so redaction doesn't leave
+    a mangled remainder like a stray ".9480" behind.
+    """
+    text = f"id={TEST_LAT:.4f},{TEST_LON:.4f}"
+    redacted = redaction.redact_coordinate_strings(
+        text, latitude=TEST_LAT, longitude=TEST_LON
+    )
+    assert redacted == "id=[LAT_REDACTED],[LON_REDACTED]"
+
+
 def test_redact_diagnostic_payload_combined_pass_on_real_structure():
     """The actual function used at every diagnostic recording call site —
     confirms the combined key + coordinate pass fully cleans the real SRF

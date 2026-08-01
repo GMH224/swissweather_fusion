@@ -54,8 +54,25 @@ def scheduled_hours_for_month(month: int) -> tuple[int, ...]:
 
 
 def is_scheduled_poll_time(*, local_dt: datetime) -> bool:
-    """True if local_dt's hour matches this month's schedule (minute 0)."""
-    return local_dt.hour in scheduled_hours_for_month(local_dt.month) and local_dt.minute == 0
+    """True if local_dt's hour matches this month's schedule.
+
+    **v0.1.19 fix**: this used to also require `local_dt.minute == 0`, on
+    the assumption the coordinator would be checked exactly on the hour.
+    In reality the coordinator (see MeteoblueCoordinator) checks every 5
+    minutes via `async_track_time_interval`, which is a fixed interval
+    *relative to whenever the coordinator was created* (HA startup or
+    integration reload), not wall-clock aligned. Unless that moment
+    happened to fall on a multiple of 5 minutes that also lands exactly on
+    :00, the checks would land on minutes like :17/:22/:27/... forever and
+    `minute == 0` would never be true — so scheduled meteoblue calls could
+    silently never fire on most restarts. Confirmed via code trace, no
+    live reproduction needed: the bug is in the gate condition itself.
+    Now a window check instead: true for the whole scheduled hour, with
+    `should_fire_scheduled_call` below (via `last_scheduled_call_hour`)
+    responsible for making sure that only fires once per (date, hour)
+    rather than on every 5-minute check within the hour.
+    """
+    return local_dt.hour in scheduled_hours_for_month(local_dt.month)
 
 
 def should_fire_scheduled_call(

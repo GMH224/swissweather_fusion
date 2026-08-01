@@ -129,6 +129,38 @@ def test_parse_forecastpoint_response_hours_wins_over_three_hours_for_same_times
     assert temps == [22]  # hours' value, not three_hours' 999
 
 
+def test_parse_forecastpoint_response_merges_per_field_at_shared_timestamp():
+    """v0.1.19 regression test: before this fix, when hours and
+    three_hours both covered the same timestamp, the merge replaced
+    three_hours' ENTIRE point list for that timestamp with hours' list —
+    so a field present only in three_hours (e.g. a measurement hours
+    happened not to report that hour) was silently lost even though there
+    was no real conflict. Simulates exactly that: hours reports
+    everything except PRESSURE_HPA at a timestamp; three_hours reports
+    PRESSURE_HPA (differently) plus its own TTT_C at the same timestamp.
+    Expected: hours' TTT_C wins (real conflict, finer source), but
+    three_hours' pressure survives (no conflict, would have been lost
+    pre-fix).
+    """
+    same_time = "2026-07-31T00:00:00+02:00"
+    hours_entry = dict(_REAL_HOURS_ENTRY)
+    hours_entry["date_time"] = same_time
+    hours_entry["TTT_C"] = 22
+    del hours_entry["PRESSURE_HPA"]  # hours doesn't report pressure this hour
+
+    three_hours_entry = dict(_REAL_THREE_HOURS_ENTRY)
+    three_hours_entry["date_time"] = same_time
+    three_hours_entry["TTT_C"] = 999  # would win pre-fix; must lose to hours
+    three_hours_entry["PRESSURE_HPA"] = 1021  # only source for pressure at this timestamp
+
+    payload = {"hours": [hours_entry], "three_hours": [three_hours_entry], "days": []}
+    points = srf.parse_forecastpoint_response(payload)
+    by_variable = {p.variable: p.value for p in points}
+
+    assert by_variable["temperature"] == 22  # hours wins the real conflict
+    assert by_variable["pressure"] == 1021  # three_hours-only field survives
+
+
 def test_parse_forecastpoint_response_three_hours_fills_beyond_hours_coverage():
     """For a timestamp only three_hours covers, that data must still be
     included — it's not redundant, it extends coverage further out.
@@ -306,6 +338,35 @@ def test_parse_forecast_response_matches_confirmed_real_structure():
     # None of the hourly measurement names appear at all — this is the
     # whole point of the fix.
     assert not any(p.variable in ("temperature", "humidity", "pressure") for p in points)
+
+
+def test_parse_forecast_response_normalizes_offset_aware_timestamps_to_utc():
+    """v0.1.19 regression test: before this fix, an offset-aware
+    local_date_time (e.g. the real "+02:00" CEST the daily endpoint
+    returns) kept its original offset instead of being converted to UTC.
+    storage/db.py compares/sorts valid_at as exact ISO strings, and every
+    other source (plus SRF's own hourly/forecastpoint path via
+    _parse_entry_datetime) stores UTC "+00:00" strings — so an
+    un-normalized "+02:00" row would silently never match the blend's
+    target keys even though it looked present in storage. Confirms the
+    daily fallback now produces the same UTC-normalized ISO string a
+    hand-converted "+02:00" timestamp should produce.
+    """
+    payload = {
+        "forecast": {
+            "day": [
+                {
+                    "TX_C": 30, "TN_C": 18, "RRR_MM": 0.0, "FF_KMH": 6,
+                    "local_date_time": "2026-08-01T00:00:00+02:00",
+                },
+            ]
+        },
+    }
+    points = srf.parse_forecast_response(payload)
+    assert points  # sanity: the entry was actually parsed
+    for point in points:
+        assert point.valid_at.utcoffset().total_seconds() == 0
+        assert point.valid_at.isoformat() == "2026-07-31T22:00:00+00:00"
 
 
 def test_parse_forecast_response_skips_entries_missing_local_date_time():

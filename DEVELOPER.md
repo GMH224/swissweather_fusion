@@ -1,5 +1,123 @@
 # Developer notes: architecture rationale
 
+## v0.1.19 — Remediation of three independent audit reports
+
+Three independent code audits of v0.1.18 (two general, one focused
+specifically on why `expert_weight_srf` was rendering as `Unknown`
+despite healthy SRF polling) converged on the same core findings.
+Every finding below was independently re-verified against the actual
+source before being fixed — either by direct code trace, or by a small
+standalone simulation reproducing the exact failure mode described. See
+`swissweather_fusion_v0.1.19_remediation_audit.md` in the repo root for
+the full verification writeup, including the reproduction for the
+watermark bug.
+
+**Fixed — data/learning correctness (the most consequential group)**:
+
+- **Reconciliation retry-watermark boundary** (`coordinator.py`
+  `ModelALearningCoordinator._reconcile`). The v0.1.15 fix intended to
+  give an unmatched-but-still-young forecast row repeated retry chances
+  (up to `RETRY_GIVE_UP_AGE`, 48h) by capping the watermark at that row's
+  own `valid_at` instead of advancing past it. But
+  `get_forecast_snapshots_to_reconcile` queries with `valid_at >
+  since_ts` (strict) — so the row became its own exclusion boundary and
+  got **zero** further retries starting on the very next reconciliation
+  pass, not the intended up-to-48h window. Directly reproduced with a
+  small simulation before fixing (see the remediation audit). Fixed by
+  backing the watermark off one microsecond before the earliest
+  retryable row's `valid_at`, so it stays on the correct side of the
+  strict inequality. This is very likely the primary reason
+  `expert_weight_srf` stayed `Unknown` even with a healthy SRF fetch
+  layer — any SRF row that missed a station match on its first attempt
+  was silently gone, not "eventually given up on."
+- **SRF `forecastpoint` hours/three_hours merge** (`clients/srf.py`).
+  The merge used to be a dict `.update()` keyed only by `valid_at`,
+  replacing three_hours' *entire* point list for a shared timestamp with
+  hours' list — so a field three_hours reported that hours simply didn't
+  (no real conflict) was silently dropped. Now merges per
+  `(valid_at, variable)`: three_hours is the base layer, hours overwrites
+  only the specific variables it itself provides at that timestamp.
+- **SRF daily-fallback timestamp normalization** (`clients/srf.py`
+  `parse_forecast_response`). Offset-aware `local_date_time` values
+  (e.g. the real `+02:00` CEST the daily endpoint returns) kept their
+  original offset instead of being converted to UTC, unlike the
+  hourly/forecastpoint path's `_parse_entry_datetime`. Since
+  `storage/db.py` compares/sorts `valid_at` as exact ISO strings, an
+  un-normalized row could never match the UTC keys everything else uses
+  — it would look stored but be invisible to the blend. Now calls
+  `.astimezone(timezone.utc)` unconditionally, same as the hourly path.
+- **Open-Meteo dedup was a no-op** (`clients/open_meteo.py`,
+  `coordinator.py`). `issued_at` was always `datetime.now(timezone.utc)`,
+  so the old dedup check (`parsed.issued_at <= previous_issued`) could
+  essentially never be true — every poll looked like a brand-new model
+  run, inflating `forecast_snapshots` and learning samples even when the
+  upstream data hadn't changed. Added `run_fingerprint`, a deterministic
+  content hash of the actual returned time/value series, and the
+  coordinator now dedups on that instead.
+- **Open-Meteo array-length mismatches were invisible**
+  (`clients/open_meteo.py`). `zip(times, values)` silently truncates to
+  the shorter array — a provider regression or malformed/partial
+  response looked identical to a normal, slightly-short forecast. Added
+  `ParsedForecast.array_length_mismatches`; the coordinator now logs a
+  warning and records a diagnostics event when a mismatch is detected.
+  The truncation behavior itself is intentionally unchanged — this is
+  visibility, not a behavior change.
+
+**Fixed — scheduling**:
+
+- **Meteoblue's scheduled polling could permanently miss every slot**
+  (`clients/meteoblue.py`). `is_scheduled_poll_time` required
+  `local_dt.minute == 0`, but it's checked from a `DataUpdateCoordinator`
+  ticking every 5 minutes *relative to whenever the coordinator was
+  created* (HA startup or reload) — not wall-clock aligned. Unless that
+  moment happened to land on a multiple-of-5 minute that was also `:00`,
+  the checks would land on `:17`/`:22`/`:27`/... forever, and the
+  12:00/16:00/20:00 (or winter) scheduled calls could simply never fire.
+  `is_scheduled_poll_time` is now a whole-hour window check; the existing
+  `last_scheduled_call_hour` guard in `should_fire_scheduled_call` (not
+  minute alignment) is what already prevented duplicate fires within the
+  same hour, so removing the minute check doesn't introduce repeat
+  firing.
+
+**Fixed — diagnostics/security**:
+
+- **Coordinate redaction only covered 3 hardcoded formats**
+  (`redaction.py`). `str(value)`/`.4f`/`.2f` missed coordinates embedded
+  at other decimal precisions or in different textual forms (e.g.
+  bracketed `[lat, lon]`). Widened to decimal precisions 2 through 8
+  (2 is the floor deliberately — 0/1-decimal renderings are short enough
+  to plausibly collide with an unrelated number elsewhere in a weather
+  payload; this was caught directly by a test during development, where
+  a 0-decimal longitude variant clipped the front off an unrelated
+  longer number). Substitution is guarded on both sides against an
+  adjacent digit or decimal point so a match can't clobber part of a
+  longer, unrelated number, and the longest/most-precise variant is
+  always tried first.
+
+**Documentation-only correction (not a behavior change)**:
+
+- `parse_geolocation_response`'s docstring claimed SRF's geolocation
+  search results are sorted by distance and "the closest one" is taken.
+  The implementation has only ever taken `results[0]`. Corrected the
+  docstring to describe actual behavior and explained why this wasn't
+  changed to a real distance calculation in this pass: none of the three
+  confirmed SRF geolocation response shapes include a documented
+  lat/lon or distance field per entry, and guessing at an unconfirmed
+  field shape is exactly the mistake that caused three earlier SRF
+  parsing bugs (v0.1.1, v0.1.4, v0.1.8) in the first place. Tracked as a
+  follow-up risk requiring a live multi-result capture, not fixed
+  speculatively.
+
+**Deliberately not changed in this pass** (real gaps, but design
+decisions or out of scope for a bug-fix release, not defects):
+Model A still only reconciles temperature/humidity/pressure (SRF's
+precip/wind can't get a learned weight without local rain/wind ground
+truth — this is why SRF's *weight* can legitimately stay neutral even
+after the watermark fix, though it should now at least become numeric).
+`ForecastAccuracySensor` and the Model B training-timestamp sensor
+remain stubs. Both were flagged as Low severity / explicit product gaps
+by all three source audits, not correctness bugs.
+
 ## v0.1.18 — SRF's real hourly endpoint, confirmed and fully wired in
 
 Built, NOT yet deployed — held pending a joint decision on timing, same

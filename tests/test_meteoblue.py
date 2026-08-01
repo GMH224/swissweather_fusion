@@ -20,9 +20,68 @@ def test_scheduled_hours_seasonal_boundaries():
 
 
 def test_is_scheduled_poll_time():
+    """v0.1.19: is_scheduled_poll_time is now a hour-window check, not an
+    exact-minute-0 check — see should_fire_scheduled_call for why that's
+    safe (the "already fired this hour" guard is what prevents repeat
+    fires within the same scheduled hour, not this function).
+    """
     assert mb.is_scheduled_poll_time(local_dt=datetime(2026, 7, 25, 16, 0))
     assert not mb.is_scheduled_poll_time(local_dt=datetime(2026, 7, 25, 15, 0))
-    assert not mb.is_scheduled_poll_time(local_dt=datetime(2026, 7, 25, 16, 5))
+    # Previously False (pre-v0.1.19) purely because the minute wasn't 0 —
+    # that was the bug. Any minute within a scheduled hour now counts.
+    assert mb.is_scheduled_poll_time(local_dt=datetime(2026, 7, 25, 16, 5))
+    assert mb.is_scheduled_poll_time(local_dt=datetime(2026, 7, 25, 16, 59))
+
+
+def test_scheduled_call_fires_even_when_never_checked_at_minute_zero():
+    """v0.1.19 regression test for DEF-01 / the meteoblue scheduling bug:
+    a coordinator whose 5-minute checks never land on minute 0 (because
+    they're relative to whatever moment HA started, not wall-clock
+    aligned) used to NEVER fire a scheduled call, since the old gate
+    required `local_dt.minute == 0` exactly. Simulates a coordinator that
+    started at :17 past the hour, so its checks land on :17/:22/:27/...
+    forever — none of which is minute 0 — and confirms a scheduled call
+    still fires once it enters the scheduled hour.
+    """
+    last_scheduled_call_hour = None
+    fired_at = []
+    # Checks every 5 minutes starting at 15:17, i.e. never once on :00.
+    check_times = [
+        datetime(2026, 7, 25, hour, minute)
+        for hour in (15, 16)
+        for minute in range(17, 60, 5)
+    ]
+    for local_dt in check_times:
+        if mb.should_fire_scheduled_call(
+            local_dt=local_dt, last_scheduled_call_hour=last_scheduled_call_hour
+        ):
+            fired_at.append(local_dt)
+            last_scheduled_call_hour = local_dt
+
+    # 16:00 is a scheduled July slot; 15:xx is not. Exactly one fire,
+    # at the first check that lands inside the scheduled hour (16:17),
+    # even though minute 0 was never checked.
+    assert fired_at == [datetime(2026, 7, 25, 16, 17)]
+
+
+def test_scheduled_call_fires_only_once_per_hour_at_non_zero_minutes():
+    """Companion to the above: within the same scheduled hour, repeated
+    5-minute checks at non-zero minutes must not fire more than once —
+    confirms should_fire_scheduled_call's own-hour guard (not minute
+    alignment) is what's actually preventing duplicate fires.
+    """
+    scheduled_hour_checks = [
+        datetime(2026, 7, 25, 16, minute) for minute in (7, 12, 17, 22, 27)
+    ]
+    last_scheduled_call_hour = None
+    fire_count = 0
+    for local_dt in scheduled_hour_checks:
+        if mb.should_fire_scheduled_call(
+            local_dt=local_dt, last_scheduled_call_hour=last_scheduled_call_hour
+        ):
+            fire_count += 1
+            last_scheduled_call_hour = local_dt
+    assert fire_count == 1
 
 
 def test_should_fire_scheduled_call_basic():

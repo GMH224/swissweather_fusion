@@ -132,7 +132,28 @@ def parse_token_response(payload: dict[str, Any]) -> str:
 
 
 def parse_geolocation_response(payload: Any) -> Optional[str]:
-    """SRF's geolocation search returns matches; take the closest one.
+    """SRF's geolocation search returns matches; take the first one.
+
+    **v0.1.19 note**: the docstring here previously said "take the
+    closest one", but the implementation has only ever taken
+    `results[0]` — it does not compute or compare distance to the
+    configured coordinates. Since the request itself is a coordinate-based
+    search (`?latitude=...&longitude=...`), it's a reasonable expectation
+    that the API already returns its best/nearest match first, but that
+    ordering has never been independently confirmed against a real
+    response containing multiple candidates, so it's a "most likely
+    correct" assumption, not a verified one. Deliberately NOT changed to
+    an actual distance calculation in this pass: none of the three
+    confirmed response shapes below include a documented lat/lon or
+    distance field on each entry, and every other fix in this file was
+    made specifically by matching against a real, captured API response
+    rather than guessing at a field shape (that discipline is why the
+    v0.1.1/v0.1.4/v0.1.8 fixes below exist in the first place — guessing
+    at SRF's shapes has been wrong before). If a live multi-result
+    response is captured showing the actual sort order (or an explicit
+    distance/lat/lon field per entry), that should replace this docstring
+    fix with a real one. Tracked as a follow-up risk, not a confirmed
+    defect, in the SRF weighting audit.
 
     **Fixed in v0.1.1**: this crashed in production with 'list' object has
     no attribute 'get' — the actual response is very likely a bare JSON
@@ -236,8 +257,23 @@ def parse_forecast_response(payload: Any) -> list[SrfForecastPoint]:
         if not valid_at_str:
             continue
         valid_at = datetime.fromisoformat(valid_at_str)
+        # v0.1.19 fix: this only handled the naive case (assume UTC),
+        # but left offset-AWARE timestamps (e.g. "...+02:00" CEST, which
+        # is what the daily endpoint actually returns per the "local" in
+        # local_date_time) with their original offset intact instead of
+        # normalizing to UTC. Model A's blend and the reconciliation
+        # queries in storage/db.py compare/sort valid_at as exact ISO
+        # strings, so an un-normalized "...+02:00" row would never match
+        # (or would sort incorrectly against) the UTC "...+00:00" keys
+        # every other source and the forecastpoint path already use —
+        # the row would look stored but be invisible to the blend. Same
+        # normalization _parse_entry_datetime already applies below for
+        # the hourly/forecastpoint path, now applied consistently here
+        # too, whether the timestamp is naive or already offset-aware.
         if valid_at.tzinfo is None:
             valid_at = valid_at.replace(tzinfo=timezone.utc)
+        else:
+            valid_at = valid_at.astimezone(timezone.utc)
         for srf_key, internal_name in _DAY_FIELD_MAP.items():
             if srf_key in entry and entry[srf_key] is not None:
                 points.append(
@@ -326,30 +362,46 @@ def _parse_entry_datetime(entry: dict[str, Any]) -> Optional[datetime]:
     return valid_at.astimezone(timezone.utc)
 
 
-def _points_from_hourly_entries(entries: list) -> dict[datetime, list[SrfForecastPoint]]:
-    """Returns points grouped by valid_at, not a flat list — the caller
-    merges "hours" and "three_hours" results together, preferring "hours"
-    for any timestamp both cover, so this needs to be keyed for that.
+def _points_from_hourly_entries(
+    entries: list,
+) -> dict[datetime, dict[str, SrfForecastPoint]]:
+    """Returns points grouped by valid_at AND THEN by internal variable
+    name (not a flat list per timestamp) — the caller merges "hours" and
+    "three_hours" results together, preferring "hours" for any (timestamp,
+    variable) pair both cover, so this needs to be keyed at the variable
+    level, not just the timestamp level, for that merge to be safe.
+
+    **v0.1.19 fix**: this used to return a flat `list[SrfForecastPoint]`
+    per timestamp. The caller then did a dict-level `.update()` keyed only
+    by valid_at, which replaced the ENTIRE list for a timestamp rather
+    than merging field-by-field — so if "three_hours" had a field (e.g.
+    precip) that "hours" didn't report for the same valid_at, "hours"
+    winning at the whole-entry level silently discarded it. Keying by
+    (valid_at, variable) instead means the merge below can compare and
+    combine at the field level, which is what the docstring below always
+    said the intent was.
     """
-    by_valid_at: dict[datetime, list[SrfForecastPoint]] = {}
+    by_valid_at: dict[datetime, dict[str, SrfForecastPoint]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             continue
         valid_at = _parse_entry_datetime(entry)
         if valid_at is None:
             continue
-        points: list[SrfForecastPoint] = []
+        variables: dict[str, SrfForecastPoint] = {}
         for srf_key, internal_name in _HOURLY_SIMPLE_FIELD_MAP.items():
             if srf_key in entry and entry[srf_key] is not None:
-                points.append(SrfForecastPoint(variable=internal_name, valid_at=valid_at, value=entry[srf_key]))
+                variables[internal_name] = SrfForecastPoint(
+                    variable=internal_name, valid_at=valid_at, value=entry[srf_key]
+                )
         for srf_key, internal_name in _HOURLY_WIND_FIELD_MAP.items():
             if srf_key in entry and entry[srf_key] is not None:
-                points.append(
-                    SrfForecastPoint(
-                        variable=internal_name, valid_at=valid_at, value=entry[srf_key] * KMH_TO_MS
-                    )
+                variables[internal_name] = SrfForecastPoint(
+                    variable=internal_name,
+                    valid_at=valid_at,
+                    value=entry[srf_key] * KMH_TO_MS,
                 )
-        by_valid_at[valid_at] = points
+        by_valid_at[valid_at] = variables
     return by_valid_at
 
 
@@ -361,29 +413,43 @@ def parse_forecastpoint_response(payload: Any) -> list[SrfForecastPoint]:
     "hours" and "three_hours" cover overlapping time ranges (confirmed:
     99 hourly entries starting at the top of the current day, 70
     three-hourly entries starting 2 hours later the same day) — for any
-    timestamp both provide data for, "hours" wins (finer granularity),
-    with "three_hours" filling in whatever extends beyond what "hours"
-    covers. Without this merge, both would insert rows for the same
-    (source, variable, valid_at), and which one the blend coordinator's
-    bulk query picks up would depend on insertion order rather than being
-    a deliberate choice.
+    (timestamp, variable) pair both provide data for, "hours" wins (finer
+    granularity), with "three_hours" filling in whatever extends beyond
+    what "hours" covers, INCLUDING variables "hours" simply doesn't report
+    for a timestamp both sources otherwise share. Without this merge, both
+    would insert rows for the same (source, variable, valid_at), and which
+    one the blend coordinator's bulk query picks up would depend on
+    insertion order rather than being a deliberate choice.
+
+    **v0.1.19 fix**: the merge used to be a dict `.update()` keyed only by
+    valid_at, which replaced three_hours' entire point list for a
+    timestamp with hours' list whenever both covered it — discarding any
+    field three_hours had that hours didn't, even though they weren't
+    actually in conflict. Now merges per (valid_at, variable): three_hours
+    is the base layer, and hours only overwrites the specific variables it
+    itself provides at a given timestamp, leaving three_hours-only fields
+    at that same timestamp intact.
     """
     if not isinstance(payload, dict):
         return []
 
-    # three_hours populated first (broader, coarser coverage), then
-    # overwritten by hours for any timestamp both have — see docstring.
-    merged: dict[datetime, list[SrfForecastPoint]] = {}
+    # three_hours is the base layer (broader, coarser coverage); hours
+    # then overwrites only the specific (timestamp, variable) pairs it
+    # itself provides — see docstring for why this is per-field, not
+    # per-timestamp.
+    merged: dict[datetime, dict[str, SrfForecastPoint]] = {}
     three_hours = payload.get("three_hours")
     if isinstance(three_hours, list):
-        merged.update(_points_from_hourly_entries(three_hours))
+        for valid_at, variables in _points_from_hourly_entries(three_hours).items():
+            merged.setdefault(valid_at, {}).update(variables)
     hours = payload.get("hours")
     if isinstance(hours, list):
-        merged.update(_points_from_hourly_entries(hours))
+        for valid_at, variables in _points_from_hourly_entries(hours).items():
+            merged.setdefault(valid_at, {}).update(variables)
 
     points: list[SrfForecastPoint] = []
-    for entry_points in merged.values():
-        points.extend(entry_points)
+    for variables in merged.values():
+        points.extend(variables.values())
 
     days = payload.get("days")
     if isinstance(days, list):

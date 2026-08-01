@@ -70,13 +70,45 @@ def redact_sensitive_keys(data: Any) -> Any:
     return data
 
 
+# v0.1.19 fix: this used to be exactly 3 hardcoded formats
+# (str(value)/.4f/.2f), so any payload or error string carrying the
+# configured coordinates at a different precision (3, 5, 6+ decimals) or
+# via a totally different textual representation slipped through
+# untouched — a real diagnostics-leak gap, since diagnostics are meant to
+# be shared outside the system. Widened to every decimal precision from
+# MIN through MAX_COORDINATE_DECIMALS, which comfortably covers what any
+# sane API/JSON serializer would emit for a lat/lon float (beyond ~6
+# decimal places is sub-meter precision, well past anything a real
+# provider response uses).
+#
+# MIN is 2, not 0 — a 0- or 1-decimal rendering of a coordinate (e.g.
+# "7" or "7.4") is short enough to plausibly collide with an unrelated,
+# genuinely-innocuous single number elsewhere in a weather payload (a
+# temperature, a percentage, an hour). That was caught directly by a
+# test during development: the 0-decimal variant of a real longitude
+# matched the leading "7" of an unrelated "7.44740001"-shaped value.
+# Two decimals is specific enough to keep doing its job (it was already
+# one of the 3 original formats) without that false-positive risk.
+MIN_COORDINATE_DECIMALS = 2
+MAX_COORDINATE_DECIMALS = 8
+
+
 def _coordinate_string_variants(value: float) -> list[str]:
-    """A handful of likely string representations of one coordinate
-    value, so the text substitution catches reasonable formatting
-    variants without needing to parse every possible representation.
+    """Likely string representations of one coordinate value, so the text
+    substitution catches reasonable formatting variants without needing
+    to parse every possible representation.
+
+    Ordered longest-first (most decimal places, or the longest of the
+    "natural" str()/repr() forms) so the substitution pass below can
+    always try the most specific/precise match before a shorter one that
+    might otherwise be a strict prefix of it — matching the shorter form
+    first could leave a dangling, no-longer-parseable remainder (e.g.
+    matching "46.9" inside "46.9480" and leaving "480" behind).
     """
-    variants = {str(value), f"{value:.4f}", f"{value:.2f}"}
-    return list(variants)
+    variants = {str(value), repr(value)}
+    for decimals in range(MIN_COORDINATE_DECIMALS, MAX_COORDINATE_DECIMALS + 1):
+        variants.add(f"{value:.{decimals}f}")
+    return sorted(variants, key=len, reverse=True)
 
 
 def redact_coordinate_strings(text: str, *, latitude: float, longitude: float) -> str:
@@ -84,11 +116,23 @@ def redact_coordinate_strings(text: str, *, latitude: float, longitude: float) -
     likely formats — catches cases like SRF's geolocationId, which is
     literally the string "46.9480,7.4474" stored under an innocuous key
     name ("id") that key-based redaction alone wouldn't flag.
+
+    Each candidate substring is only replaced when it isn't itself
+    directly adjacent to another digit OR a decimal point on either
+    side — so redacting "46.94" doesn't also eat into an unrelated,
+    longer number like "146.9480", and matching "7.4474" doesn't clip
+    the front off a longer, unrelated "7.44740001" (adjacency to the
+    trailing "." + more digits matters just as much as adjacency to a
+    bare digit). Longest-variant-first ordering (see
+    _coordinate_string_variants) means the most precise match is always
+    attempted before a shorter one that could be its prefix.
     """
     for value in _coordinate_string_variants(latitude):
-        text = re.sub(re.escape(value), "[LAT_REDACTED]", text)
+        pattern = r"(?<![\d.])" + re.escape(value) + r"(?![\d.])"
+        text = re.sub(pattern, "[LAT_REDACTED]", text)
     for value in _coordinate_string_variants(longitude):
-        text = re.sub(re.escape(value), "[LON_REDACTED]", text)
+        pattern = r"(?<![\d.])" + re.escape(value) + r"(?![\d.])"
+        text = re.sub(pattern, "[LON_REDACTED]", text)
     return text
 
 

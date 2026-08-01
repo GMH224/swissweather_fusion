@@ -155,6 +155,76 @@ def test_wind_speed_requests_meters_per_second_not_kmh():
     assert "wind_speed_unit=ms" in url
 
 
+def test_parse_forecast_response_flags_array_length_mismatch():
+    """v0.1.19 regression test: before this fix, zip(times, values)
+    silently truncated to the shorter array with no signal anywhere —
+    a provider regression or malformed/partial response looked exactly
+    like a normal, slightly-short forecast. Confirms a length mismatch
+    is now recorded on the parsed result.
+    """
+    payload = {
+        "hourly": {
+            "time": ["2026-07-25T12:00", "2026-07-25T13:00", "2026-07-25T14:00"],
+            "temperature_2m": [20.1, 21.3],  # one short — malformed/partial
+            "relative_humidity_2m": [55, 52, 50],  # matches, fine
+        }
+    }
+    parsed = om.parse_forecast_response(payload)
+    assert "temperature" in parsed.array_length_mismatches
+    assert "humidity" not in parsed.array_length_mismatches
+    # Existing truncation behavior is unchanged — still front-aligned
+    # pairing, just now with visibility.
+    temps = [p for p in parsed.points if p.variable == "temperature"]
+    assert len(temps) == 2
+
+
+def test_parse_forecast_response_no_mismatch_when_arrays_match():
+    payload = {
+        "hourly": {
+            "time": ["2026-07-25T12:00", "2026-07-25T13:00"],
+            "temperature_2m": [20.1, 21.3],
+        }
+    }
+    parsed = om.parse_forecast_response(payload)
+    assert parsed.array_length_mismatches == ()
+
+
+def test_run_fingerprint_stable_for_identical_hourly_series():
+    """v0.1.19 regression test (DEF-02): the old dedup check compared
+    issued_at, which is always datetime.now() and therefore always
+    advances — it could never actually detect an unchanged upstream run.
+    run_fingerprint is a content hash instead, so two parses of the exact
+    same hourly series must produce the same fingerprint even though
+    issued_at differs between the two calls.
+    """
+    payload = {
+        "hourly": {
+            "time": ["2026-07-25T12:00", "2026-07-25T13:00"],
+            "temperature_2m": [20.1, 21.3],
+            "relative_humidity_2m": [55, 52],
+        }
+    }
+    first = om.parse_forecast_response(payload)
+    second = om.parse_forecast_response(payload)
+    assert first.run_fingerprint == second.run_fingerprint
+    assert first.run_fingerprint is not None
+    # issued_at itself still always advances (unrelated to the fix) —
+    # confirms the fingerprint, not issued_at, is what dedup should use.
+    assert first.issued_at <= second.issued_at
+
+
+def test_run_fingerprint_changes_when_hourly_series_changes():
+    payload_a = {
+        "hourly": {"time": ["2026-07-25T12:00"], "temperature_2m": [20.1]}
+    }
+    payload_b = {
+        "hourly": {"time": ["2026-07-25T12:00"], "temperature_2m": [20.9]}
+    }
+    parsed_a = om.parse_forecast_response(payload_a)
+    parsed_b = om.parse_forecast_response(payload_b)
+    assert parsed_a.run_fingerprint != parsed_b.run_fingerprint
+
+
 def test_parse_elevation_response():
     assert om.parse_elevation_response({"elevation": [543.0]}) == 543.0
     assert om.parse_elevation_response({"elevation": []}) is None
