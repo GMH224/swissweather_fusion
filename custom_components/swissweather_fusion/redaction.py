@@ -30,7 +30,7 @@ shape isn't fully known in advance.
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 REDACTED_MARKER = "[REDACTED]"
 
@@ -133,6 +133,35 @@ def redact_coordinate_strings(text: str, *, latitude: float, longitude: float) -
     for value in _coordinate_string_variants(longitude):
         pattern = r"(?<![\d.])" + re.escape(value) + r"(?![\d.])"
         text = re.sub(pattern, "[LON_REDACTED]", text)
+    return text
+
+
+def redact_secret_values(text: str, *, secrets: Iterable[str]) -> str:
+    """Scrubs any exact occurrence of a known credential value out of
+    free-form text — e.g. an exception message that embedded a full
+    request URL with an API key as a query parameter.
+
+    **v0.1.20**: added after finding that Open-Meteo's own client builds
+    its request URL as `url += f"&apikey={api_key}"` (see
+    clients/open_meteo.py) — a plain HTTP error from that request would
+    put the real API key directly into `str(exception)`. Combined with
+    diagnostics_events' `detail` field never actually being redacted
+    despite diagnostics.py's own docstring claiming otherwise (found in
+    the same investigation), this was a real, live credential-leak path
+    for anyone who downloaded diagnostics while an Open-Meteo poll was
+    failing with diagnostic logging enabled — not a hypothetical.
+
+    Unlike redact_coordinate_strings, there's no false-positive/formatting
+    ambiguity to worry about here: a configured secret is either present
+    verbatim or it isn't, so a straightforward literal substring
+    replacement is both safe and sufficient. Falsy secrets (None/empty
+    string, e.g. an unconfigured optional API key) are skipped — an
+    empty-string "secret" would otherwise match (and corrupt) everywhere.
+    """
+    for secret in secrets:
+        if not secret:
+            continue
+        text = text.replace(secret, "[SECRET_REDACTED]")
     return text
 
 

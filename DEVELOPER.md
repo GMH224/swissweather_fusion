@@ -1,5 +1,151 @@
 # Developer notes: architecture rationale
 
+## v0.1.21 — SRF's 400 confirmed: an account/API-plan restriction, not a bug
+
+**Root cause confirmed** (v0.1.20 left this as "still under
+investigation" — resolved via a standalone probe script rather than
+another round of HA deploy cycles, much faster for this kind of thing).
+The real error body, read directly from a live probe against the actual
+account:
+
+```json
+{"code": "400.01.007", "message": "location mismatch for developer app", "info": "You have exceeded your location limit"}
+```
+
+The SRF free API plan allows exactly **one** registered location per
+developer app, with **no self-service reset**. The account in question
+had tested with slightly different coordinates once before (still
+Frauenfeld-area, but not identical), which claimed the plan's one
+allowed slot — every subsequent `v2/forecastpoint` call from a different
+coordinate 400s, permanently, until SRF support resets it manually.
+Confirmed directly with the account holder, not guessed.
+
+The same probe also ruled out two other live hypotheses in the same
+pass: only ONE geolocation candidate is ever returned for these
+coordinates (so the documented "takes `results[0]`, never verified it's
+the closest" concern isn't the cause here — nothing to fix in
+`parse_geolocation_response` for this case), and percent-encoding the
+comma in the ID made no difference (rules out a URL-encoding gateway
+quirk). Genuinely nothing wrong in this codebase's SRF handling — the
+merge fix, the UTC-normalization fix, and everything else from v0.1.19
+were all real and correct, they just can't matter until `forecastpoint`
+succeeds at least once.
+
+**What WAS fixed this release**: nothing about this restriction is
+fixable in code — but `async_fetch_forecastpoint` used to call
+`resp.raise_for_status()` immediately on a non-200 status, which raises
+before the response body is ever read. That meant SRF's own structured
+error detail (the `code`/`message`/`info` shape above) never reached the
+log or diagnostics — only a generic `400, message='Bad Request', url=...`,
+which looks identical to a transient network/API problem and gives no
+hint that the actual fix is "check your developer portal account," not
+"debug the integration." Added `parse_srf_error_detail()` to read the
+body first and extract SRF's own explanation when there is one, and
+`async_fetch_forecastpoint` now raises a message that states outright
+this is very likely an account/plan restriction, with where to go to
+fix it (`https://developer.srgssr.ch`, or `meteo.api@srgssr.ch`). Once
+recorded via the v0.1.20 `forecastpoint_fallback` diagnostics event,
+this makes the real cause visible from a single diagnostics download,
+with no HA log access and no probe script needed for anyone who hits
+this same free-plan limit in the future.
+
+**Also worth noting for anyone debugging this kind of "confirmed working
+in dev, broken in someone else's account" issue**: a small, dependency-
+free standalone Python script (stdlib `urllib` only, credentials as CLI
+args, never printed) that reproduces the auth → geolocation →
+forecastpoint flow directly against the real API turned out to be far
+faster than iterating through HA deploy/log-download cycles — got a
+definitive, complete answer (including testing every geolocation
+candidate and a URL-encoding variant) in one run instead of several
+rounds of "deploy, wait, download diagnostics, deploy again."
+
+## v0.1.20 — a real, live credential/coordinate leak in diagnostics_events, found while chasing SRF's 400
+
+**Background**: after v0.1.19 shipped, `expert_weight_srf` was still
+showing `Unknown` in production. A downloaded diagnostics file showed
+the retry-watermark fix genuinely working (1221 rows reconciled in one
+run) — so the remaining cause had to be upstream of learning entirely.
+`diagnostics_events` showed SRF landing on the fallback endpoint on
+**every single poll** (6/6 observed over several hours), which is fatal
+on its own: the fallback's fields map to `temperature_daily_max`/`_min`,
+never a variable literally named `"temperature"`, so SRF's data is
+structurally invisible to reconciliation while stuck there — not
+delayed, never eligible at all.
+
+**Root cause (still under investigation, not yet fixed)**: the actual
+HA log showed the real reason for every fallback: `400, message='Bad
+Request', url='.../v2/forecastpoint/{lat},{lon}'`. SRF's own developer
+docs are explicit that the geolocationId — even though it's *formatted*
+like a coordinate pair — must be a genuine registered point obtained via
+their search, and "it is not enough to simply round any
+geo-coordinates." The same coordinate-shaped ID that 400s against
+`v2/forecastpoint` succeeds every time against the legacy `/forecast/`
+endpoint, which is consistent with v2 having stricter validation than a
+soon-to-be-deprecated v1. Not fixed yet — deliberately not guessing at a
+5th SRF response-shape/behavior assumption without a live capture to
+confirm it, consistent with why this project has a "verify against a
+real response" rule in the first place (v0.1.1/v0.1.4/v0.1.8 all exist
+because an earlier guess was wrong). Next step is inspecting what the
+geolocation search itself actually returns.
+
+**What WAS fixed this release — found investigating the above, more
+serious than the SRF question itself**: `diagnostics.py`'s own
+docstring and the "note" field returned to the user have always claimed
+`diagnostics_events` "are passed through the same redaction" as
+everything else. That was never actually true.
+`DiagnosticsRecorder.record()` does no redaction of its own by design
+(a dumb append — see diagnostics_recorder.py), and
+`async_get_config_entry_diagnostics` used to do
+`recorder.get_events() if recorder is not None else []`: passed straight
+through, completely unredacted. Only one call site
+(`SrfClient._record_diagnostic`, for raw API response bodies) redacted
+anything before recording; every other `self._diagnostics.record(...)`
+call across every coordinator — most importantly `poll_failure` events,
+whose `detail` is built from `str(exception)` — went out as-is.
+
+This became a genuine credential leak, not just a location one, once
+combined with something separately found in the same pass: Open-Meteo's
+own client builds its request URL as `url += f"&apikey={api_key}"` (see
+clients/open_meteo.py) — a real API key in the URL, not just in headers.
+A `poll_failure` from that source with diagnostic logging enabled would
+have put the actual key into a downloaded diagnostics file in plain
+text. (This specific user's own downloaded file happened not to contain
+one — SRF's fallback always *succeeds*, so it never reached a
+`poll_failure` — but the new `forecastpoint_fallback` event added in
+this same release, recording the primary attempt's failure detail,
+would have carried the raw 400 URL, coordinates and all, had it existed
+one release earlier.)
+
+Fixed centrally, not at each scattered call site: added
+`redact_secret_values()` to `redaction.py` (a straightforward literal
+substring replacement for known configured credential values — no
+ambiguity to worry about the way coordinate-format-guessing has, a
+secret is either present verbatim or it isn't), and
+`async_get_config_entry_diagnostics` now redacts every event's `detail`
+and any string values in `extra` — for both coordinates and secrets —
+before returning, the same "redact once, at the single funnel point
+everything already passes through" pattern already used for
+`config_data`/`source_health`. `_health_summary`'s `last_data_error`/
+`last_auth_error` also gained secret redaction (same Open-Meteo apikey
+vector, missed by the original v0.1.10 fix which only added coordinate
+redaction there).
+
+**Also added — diagnostics visibility gaps, unrelated to the leak, found
+in the same investigation**:
+- Successful geolocation resolutions were never recorded to diagnostics
+  at all (only failed lookups were) — so there was no way to see how
+  many candidates SRF's geolocation search actually returned, or
+  whether the chosen one looks like a genuine registered point, without
+  separately pulling HA's core log. Now recorded on every (cached, so
+  this only fires once per coordinate change) successful resolution.
+- The primary `v2/forecastpoint` attempt's failure reason was only ever
+  logged to HA's own log (`_LOGGER.warning`), never to
+  `diagnostics_events` — meaning "100% of polls are silently landing on
+  the fallback endpoint" was only visible by cross-referencing two
+  separate downloads (diagnostics + HA log) rather than one. Now
+  recorded as a `forecastpoint_fallback` event with the actual failure
+  detail (redacted, per the fix above).
+
 ## v0.1.19 — Remediation of three independent audit reports
 
 Three independent code audits of v0.1.18 (two general, one focused
@@ -117,6 +263,31 @@ after the watermark fix, though it should now at least become numeric).
 `ForecastAccuracySensor` and the Model B training-timestamp sensor
 remain stubs. Both were flagged as Low severity / explicit product gaps
 by all three source audits, not correctness bugs.
+
+**Also fixed — found via real functional testing, not the original
+audits**: closed a documented test-suite gap (`coordinator.py`,
+`__init__.py`, `config_flow.py`, `weather.py`, `sensor.py`, and
+`binary_sensor.py` were previously only syntax-checked, never
+functionally exercised, since `homeassistant` wasn't installed when
+this project was built) by installing the real `homeassistant` package
+and `pytest-homeassistant-custom-component` for a one-off deeper
+verification pass. This surfaced a genuine defect the static audits
+never caught: `SwissWeatherDB.__init__` calls `sqlite3.connect()`
+without first ensuring its parent directory exists. In a normal
+production HA install this is masked because `.storage/` already exists
+by the time any integration loads — but a fresh test instance without
+it reproduced an unhandled `sqlite3.OperationalError` immediately, well
+before `__init__.py`'s per-source failure isolation even gets a chance
+to run. Fixed with `os.makedirs(parent_dir, exist_ok=True)` before
+opening the connection. The same functional pass also confirmed, for
+real rather than by reading the code, that (a) the retry-watermark fix
+works in the actual `ModelALearningCoordinator` class (with a control
+run proving the test would have caught the pre-fix bug), and (b) the
+whole integration survives total network failure gracefully — every
+source coordinator's first refresh failing individually, all 9
+coordinators and 40+ entities still set up successfully, clean unload
+afterward. See `swissweather_fusion_v0.1.19_remediation_audit.md` for
+the full account.
 
 ## v0.1.18 — SRF's real hourly endpoint, confirmed and fully wired in
 

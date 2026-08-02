@@ -34,6 +34,7 @@ racing on the same connection.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -151,6 +152,23 @@ class SwissWeatherDB:
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
+        # v0.1.19 fix: sqlite3.connect() does not create missing parent
+        # directories, and this integration's real call site
+        # (__init__.py) points at HA's `.storage/` directory, which
+        # reliably exists in a normal HA install because core creates it
+        # very early during startup — but that's an environmental
+        # assumption, not something this class enforced itself. Found via
+        # a real Home Assistant test-instance setup run (not by static
+        # review): a fresh hass.config.config_dir without a pre-existing
+        # `.storage/` directory raised an unhandled
+        # `sqlite3.OperationalError: unable to open database file`,
+        # skipping the graceful-degradation path __init__.py otherwise
+        # goes out of its way to provide for every other failure mode.
+        # Creating the directory here (idempotent, exist_ok=True) removes
+        # the dependency on that external assumption entirely.
+        parent_dir = os.path.dirname(self._db_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row

@@ -291,6 +291,24 @@ class SrfCoordinator(DataUpdateCoordinator):
                         "the daily-only endpoint: %s",
                         primary_err,
                     )
+                    # v0.1.20 fix: this failure was only ever logged to
+                    # HA's own log, never recorded as a diagnostics event
+                    # — so a downloaded diagnostics file could show 100%
+                    # of polls silently landing on the fallback endpoint
+                    # with no way to see *why* without separately pulling
+                    # HA's core log too. Found investigating exactly that
+                    # scenario: expert_weight_srf stuck Unknown because
+                    # every single poll (6/6 observed) was landing on the
+                    # daily fallback, which structurally can't produce a
+                    # "temperature" measurement Model A reconciles against
+                    # (see clients/srf.py's _DAY_FIELD_MAP — the fallback
+                    # only ever produces temperature_daily_max/min, never
+                    # plain "temperature").
+                    if self._diagnostics is not None:
+                        self._diagnostics.record(
+                            source="srf", event_type="forecastpoint_fallback",
+                            detail=f"primary forecastpoint fetch failed: {primary_err}",
+                        )
                     used_fallback = True
                     points = await self._client.async_fetch_forecast(
                         latitude=self._latitude, longitude=self._longitude

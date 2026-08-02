@@ -34,28 +34,116 @@ side effects.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_LATITUDE, CONF_LONGITUDE, DOMAIN
-from .redaction import redact_coordinate_strings, redact_sensitive_keys
+from .const import (
+    CONF_LATITUDE,
+    CONF_LONGITUDE,
+    CONF_METEOBLUE_API_KEY,
+    CONF_METEONOMIQS_API_KEY,
+    CONF_OPEN_METEO_API_KEY,
+    CONF_SRF_CONSUMER_KEY,
+    CONF_SRF_CONSUMER_SECRET,
+    DOMAIN,
+)
+from .redaction import redact_coordinate_strings, redact_secret_values, redact_sensitive_keys
 
 
-def _redact_error_string(
-    value: Optional[str], *, latitude: float, longitude: float
-) -> Optional[str]:
-    if value is None:
-        return None
-    return redact_coordinate_strings(value, latitude=latitude, longitude=longitude)
+def _redact_text(
+    value: str, *, latitude: float, longitude: float, secrets: list[str]
+) -> str:
+    value = redact_coordinate_strings(value, latitude=latitude, longitude=longitude)
+    return redact_secret_values(value, secrets=secrets)
 
 
-def _health_summary(health: Any, *, latitude: float, longitude: float) -> dict[str, Any]:
+def _redact_event(
+    event: dict[str, Any], *, latitude: float, longitude: float, secrets: list[str]
+) -> dict[str, Any]:
+    """v0.1.20 fix: this module's own docstring/note has always claimed
+    diagnostics_events "are passed through the same redaction" as
+    everything else — that was never actually true.
+    DiagnosticsRecorder.record() does no redaction of its own (it's a
+    dumb append, by design — see diagnostics_recorder.py), and the
+    caller-side redaction that DOES exist (SrfClient._record_diagnostic,
+    which redacts raw_payload before recording) only covers that one
+    call site. Every OTHER `self._diagnostics.record(...)` call across
+    every coordinator — most importantly `poll_failure` events, whose
+    `detail` is built from `str(exception)` and can therefore contain a
+    full request URL, coordinates and all, or (for Open-Meteo
+    specifically, which embeds its API key as a URL query parameter) a
+    real credential — went out completely unredacted. Found while
+    investigating a real SRF `forecastpoint` 400 error; confirmed the
+    same gap applies to every source, not just SRF.
+
+    Redacts `detail` and any string values inside `extra` (recursively
+    one level, which is as deep as any current event's `extra` goes) for
+    both coordinates and configured secrets. Applied centrally here,
+    covering every event regardless of which coordinator recorded it or
+    whether that call site remembers to redact — the same "redact once,
+    at the single funnel point everything already passes through" design
+    already used for config_data/config_options and source_health above.
+    """
+    redacted_extra: dict[str, Any] = {}
+    for key, value in event.get("extra", {}).items():
+        if isinstance(value, str):
+            redacted_extra[key] = _redact_text(
+                value, latitude=latitude, longitude=longitude, secrets=secrets
+            )
+        else:
+            # Non-string extra values (raw_response dicts, point_count
+            # ints, used_fallback bools) are either already redacted at
+            # the point they were built (raw_response, via
+            # redact_diagnostic_payload) or aren't sensitive to begin
+            # with (counts/flags) — left as-is.
+            redacted_extra[key] = value
+    return {
+        "ts": event.get("ts"),
+        "source": event.get("source"),
+        "event_type": event.get("event_type"),
+        "detail": _redact_text(
+            event.get("detail", ""), latitude=latitude, longitude=longitude, secrets=secrets
+        ),
+        "extra": redacted_extra,
+    }
+
+
+async def async_get_config_entry_diagnostics(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> dict[str, Any]:
+    runtime = hass.data[DOMAIN][entry.entry_id]
+    recorder = runtime.get("diagnostics_recorder")
+
+    # The REAL coordinates, needed for the coordinate-redaction pass below
+    # — extracted before entry.data gets redacted, since redaction needs
+    # the actual values to search for and replace.
+    latitude = entry.data.get(CONF_LATITUDE, 0.0)
+    longitude = entry.data.get(CONF_LONGITUDE, 0.0)
+    # v0.1.20: real secret values, same "extract before redacting
+    # entry.data" pattern as coordinates above — needed to scrub these
+    # exact values out of event detail/extra text (see _redact_event).
+    secrets = [
+        entry.data.get(CONF_SRF_CONSUMER_KEY),
+        entry.data.get(CONF_SRF_CONSUMER_SECRET),
+        entry.data.get(CONF_METEOBLUE_API_KEY),
+        entry.data.get(CONF_METEONOMIQS_API_KEY),
+        entry.data.get(CONF_OPEN_METEO_API_KEY),
+    ]
+
+
+def _health_summary(
+    health: Any, *, latitude: float, longitude: float, secrets: list[str]
+) -> dict[str, Any]:
     """A snapshot of one SourceHealth object's state. last_data_error and
     last_auth_error are exception message strings and can embed a full
     request URL (query parameters and all) — these go through coordinate
-    redaction, unlike the plain timestamps/counts which don't need it.
+    AND secret redaction (v0.1.20: added secrets here too — Open-Meteo's
+    client embeds its API key directly in the request URL, so an error
+    message from that source could carry it, same as the
+    diagnostics_events leak this was found alongside), unlike the plain
+    timestamps/counts which don't need either.
     """
     if health is None:
         return {}
@@ -64,11 +152,15 @@ def _health_summary(health: Any, *, latitude: float, longitude: float) -> dict[s
         if health.last_success_time
         else None,
         "last_poll_duration_ms": health.last_poll_duration_ms,
-        "last_data_error": _redact_error_string(
-            health.last_data_error, latitude=latitude, longitude=longitude
+        "last_data_error": (
+            _redact_text(health.last_data_error, latitude=latitude, longitude=longitude, secrets=secrets)
+            if health.last_data_error is not None
+            else None
         ),
-        "last_auth_error": _redact_error_string(
-            health.last_auth_error, latitude=latitude, longitude=longitude
+        "last_auth_error": (
+            _redact_text(health.last_auth_error, latitude=latitude, longitude=longitude, secrets=secrets)
+            if health.last_auth_error is not None
+            else None
         ),
         "consecutive_failures": health.consecutive_failures,
     }
@@ -139,7 +231,9 @@ async def async_get_config_entry_diagnostics(
     for name in ("station", "srf", "meteoblue", "combiprecip", "meteonomiqs"):
         coordinator = runtime.get(f"{name}_coordinator")
         health = getattr(coordinator, "health", None) if coordinator is not None else None
-        source_health[name] = _health_summary(health, latitude=latitude, longitude=longitude)
+        source_health[name] = _health_summary(
+            health, latitude=latitude, longitude=longitude, secrets=secrets
+        )
         source_health[name]["scheduling"] = _coordinator_scheduling_summary(
             coordinator,
             last_success_time=getattr(health, "last_success_time", None),
@@ -148,7 +242,7 @@ async def async_get_config_entry_diagnostics(
     open_meteo_coordinator = runtime.get("open_meteo_coordinator")
     if open_meteo_coordinator is not None and hasattr(open_meteo_coordinator, "health"):
         source_health["open_meteo"] = {
-            model: _health_summary(h, latitude=latitude, longitude=longitude)
+            model: _health_summary(h, latitude=latitude, longitude=longitude, secrets=secrets)
             for model, h in open_meteo_coordinator.health.items()
         }
         # Uses whichever model has the most recent success, for the
@@ -190,19 +284,34 @@ async def async_get_config_entry_diagnostics(
         "last_reconciled_count": getattr(learning_coordinator, "last_reconciled_count", None),
     }
 
-    diagnostics_events = recorder.get_events() if recorder is not None else []
+    # v0.1.20 fix: this used to be `recorder.get_events() if recorder is
+    # not None else []` — passed straight through with NO redaction at
+    # all, despite the "note" text below always having claimed
+    # diagnostics_events go through "the same redaction". See
+    # _redact_event's docstring for the full story and how this was
+    # found (a real SRF 400 error investigation, not a proactive audit).
+    diagnostics_events = (
+        [
+            _redact_event(e, latitude=latitude, longitude=longitude, secrets=secrets)
+            for e in recorder.get_events()
+        ]
+        if recorder is not None
+        else []
+    )
 
     return {
         "diagnostic_logging_enabled": recorder.enabled if recorder is not None else False,
         "note": (
             "Coordinates, elevation, and API credentials are redacted below, "
             "including inside error message strings that may embed a full "
-            "request URL. diagnostics_events may include raw third-party API "
-            "response bodies (only when diagnostic logging was enabled) — "
-            "these are passed through the same redaction, but review before "
-            "sharing publicly regardless, since third-party APIs "
-            "occasionally embed identifying data in fields this project "
-            "doesn't yet know to look for."
+            "request URL or (for Open-Meteo specifically, whose client "
+            "embeds its API key as a URL query parameter) a real "
+            "credential. diagnostics_events may include raw third-party "
+            "API response bodies (only when diagnostic logging was "
+            "enabled) — these are passed through the same redaction, but "
+            "review before sharing publicly regardless, since third-party "
+            "APIs occasionally embed identifying data in fields this "
+            "project doesn't yet know to look for."
         ),
         "config_data": redacted_data,
         "config_options": redacted_options,

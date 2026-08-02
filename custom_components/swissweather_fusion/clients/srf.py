@@ -19,6 +19,7 @@ lacked).
 from __future__ import annotations
 
 import base64
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -107,6 +108,38 @@ KMH_TO_MS = 1.0 / 3.6
 TOKEN_LIFETIME = timedelta(days=7)
 # Refresh a bit before actual expiry rather than reacting only to a 401.
 TOKEN_REFRESH_MARGIN = timedelta(days=1)
+
+
+def parse_srf_error_detail(body_text: str) -> Optional[str]:
+    """SRF's own structured error shape, confirmed via a live probe
+    against a real account that had hit a real restriction:
+    `{"code": "400.01.007", "message": "location mismatch for developer
+    app", "info": "You have exceeded your location limit"}`.
+
+    **v0.1.21**: added after exactly that error was the actual root
+    cause of expert_weight_srf staying Unknown — the free SRF API plan
+    allows exactly ONE registered location per developer app, with no
+    self-service reset once a location is claimed (confirmed directly
+    with SRF, not guessed). This is an SRG-SSR account/API-plan
+    restriction, not something any code change here can work around —
+    but surfacing SRF's own code/message/info verbatim, distinctly from
+    a generic HTTP error, means whoever sees the log/diagnostics next
+    time immediately knows to check their developer portal account
+    rather than assume it's a code or network bug and spend hours
+    debugging a coordinator/parser that was never broken.
+    """
+    try:
+        payload = json.loads(body_text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    code = payload.get("code")
+    message = payload.get("message")
+    info = payload.get("info")
+    if code is None and message is None:
+        return None
+    return " — ".join(str(p) for p in (code, message, info) if p)
 
 
 def build_basic_auth_header(consumer_key: str, consumer_secret: str) -> str:
@@ -575,6 +608,21 @@ class SrfClient:
                 raw_payload=payload,
             )
             raise ValueError("SRF geolocation lookup returned no results")
+        # v0.1.20 fix: this branch (successful resolution) never recorded
+        # anything in diagnostics — only the "no usable result" failure
+        # path above did. That meant a *successful* geolocation lookup
+        # that nonetheless resolved to an ID v2/forecastpoint later
+        # rejects (see the v0.1.20 changelog entry on the 400 Bad Request
+        # investigation) left no trace of what SRF actually returned —
+        # how many candidates, what shape, whether the chosen result
+        # even looks like a real registered point. Recording it here
+        # (only need to do this once per coordinate change, thanks to
+        # the cache above, so this doesn't spam diagnostics every poll).
+        self._record_diagnostic(
+            event_type="raw_response",
+            detail=f"SRF geolocation lookup resolved to id={geolocation_id!r}",
+            raw_payload=payload,
+        )
         self._geolocation_id = geolocation_id
         self._geolocation_coords = (latitude, longitude)
         return geolocation_id
@@ -645,7 +693,33 @@ class SrfClient:
         async with self._session.get(
             url, headers=headers, timeout=_client_timeout()
         ) as resp:
-            resp.raise_for_status()
+            if resp.status != 200:
+                # v0.1.21 fix: previously just resp.raise_for_status(),
+                # which raises before the body is read — meaning SRF's
+                # own structured error detail (e.g. the confirmed real
+                # "you have exceeded your location limit" free-plan
+                # restriction) never reached the log or diagnostics,
+                # only a generic "400, message='Bad Request', url=...".
+                # Reading the body first (still valid on the open
+                # response within this `async with` block, regardless of
+                # status) lets us surface SRF's actual explanation when
+                # there is one, and falls back to the normal
+                # raise_for_status() behavior otherwise.
+                body_text = await resp.text()
+                srf_detail = parse_srf_error_detail(body_text)
+                if srf_detail is not None:
+                    raise RuntimeError(
+                        f"SRF v2/forecastpoint rejected the request "
+                        f"(HTTP {resp.status}): {srf_detail}. This is very "
+                        f"likely an SRG-SSR account/API-plan restriction "
+                        f"(e.g. the free plan's one-registered-location "
+                        f"limit — confirmed as the real cause once before), "
+                        f"not a bug in this integration. Check the app's "
+                        f"registered locations at "
+                        f"https://developer.srgssr.ch or contact "
+                        f"meteo.api@srgssr.ch."
+                    )
+                resp.raise_for_status()
             payload = await resp.json()
         points = parse_forecastpoint_response(payload)
         if not points:

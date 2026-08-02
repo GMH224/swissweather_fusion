@@ -408,3 +408,41 @@ def test_parse_forecast_response_unexpected_top_level_types():
         "forecast": [{"TX_C": 30, "local_date_time": "2026-07-29T00:00:00+02:00"}]
     }
     assert len(srf.parse_forecast_response(direct_list_payload)) == 1
+
+
+def test_parse_srf_error_detail_real_location_limit_error():
+    """v0.1.21: the exact real error confirmed via a live probe script
+    against a real account that had exceeded the SRF free plan's
+    one-registered-location limit for v2/forecastpoint. Confirms this is
+    surfaced verbatim rather than being swallowed by a generic HTTP
+    error, since — unlike every other SRF surprise in this project's
+    history — this one turned out to not be a parsing/code bug at all,
+    so the only thing code CAN usefully do here is make the real reason
+    visible immediately instead of costing hours of debugging a
+    coordinator/parser that was never broken.
+    """
+    body = (
+        '{"code": "400.01.007", "message": "location mismatch for '
+        'developer app", "info": "You have exceeded your location limit"}'
+    )
+    detail = srf.parse_srf_error_detail(body)
+    assert detail == (
+        "400.01.007 — location mismatch for developer app — "
+        "You have exceeded your location limit"
+    )
+
+
+def test_parse_srf_error_detail_handles_non_json_body():
+    assert srf.parse_srf_error_detail("<html>Bad Gateway</html>") is None
+    assert srf.parse_srf_error_detail("") is None
+
+
+def test_parse_srf_error_detail_handles_json_without_expected_shape():
+    assert srf.parse_srf_error_detail("[]") is None
+    assert srf.parse_srf_error_detail('{"unrelated_field": "value"}') is None
+
+
+def test_parse_srf_error_detail_handles_partial_shape():
+    # message-only (no code) — still useful, still surfaced.
+    detail = srf.parse_srf_error_detail('{"message": "Something went wrong"}')
+    assert detail == "Something went wrong"

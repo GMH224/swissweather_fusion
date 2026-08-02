@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 
 import pytest
@@ -13,6 +14,35 @@ def db():
     yield database
     database.close()
     os.remove(path)
+
+
+def test_creates_missing_parent_directory():
+    """v0.1.19 regression test: found via a real Home Assistant
+    functional test run, not static review — sqlite3.connect() does not
+    create missing parent directories, and this integration's real call
+    site points at HA's `.storage/` directory. That reliably exists in a
+    normal HA install (core creates it during its own startup, before
+    any integration's async_setup_entry runs), but a fresh test instance
+    without a pre-existing `.storage/` directory reproduced an unhandled
+    sqlite3.OperationalError immediately. Confirms SwissWeatherDB no
+    longer depends on that external assumption.
+    """
+    base = tempfile.mkdtemp()
+    try:
+        nested_path = os.path.join(base, "does", "not", "exist", "yet", "test.db")
+        assert not os.path.exists(os.path.dirname(nested_path))
+        database = SwissWeatherDB(nested_path)
+        try:
+            database.insert_station_observation(
+                "2026-07-25T12:00:00Z", 21.5, 55.0, 1015.2
+            )
+            row = database.get_latest_station_observation()
+            assert row["temperature"] == 21.5
+        finally:
+            database.close()
+        assert os.path.exists(nested_path)
+    finally:
+        shutil.rmtree(base)
 
 
 def test_station_observation_roundtrip(db):

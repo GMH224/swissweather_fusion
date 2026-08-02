@@ -28,6 +28,7 @@ existing tests weakened.
 | 8 | Geolocation "closest" claim vs. first-result behavior | Low / follow-up risk (report 2/3) | **Docstring corrected**, behavior unchanged | `clients/srf.py` |
 | 9 | Model A doesn't learn precip/wind (SRF weight gap) | Medium (report 1/3) | **Not changed** — documented design gap | `DEVELOPER.md` |
 | 10 | Forecast accuracy / Model B training sensors are stubs | Low | **Not changed** — documented, out of scope | — |
+| 11 | `SwissWeatherDB` crashes if `.storage/` doesn't yet exist | Not in original audits — found via real HA functional testing | **Fixed** | `storage/db.py` `SwissWeatherDB.__init__` |
 
 ---
 
@@ -271,15 +272,87 @@ they aren't mistaken for having been silently fixed by this release.
 
 ---
 
+## 11. Found via functional testing, not the original audits: missing parent-directory creation in `SwissWeatherDB`
+
+While closing the "coordinator.py was never functionally exercised"
+test gap (see Verification section below), running the real
+`async_setup_entry` against an actual Home Assistant test instance
+surfaced a genuine defect none of the three static audits caught:
+`SwissWeatherDB.__init__` calls `sqlite3.connect(self._db_path, ...)`
+without first ensuring the parent directory exists. `sqlite3.connect()`
+does not create missing directories. The real call site
+(`__init__.py`) points at HA's `.storage/` directory, which in a normal
+production HA install already exists (core creates it very early during
+its own startup, before any integration's `async_setup_entry` runs) —
+which is exactly why static review never flagged it and why it likely
+has never actually bitten a real deployment. But it's still an
+unhandled crash path with no defensive check of its own, and it's
+inconsistent with the graceful-degradation stance the rest of
+`__init__.py` (and this whole project) otherwise goes out of its way to
+maintain for every other failure mode. Reproduced directly: a fresh test
+`hass.config.config_dir` without a pre-existing `.storage/` raised
+`sqlite3.OperationalError: unable to open database file` immediately,
+before any coordinator even got the chance to isolate a failure.
+
+**Fix**: `SwissWeatherDB.__init__` now calls
+`os.makedirs(parent_dir, exist_ok=True)` before opening the connection.
+
+**Regression test added**: `test_creates_missing_parent_directory` in
+`tests/test_db.py` — constructs a `SwissWeatherDB` pointed at a
+multi-level nonexistent path and confirms it succeeds and is usable.
+
 ## Verification
+
+Closed the test-suite gap documented in `tests/conftest.py`/
+`tests/test_syntax.py` (coordinator.py, __init__.py, config_flow.py,
+weather.py, sensor.py, and binary_sensor.py were previously only
+syntax-checked, never functionally exercised, because `homeassistant`
+wasn't installed when this project was built). Installed the real
+`homeassistant` package (2025.1.4) and
+`pytest-homeassistant-custom-component` in an isolated virtualenv and
+ran two additional functional tests against the actual production
+classes (not test mirrors):
+
+1. **`ModelALearningCoordinator._reconcile` (the real method)** — same
+   retry scenario as the shipped `test_reconciliation_retries_unmatched_row_on_next_pass`
+   unit test, but calling the actual production class through a real
+   `hass` instance rather than the hand-written mirror. Passed. As a
+   control, the fix was temporarily reverted and the same test was
+   re-run — it failed with exactly the predicted symptom
+   (`watermark == row's valid_at`), confirming the test genuinely
+   discriminates between the fixed and buggy behavior rather than
+   passing regardless.
+2. **Full `async_setup_entry` against a real HA test instance, with
+   zero real network access** (this environment cannot reach the actual
+   SRF/meteoblue/Open-Meteo/Meteonomiqs/CombiPrecip APIs) — every source
+   coordinator's first refresh failed as expected, `__init__.py`'s
+   per-source isolation (`asyncio.gather(..., return_exceptions=True)`)
+   caught every one of them individually, and setup still completed:
+   all 9 coordinators constructed and stored, all `weather`/`sensor`/
+   `binary_sensor` entities registered (40+ entities), and
+   `async_unload_entry` completed cleanly afterward. This is exactly
+   the graceful-degradation behavior `__init__.py`'s own v0.1.1/v0.1.14
+   comments claim, now confirmed by actually running it rather than
+   reading the code. This run is what surfaced finding #11 above.
+
+Both functional tests live outside the shipped `tests/` directory (they
+require the full `homeassistant` package + `pytest-homeassistant-
+custom-component`, a heavy dependency this project's own `conftest.py`
+deliberately avoided requiring for the fast unit suite) — they were run
+as a one-off deeper verification pass for this release, not added to
+the standard CI-style suite. The `tests/` directory's own coverage
+below remains the fast, dependency-light suite contributors run day to
+day.
+
+## Final verification
 
 ```
 $ python3 -m pytest tests/ -q
 ........................................................................ [ 45%]
-........................................................................ [ 91%]
-..............                                                          [100%]
-158 passed in 0.92s
+........................................................................ [ 90%]
+...............                                                         [100%]
+159 passed in 1.50s
 ```
 
-144 (v0.1.18 baseline) → 158 (v0.1.19): 14 new tests, all passing, 0
-existing tests removed or weakened to make the suite pass.
+144 (v0.1.18 baseline) → 159 (v0.1.19 final): 15 new tests, all passing,
+0 existing tests removed or weakened.
