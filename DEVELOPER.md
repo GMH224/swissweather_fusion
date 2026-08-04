@@ -1,5 +1,67 @@
 # Developer notes: architecture rationale
 
+## v0.1.22 — a self-inflicted production crash, found in a real HA log, fixed with a new class of test
+
+**The bug**: `diagnostics.py` had two separate
+`async def async_get_config_entry_diagnostics` definitions — an
+orphaned, incomplete leftover from an earlier edit (ending abruptly
+right after `secrets = [...]`, no return statement) directly above the
+real, complete one. Python silently keeps the LAST definition of a
+module-level function; the real one being called had no `secrets`
+variable defined at all, because that assignment only existed in the
+dead, shadowed copy above it. Every single "Download Diagnostics" click
+crashed with `NameError: name 'secrets' is not defined`, confirmed
+directly from a real HA log (six repeated crashes in three minutes,
+from repeated attempts to check status) — this had been live since
+v0.1.20 shipped, several days before being caught, precisely because it
+only fails when that exact code path executes, not on import.
+
+**Why the existing safety nets missed it**: `ast.parse`-based syntax
+checking (what `tests/test_syntax.py` had) cannot catch this — a
+duplicate function name at module scope, and a reference to an
+undefined name inside a function body, are BOTH syntactically legal
+Python. The fast unit suite tested the smaller helper functions
+(`_health_summary`, `_redact_event`, `_redact_text`) directly, but never
+called the top-level `async_get_config_entry_diagnostics` itself. Even
+the deeper real-HA functional testing pass from v0.1.19/v0.1.20 didn't
+catch it, because that pass tested `_reconcile` and `async_setup_entry`
+specifically — it never occurred to call the diagnostics endpoint in
+that same pass either.
+
+**The fix**: removed the dead duplicate, moved `secrets = [...]` into
+the actual function that runs. Confirmed via the same real-HA
+functional-testing approach as before, with a proper control: the new
+test reproduces the exact `NameError` when the bug is reintroduced, and
+passes cleanly with the fix in place.
+
+**The more durable fix — added a whole new class of test**: an AST-based
+scan across every file in the package for duplicate top-level (and
+per-class) definitions, plus a `pyflakes`-based undefined-name check.
+Both run in well under a second, need no Home Assistant install, and
+would have caught this exact bug — with the exact line number —
+instantly, before it ever shipped. Confirmed with a control run: with
+the bug artificially reintroduced, `test_no_undefined_names` fails
+immediately, flagging all three now-broken call sites by line number;
+restoring the fix makes it pass again. Both tests are now permanent
+parts of the fast unit suite (`tests/test_syntax.py`), not the heavier
+optional HA-dependent functional tests, specifically because they don't
+need to be — this whole class of bug is catchable statically. Swept the
+rest of the package the same way as part of this fix: no other
+duplicate definitions or undefined names found anywhere else.
+
+**Unrelated SRF status note, from the same investigation**: log
+timestamps show SRF was still hitting the identical `400.01.007`
+location-limit error as late as 05:53:59 UTC (12:53 Vietnam) — nearly
+two hours after the ~11am Vietnam restart that was expected to have
+already taken effect. A later diagnostics capture showed
+`expert_weight_srf` numeric, meaning it did eventually start working,
+sometime in the roughly 80-minute gap the available log doesn't cover.
+Most likely explanation: SRF's backend took a while to actually apply
+the location reset after the account-side change, rather than it taking
+effect instantly. Not a code issue either way — noted here only because
+it's a real, confirmed timeline worth having on record if this ever
+needs revisiting.
+
 ## v0.1.21 — SRF's 400 confirmed: an account/API-plan restriction, not a bug
 
 **Root cause confirmed** (v0.1.20 left this as "still under

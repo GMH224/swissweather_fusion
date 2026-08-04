@@ -110,29 +110,6 @@ def _redact_event(
     }
 
 
-async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, entry: ConfigEntry
-) -> dict[str, Any]:
-    runtime = hass.data[DOMAIN][entry.entry_id]
-    recorder = runtime.get("diagnostics_recorder")
-
-    # The REAL coordinates, needed for the coordinate-redaction pass below
-    # — extracted before entry.data gets redacted, since redaction needs
-    # the actual values to search for and replace.
-    latitude = entry.data.get(CONF_LATITUDE, 0.0)
-    longitude = entry.data.get(CONF_LONGITUDE, 0.0)
-    # v0.1.20: real secret values, same "extract before redacting
-    # entry.data" pattern as coordinates above — needed to scrub these
-    # exact values out of event detail/extra text (see _redact_event).
-    secrets = [
-        entry.data.get(CONF_SRF_CONSUMER_KEY),
-        entry.data.get(CONF_SRF_CONSUMER_SECRET),
-        entry.data.get(CONF_METEOBLUE_API_KEY),
-        entry.data.get(CONF_METEONOMIQS_API_KEY),
-        entry.data.get(CONF_OPEN_METEO_API_KEY),
-    ]
-
-
 def _health_summary(
     health: Any, *, latitude: float, longitude: float, secrets: list[str]
 ) -> dict[str, Any]:
@@ -220,6 +197,30 @@ async def async_get_config_entry_diagnostics(
     # the actual values to search for and replace.
     latitude = entry.data.get(CONF_LATITUDE, 0.0)
     longitude = entry.data.get(CONF_LONGITUDE, 0.0)
+    # v0.1.20: real secret values, same "extract before redacting
+    # entry.data" pattern as coordinates above — needed to scrub these
+    # exact values out of event detail/extra text (see _redact_event).
+    #
+    # v0.1.22 fix: this assignment briefly existed only in a leftover,
+    # never-actually-called duplicate of this function (an artifact of
+    # an earlier imprecise edit — Python silently keeps the LAST
+    # definition of a module-level function, so the real one being
+    # called had no `secrets` defined at all). Confirmed broken via a
+    # real production crash: NameError: name 'secrets' is not defined,
+    # in this exact function, the moment diagnostics were downloaded.
+    # `ast.parse`-based syntax checks can't catch this (duplicate
+    # function names are syntactically legal), and the fast unit suite
+    # only exercised the smaller helper functions, never this top-level
+    # one directly — see tests/test_diagnostics.py's new
+    # test_async_get_config_entry_diagnostics_smoke for why that gap is
+    # now closed.
+    secrets = [
+        entry.data.get(CONF_SRF_CONSUMER_KEY),
+        entry.data.get(CONF_SRF_CONSUMER_SECRET),
+        entry.data.get(CONF_METEOBLUE_API_KEY),
+        entry.data.get(CONF_METEONOMIQS_API_KEY),
+        entry.data.get(CONF_OPEN_METEO_API_KEY),
+    ]
 
     # Config entry data/options redacted the same way as everything else
     # in this project — credentials, coordinates, and elevation all match
