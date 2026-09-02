@@ -579,3 +579,108 @@ def derive_condition(
     if is_daytime is False:
         return "clear-night"
     return "sunny"
+
+
+# ---------------------------------------------------------------------------
+# Condition resolution from real provider data (v0.2.0)
+# ---------------------------------------------------------------------------
+# WMO weather code -> Home Assistant condition. Open-Meteo returns the
+# standard WMO 4677 code, so this is a documented mapping rather than a
+# guess. Codes are grouped as HA's condition vocabulary is much coarser.
+_WMO_TO_CONDITION = {
+    0: "sunny",
+    1: "sunny", 2: "partlycloudy", 3: "cloudy",
+    45: "fog", 48: "fog",
+    51: "rainy", 53: "rainy", 55: "rainy",
+    56: "rainy", 57: "rainy",
+    61: "rainy", 63: "rainy", 65: "pouring",
+    66: "rainy", 67: "pouring",
+    71: "snowy", 73: "snowy", 75: "snowy", 77: "snowy",
+    80: "rainy", 81: "rainy", 82: "pouring",
+    85: "snowy", 86: "snowy",
+    95: "lightning", 96: "lightning-rainy", 99: "lightning-rainy",
+}
+
+
+def condition_from_weather_code(code: float | None) -> str | None:
+    """Map a WMO 4677 weather code to a Home Assistant condition.
+
+    Returns None for an unrecognised code rather than guessing — the
+    same refusal-to-invent stance taken by unit_conversion.py for
+    unrecognised units.
+    """
+    if code is None:
+        return None
+    try:
+        return _WMO_TO_CONDITION.get(int(code))
+    except (TypeError, ValueError):
+        return None
+
+
+def resolve_condition(
+    *,
+    weather_code: float | None = None,
+    precip: float | None = None,
+    snowfall: float | None = None,
+    temperature: float | None = None,
+    humidity: float | None = None,
+    cloud_coverage: float | None = None,
+    precip_threshold: float = 0.1,
+    is_daytime: bool | None = None,
+) -> str | None:
+    """Resolve a weather condition, preferring stated evidence over inference.
+
+    **v0.2.0.** The architecture document's governing rule is "do not
+    infer a value when an upstream model provides it directly", and this
+    function is where that rule bites hardest.
+
+    derive_condition() — still used where only the old inputs exist —
+    decides `snowy` from `temperature <= 0 and precip > threshold`, and
+    `cloudy` from a humidity proxy that DEVELOPER.md openly labels
+    plausible-but-unvalidated. Both were invented because the richer data
+    was being discarded at the client. It no longer is.
+
+    Precedence, strongest evidence first:
+
+    1. **The provider's own classification.** A WMO code is the model's
+       considered answer, and it encodes things this project cannot
+       derive at all — fog, thunderstorms, drizzle-versus-rain.
+    2. **Explicit snowfall.** If a model states a snowfall amount, that
+       settles precipitation type. No temperature guessing.
+    3. **Measured cloud cover**, replacing the humidity proxy.
+    4. **The old inference**, only as a last resort when nothing better
+       is available.
+
+    Returning None is legitimate at every level: it means no source said
+    anything usable, and derive_condition()'s answer is then used.
+    """
+    # 1. Provider classification wins outright.
+    from_code = condition_from_weather_code(weather_code)
+    if from_code is not None:
+        # Night substitution still applies to the clear-sky case (P2-005).
+        if from_code == "sunny" and is_daytime is False:
+            return "clear-night"
+        return from_code
+
+    # 2. Explicit snowfall settles precipitation type without guessing.
+    if snowfall is not None and snowfall > 0:
+        return "snowy"
+
+    if precip is not None and precip > precip_threshold:
+        if temperature is not None and temperature <= 0.0:
+            return "snowy"
+        return "rainy"
+
+    # 3. Measured cloud cover beats the humidity proxy.
+    if cloud_coverage is not None:
+        if cloud_coverage >= 85:
+            return "cloudy"
+        if cloud_coverage >= 40:
+            return "partlycloudy"
+        return "clear-night" if is_daytime is False else "sunny"
+
+    # 4. Nothing better available — fall back to the v0 inference.
+    return derive_condition(
+        precip, temperature, humidity,
+        precip_threshold=precip_threshold, is_daytime=is_daytime,
+    )

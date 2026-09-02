@@ -1441,7 +1441,28 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
     with nothing reading it.
     """
 
-    MEASUREMENTS = ("temperature", "humidity", "pressure", "precip", "wind_speed")
+    # v0.2.0: split by parameter class (architecture doc §6).
+    #
+    # LEARNED_MEASUREMENTS keep the EMA bias-correction path unchanged —
+    # they are the three the local station can reconcile against.
+    #
+    # FUSED_MEASUREMENTS are Class B: the provider states a value but this
+    # installation has no ground truth for it, so a learned "bias" would
+    # be fabricated. They are combined with per-parameter strategies from
+    # forecast_parameters.PARAMETERS (median for precipitation-like
+    # quantities, max for gusts, circular mean for bearing) rather than
+    # the arithmetic mean the architecture document originally proposed —
+    # see that module's docstring for why a mean is wrong here.
+    LEARNED_MEASUREMENTS = ("temperature", "humidity", "pressure")
+    FUSED_MEASUREMENTS = (
+        "precip", "rain", "showers", "snowfall", "snow_depth",
+        "precip_probability", "wind_speed", "wind_gust_speed",
+        "wind_bearing", "dew_point", "apparent_temperature",
+        "cloud_coverage", "visibility",
+    )
+    CATEGORICAL_MEASUREMENTS = ("weather_code",)
+    # Everything queried from storage in one pass.
+    MEASUREMENTS = LEARNED_MEASUREMENTS + FUSED_MEASUREMENTS + CATEGORICAL_MEASUREMENTS
     # 7 days rather than 2 — needed for meaningful daily/twice-daily
     # coverage (added alongside precipitation-in-mm for those views), and
     # matches roughly CH2/meteoblue's own horizons. Sources with shorter
@@ -1535,6 +1556,63 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                     )
                 )
         return model_a.blend(contributions)
+
+    def _fuse_class_b(
+        self, measurement: str, target_hour: datetime, latest_forecast: dict
+    ) -> Optional[float]:
+        """Combine a Class B parameter across sources, with no learning.
+
+        v0.2.0. Deliberately does NOT consult bucket_stats: these
+        parameters have no local ground truth, so any stored bias for
+        them would be fabricated. See forecast_parameters.
+        """
+        from . import forecast_parameters as fp
+
+        target_iso = target_hour.replace(
+            minute=0, second=0, microsecond=0
+        ).isoformat()
+        values = [
+            latest_forecast[(source, measurement, target_iso)][0]
+            for source in ALL_FORECAST_SOURCES
+            if (source, measurement, target_iso) in latest_forecast
+        ]
+        if not values:
+            return None
+
+        # Wind bearing is an angle: the arithmetic mean of 350 and 10 is
+        # 180, exactly backwards. Handled by a circular mean.
+        if measurement == "wind_bearing":
+            return fp.fuse_wind_bearing(values)
+
+        parameter = fp.get(measurement)
+        if parameter is None:
+            return None
+        return parameter.fuse_values(values)
+
+    def _resolve_categorical(
+        self, measurement: str, target_hour: datetime, latest_forecast: dict
+    ) -> Optional[float]:
+        """Pick a categorical value by majority, never by averaging.
+
+        v0.2.0 (architecture doc §6.3). Ties break toward the more severe
+        code, on the reasoning that under-warning is the costlier error.
+        """
+        target_iso = target_hour.replace(
+            minute=0, second=0, microsecond=0
+        ).isoformat()
+        values = [
+            latest_forecast[(source, measurement, target_iso)][0]
+            for source in ALL_FORECAST_SOURCES
+            if (source, measurement, target_iso) in latest_forecast
+        ]
+        values = [v for v in values if v is not None]
+        if not values:
+            return None
+        counts: dict[float, int] = {}
+        for value in values:
+            counts[value] = counts.get(value, 0) + 1
+        best = max(counts.values())
+        return max(v for v, c in counts.items() if c == best)
 
     def _compute_blend(self) -> dict[str, Any]:
         from .models import model_a

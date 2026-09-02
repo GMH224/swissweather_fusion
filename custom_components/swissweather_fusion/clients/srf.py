@@ -395,13 +395,27 @@ _HOURLY_SIMPLE_FIELD_MAP = {
     "RRR_MM": "precip",
     "TTL_C": "srf_temp_low_bound",
     "TTH_C": "srf_temp_high_bound",
-    "DEWPOINT_C": "srf_dewpoint",
-    "TTTFEEL_C": "srf_feels_like",
+    # v0.2.0: promoted from the srf_ namespace into the common
+    # vocabulary. These were ALREADY being parsed and stored — they were
+    # simply prefixed so the blend could not see them, and nothing ever
+    # read them (the IND-10 write-only pattern). Promoting them costs no
+    # additional API calls; the data was already arriving.
+    #
+    # NOTE: this changes stored variable NAMES only. It does not touch
+    # the SRF request, the geolocation resolution, or the registered
+    # coordinate the API key is bound to — all of which are deliberately
+    # out of scope.
+    "DEWPOINT_C": "dew_point",
+    "TTTFEEL_C": "apparent_temperature",
+    "PROBPCP_PERCENT": "precip_probability",
+    "DD_DEG": "wind_bearing",
+    # FRESHSNOW_MM is millimetres of fresh snow; the common "snowfall"
+    # parameter is centimetres (matching Open-Meteo). Left in the srf_
+    # namespace rather than silently mixing units — unit reconciliation
+    # is a deliberate change, not a rename. See DEVELOPER.md.
     "FRESHSNOW_MM": "srf_freshsnow",
     "SUN_MIN": "srf_sun_minutes",
     "IRRADIANCE_WM2": "srf_irradiance",
-    "PROBPCP_PERCENT": "srf_precip_probability",
-    "DD_DEG": "srf_wind_direction",
     "symbol_code": "srf_symbol_code",
     "symbol24_code": "srf_symbol24_code",
 }

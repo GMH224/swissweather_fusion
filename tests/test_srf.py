@@ -66,23 +66,42 @@ def test_parse_forecastpoint_response_converts_wind_speed_kmh_to_ms():
     assert by_variable["srf_wind_gust"] == pytest.approx(7 / 3.6)
 
 
-def test_parse_forecastpoint_response_prefixes_extras_with_srf():
-    """Every confirmed field beyond the core five must be prefixed so it
-    can never be mistaken for one of the standard cross-source
-    measurement names and accidentally picked up by the blend.
+def test_parse_forecastpoint_response_promotes_common_fields_and_prefixes_the_rest():
+    """v0.2.0 changed this contract deliberately.
+
+    Through v0.1.28 every field beyond the core five was prefixed `srf_`
+    so it could never be picked up by the blend. That was the right
+    default while Model A fused only five measurements — but it meant SRF
+    was parsing eleven extra fields, storing them, and having nothing
+    ever read them (the IND-10 write-only pattern).
+
+    v0.2.0 promotes the four that have a genuine cross-source equivalent
+    into the common vocabulary, so they can be fused. The rest stay
+    prefixed, and one of them — FRESHSNOW_MM — stays prefixed
+    specifically because it is in millimetres while the common
+    `snowfall` parameter is centimetres. Unit reconciliation is a
+    deliberate change, not a rename, so it is NOT promoted here.
     """
     payload = {"hours": [_REAL_HOURS_ENTRY], "three_hours": [], "days": []}
     points = srf.parse_forecastpoint_response(payload)
     by_variable = {p.variable: p.value for p in points}
-    assert by_variable["srf_dewpoint"] == 14.0
-    assert by_variable["srf_feels_like"] == 23
+
+    # Promoted to the common vocabulary (fusable).
+    assert by_variable["dew_point"] == 14.0
+    assert by_variable["apparent_temperature"] == 23
+    assert by_variable["precip_probability"] == 1
+    assert by_variable["wind_bearing"] == 110
+
+    # Still namespaced: no cross-source equivalent, or a unit mismatch.
     assert by_variable["srf_temp_low_bound"] == 20.4
     assert by_variable["srf_temp_high_bound"] == 23.2
     assert by_variable["srf_freshsnow"] == 0
     assert by_variable["srf_sun_minutes"] == 0
     assert by_variable["srf_irradiance"] == 0
-    assert by_variable["srf_precip_probability"] == 1
-    assert by_variable["srf_wind_direction"] == 110
+
+    # The old names must be gone, so nothing reads them by habit.
+    assert "srf_dewpoint" not in by_variable
+    assert "srf_precip_probability" not in by_variable
     assert by_variable["srf_symbol_code"] == -1
     assert by_variable["srf_symbol24_code"] == 100
     # cur_color is a nested UI color hint, not weather data — deliberately

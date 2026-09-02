@@ -46,12 +46,38 @@ MODEL_PARAM = {
 # Variables requested for every model — kept identical across CH1/CH2/D2 so
 # Model A's blend always has the same measurement set to work with, even
 # though the underlying models don't all expose identical native fields.
+# v0.2.0: expanded from five variables to seventeen.
+#
+# The architecture review's governing rule is "do not infer a value when
+# an upstream model provides it directly". Until v0.2.0 this client asked
+# for five variables and the integration then INFERRED snow from
+# temperature and cloud from humidity — guessing at answers ICON was
+# willing to state outright.
+#
+# All of these are free-tier hourly variables on the same request, so the
+# expansion costs no extra API calls and no quota. It does cost storage:
+# roughly 3.4x the rows per run. See DEVELOPER.md.
 HOURLY_VARIABLES = (
+    # Class A — learned against the local station
     "temperature_2m",
     "relative_humidity_2m",
     "pressure_msl",
+    # Class B — fused, not learned
     "precipitation",
+    "rain",
+    "showers",
+    "snowfall",
+    "snow_depth",
+    "precipitation_probability",
     "wind_speed_10m",
+    "wind_gusts_10m",
+    "wind_direction_10m",
+    "dew_point_2m",
+    "apparent_temperature",
+    "cloud_cover",
+    "visibility",
+    # Class C — categorical, never averaged
+    "weather_code",
 )
 
 
@@ -135,6 +161,20 @@ class ParsedForecast:
 # forecast_snapshots.variable).
 _VARIABLE_NAME_MAP = {
     "temperature_2m": "temperature",
+    # v0.2.0 additions. Names on the right are the project's common
+    # vocabulary, defined once in forecast_parameters.PARAMETERS.
+    "rain": "rain",
+    "showers": "showers",
+    "snowfall": "snowfall",
+    "snow_depth": "snow_depth",
+    "precipitation_probability": "precip_probability",
+    "wind_gusts_10m": "wind_gust_speed",
+    "wind_direction_10m": "wind_bearing",
+    "dew_point_2m": "dew_point",
+    "apparent_temperature": "apparent_temperature",
+    "cloud_cover": "cloud_coverage",
+    "visibility": "visibility",
+    "weather_code": "weather_code",
     "relative_humidity_2m": "humidity",
     # v0.1.2 fix: was surface_pressure (pressure at the source's own grid
     # elevation), which doesn't match what SRF/meteoblue/the local station

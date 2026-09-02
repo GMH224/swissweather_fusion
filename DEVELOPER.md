@@ -1815,7 +1815,7 @@ trigger it.
 
 ## v0.1.24–v0.1.28 — architecture notes
 
-Full remediation record: `swissweather_fusion_v0.1.28_remediation_audit.md`.
+Full remediation record: `swissweather_fusion_v0.2.0_release_audit.md`.
 The design decisions worth knowing before reading the code:
 
 ### Model A blend weights are dimensionless (IND-01)
@@ -1942,7 +1942,41 @@ Relatedly: **no blanket `except Exception` in an entity property.** It
 converted a hard `AttributeError` into a silently blank sensor that
 looked implemented.
 
-## Known gaps (the honest list, updated for v0.1.28)
+
+### Forecast parameter registry (v0.2.0)
+
+`forecast_parameters.py` is the single source of truth for every fusable
+parameter: its class, unit, bounds, minimum contributing sources and
+fusion strategy. Add a parameter there, not in an `if` chain.
+
+**Class A vs Class B is about ground truth, not importance.** Class A
+(temperature, humidity, pressure) can be reconciled against the local
+station, so the EMA bias machinery applies. Class B cannot, so it gets a
+fused *consensus* and no learned correction. Giving a Class B parameter
+an `ema_bias` would fabricate a number indistinguishable from a real one.
+
+**Do not default new parameters to the arithmetic mean.** Precipitation
+is zero-inflated (mean of [0, 0, 8] invents drizzle no model forecast);
+snowfall is near-binary at the margin; gusts are an extreme statistic;
+wind bearing is an angle where the linear mean of 350° and 10° is 180°,
+exactly backwards. Each parameter declares its own strategy and each has
+a test that fails if it reverts to a mean.
+
+### Condition resolution order (v0.2.0)
+
+`resolve_condition()` prefers stated evidence over inference:
+
+1. provider WMO weather code — the model's own considered answer, and
+   the only way to reach `fog`, `lightning` or `pouring`
+2. explicit snowfall — settles precipitation type without guessing from
+   temperature
+3. measured cloud cover — replaces the humidity proxy
+4. `derive_condition()` — the v0 inference, last resort only
+
+Keep `derive_condition()`. Sources that provide none of the newer fields
+still depend on it.
+
+## Known gaps (the honest list, updated for v0.2.0)
 
 **Closed since v0.1.1:**
 
