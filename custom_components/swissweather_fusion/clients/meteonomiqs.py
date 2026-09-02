@@ -20,9 +20,14 @@ Two endpoints are used, both on the plain (non-premium) tier:
 """
 from __future__ import annotations
 
+import logging
+import math
+
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Optional
+
+_LOGGER = logging.getLogger(__name__)
 
 BASE_URL = "https://forecast.meteonomiqs.com/v4_0"
 
@@ -55,6 +60,84 @@ class ParsedNowcast:
     fetched_at: datetime
 
 
+# Meteonomiqs documents precipitationRisk as an integer 0-9 scale.
+PRECIP_RISK_MIN = 0
+PRECIP_RISK_MAX = 9
+
+
+def _validated_risk_value(raw: Any) -> Optional[int]:
+    """Accept a documented 0-9 risk value; reject anything else.
+
+    **v0.1.27 fix (SWF-P1-003).** This value was previously stored
+    straight from the JSON with no type, finiteness or range check, and
+    models/model_b.refine_with_meteonomiqs divides it by 9 and averages
+    the result into the storm score. A risk value of 99 therefore
+    produced a refined score of 5.9 — surfaced by
+    StormOnsetProbabilitySensor, which advertises `%`, as **590%**.
+
+    The consequences run past a silly dashboard number: any automation
+    thresholding on that sensor fires unconditionally, and the value is
+    persisted into storm_predictions, which is the training set for
+    Model B v1. Corrupt training data is the expensive kind of wrong,
+    because it is not obviously wrong later.
+
+    Out-of-range means the provider is not behaving as documented, so the
+    value is discarded rather than clamped: clamping 99 to 9 would invent
+    a maximum-risk reading out of a response we do not understand.
+    Returning None puts this interval in the same state as one the
+    provider simply did not rate, which every caller already handles.
+
+    Numeric strings are accepted because JSON APIs return them
+    inconsistently and "7" is unambiguous; bools are refused despite
+    being int subclasses, since True would silently become risk 1.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric) or numeric != int(numeric):
+        # A fractional value is not on the documented integer scale.
+        # int(3.7) would silently become 3, which is a guess about a
+        # response we do not understand — the same silent-guess pattern
+        # rejected in unit_conversion.py for unrecognised units.
+        _LOGGER.warning(
+            "Meteonomiqs returned non-integer precipitation risk %r; "
+            "ignoring this interval", raw
+        )
+        return None
+    value = int(numeric)
+    if not PRECIP_RISK_MIN <= value <= PRECIP_RISK_MAX:
+        _LOGGER.warning(
+            "Meteonomiqs returned precipitation risk %r, outside its "
+            "documented %d-%d scale; ignoring this interval",
+            raw,
+            PRECIP_RISK_MIN,
+            PRECIP_RISK_MAX,
+        )
+        return None
+    return value
+
+
+def _validated_radar_amount(raw: Any) -> Optional[float]:
+    """Finite, non-negative precipitation amount, or None.
+
+    v0.1.27 (SWF-P2-002): parser-level normalisation, so a string or a
+    non-finite value cannot reach arithmetic downstream before the shared
+    physical-bounds validator ever sees it.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
+
+
 def parse_nowcast_response(payload: dict[str, Any]) -> ParsedNowcast:
     precip_risk = payload.get("precipitationRisk", {})
     items: list[NowcastItem] = []
@@ -72,8 +155,10 @@ def parse_nowcast_response(payload: dict[str, Any]) -> ParsedNowcast:
             NowcastItem(
                 from_ts=from_ts,
                 to_ts=to_ts,
-                precip_risk_value=precrisk.get("value"),
-                radar_precip_mmh=amount.get("value"),
+                # v0.1.27 fix (SWF-P1-003): validated at the parser
+                # boundary rather than trusted. See _validated_risk_value.
+                precip_risk_value=_validated_risk_value(precrisk.get("value")),
+                radar_precip_mmh=_validated_radar_amount(amount.get("value")),
             )
         )
     return ParsedNowcast(items=items, fetched_at=datetime.now(timezone.utc))
@@ -189,8 +274,46 @@ class AnnualCallBudget:
         first-run behavior."""
         if not state:
             return
-        self._current_year = state.get("year")
-        self._calls_used_this_year = state.get("calls_used", 0)
+
+        # v0.1.27 fix (SWF-P2-001): validate what comes back from
+        # storage. SwissWeatherDB._safe_parse_meta already guarantees the
+        # value is well-formed JSON (P2-02), but well-formed is not the
+        # same as meaningful: a partially-written or hand-edited row can
+        # carry a string year, a negative call count, or a count far
+        # above the annual budget. Any of those silently corrupts quota
+        # accounting for a whole year — a negative count hands out free
+        # calls, an inflated one starves the source.
+        #
+        # Invalid state is DISCARDED rather than clamped, leaving the
+        # in-memory default (year None, zero used). That is the same
+        # state as "never persisted", which is already handled correctly
+        # everywhere, and it fails safe: the next successful call
+        # re-establishes the year and the count starts from a known
+        # floor.
+        year = state.get("year")
+        calls_used = state.get("calls_used", 0)
+
+        if year is not None and (isinstance(year, bool) or not isinstance(year, int)):
+            _LOGGER.warning(
+                "Discarding persisted annual-budget state: year %r is not an "
+                "integer", year
+            )
+            return
+        if isinstance(calls_used, bool) or not isinstance(calls_used, int):
+            _LOGGER.warning(
+                "Discarding persisted annual-budget state: calls_used %r is "
+                "not an integer", calls_used
+            )
+            return
+        if calls_used < 0 or calls_used > self._annual_budget:
+            _LOGGER.warning(
+                "Discarding persisted annual-budget state: calls_used %d is "
+                "outside 0..%d", calls_used, self._annual_budget
+            )
+            return
+
+        self._current_year = year
+        self._calls_used_this_year = calls_used
 
 
 def needs_keepalive_call(

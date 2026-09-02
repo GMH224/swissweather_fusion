@@ -5,7 +5,6 @@ classifier. See DEVELOPER.md for the full architecture rationale.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import logging
 
@@ -58,18 +57,33 @@ _LOGGER = logging.getLogger(__name__)
 PLATFORMS = [Platform.WEATHER, Platform.SENSOR, Platform.BINARY_SENSOR]
 
 
-def _integration_version() -> str:
-    """Read the version from manifest.json.
+def _integration_version(hass: HomeAssistant) -> str:
+    """The version Home Assistant itself has already loaded for us.
 
-    Read rather than hard-coded so it can never disagree with what HACS
-    and Home Assistant report for the same installed files.
+    **v0.1.26 fix.** v0.1.25 read manifest.json with a plain open() from
+    async_setup_entry, which is a blocking file read on the event loop —
+    Home Assistant detects and warns about exactly this:
+
+        Detected blocking call to open with args
+        ('/config/custom_components/swissweather_fusion/manifest.json',)
+        inside the event loop
+
+    Embarrassing in a diagnostic helper whose entire purpose is to make
+    problems easier to see. It is also unnecessary work: Home Assistant
+    parses every custom integration's manifest during startup and keeps
+    it in the loader's integration cache, so the value is already in
+    memory. `hass.data["integrations"]` is not a public API, hence the
+    defensive access and the fallback — but reading a cached value costs
+    nothing and touches no disk.
     """
     try:
-        manifest_path = os.path.join(os.path.dirname(__file__), "manifest.json")
-        with open(manifest_path, encoding="utf-8") as handle:
-            return str(json.load(handle).get("version", "unknown"))
+        integration = hass.data.get("integrations", {}).get(DOMAIN)
+        version = getattr(integration, "version", None)
+        if version is not None:
+            return str(version)
     except Exception:  # noqa: BLE001 - diagnostics must never break setup
-        return "unknown"
+        pass
+    return "unknown"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -99,7 +113,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # actually land" is answerable in one line.
     _LOGGER.info(
         "SwissWeather Fusion %s starting up (database schema v%s)",
-        _integration_version(),
+        _integration_version(hass),
         SCHEMA_VERSION,
     )
 
@@ -200,6 +214,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         combiprecip_coordinator,
         meteoblue_coordinator,
         meteonomiqs_coordinator,
+        diagnostics=diagnostics_recorder,
     )
     # v0.1.5: computes Model A's current values + hourly/daily/twice-daily
     # forecast in one batched executor job — see coordinator.py for why

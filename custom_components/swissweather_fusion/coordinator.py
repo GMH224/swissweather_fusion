@@ -588,9 +588,12 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
         # but nothing bounding the annual total. Reuses the
         # AnnualCallBudget class already built for Meteonomiqs rather
         # than growing a second implementation of the same idea.
-        self._annual_budget = AnnualCallBudget(
-            max_calls_per_year=METEOBLUE_ANNUAL_CALL_BUDGET
-        )
+        # NOTE the positional argument. AnnualCallBudget's parameter is
+        # `annual_budget`, not `max_calls_per_year` — v0.1.25 shipped with
+        # the wrong keyword and took setup down with a TypeError at
+        # construction time, because no test ever called this constructor.
+        # See tests/test_v0_1_26_construction.py.
+        self._annual_budget = AnnualCallBudget(METEOBLUE_ANNUAL_CALL_BUDGET)
         self._state_loaded_from_db = False
         self.health = SourceHealth()
 
@@ -1310,29 +1313,55 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         in_forecast_season = local_now.month in METEONOMIQS_FORECAST_SEASON_MONTHS
         past_noon = local_now.hour >= METEONOMIQS_FORECAST_CALL_HOUR_LOCAL
 
-        # v0.1.24 fix (P1-07): the scheduled/keepalive path now reserves
-        # its own call too, since record_call() no longer happens inside
-        # the fetch methods. Deliberately record_call() and NOT
-        # try_call(): AnnualCallBudget's own class docstring states the
-        # keepalive must never be skipped just because bonus calls
-        # consumed the budget elsewhere — losing API access to
-        # inactivity-revocation is worse than a slightly tighter annual
-        # count. This preserves that documented design while still
-        # closing the accounting race, because the recording is now
-        # synchronous rather than after an awaited call.
-        self._budget.record_call(today=today)
+        # v0.1.24 fix (P1-07): the scheduled/keepalive path reserves its
+        # own call, since record_call() no longer happens inside the fetch
+        # methods. Deliberately record_call() and NOT try_call():
+        # AnnualCallBudget's own class docstring states the keepalive must
+        # never be skipped just because bonus calls consumed the budget
+        # elsewhere — losing API access to inactivity-revocation is worse
+        # than a slightly tighter annual count.
+        #
+        # The external ICS audit challenged that policy as an unbounded
+        # bypass of a hard quota, which is a fair question, so the
+        # arithmetic is stated here rather than left implicit: the
+        # keepalive fires at most once per day (gated by
+        # _last_successful_call_date above) and the bonus path at most
+        # once per day (BonusCallTracker). Worst case is therefore
+        # 365 + 365 = 730 calls/year against a 1000/year budget. The
+        # unconditional keepalive cannot exhaust the quota; it can only
+        # make the count slightly tighter, which is the trade the
+        # docstring describes.
+        #
+        # v0.1.27 fix (SWF-P1-001): the reservation now happens INSIDE
+        # each branch that actually performs a request.
+        #
+        # It used to run before this if/elif, which meant the seasonal
+        # pre-noon case — in forecast season, checked before
+        # METEONOMIQS_FORECAST_CALL_HOUR_LOCAL — incremented the annual
+        # counter and then deliberately made no call at all. With a
+        # 6-hourly check that is up to two phantom credits per seasonal
+        # day before the real noon call, roughly tripling the recorded
+        # cost of a once-daily service. Persisted quota state then
+        # diverges from actual provider traffic, and the budget exhausts
+        # early, taking legitimate storm-triggered bonus calls with it.
+        #
+        # Still recorded synchronously, before the awaited fetch, so the
+        # P1-07 TOCTOU fix is preserved intact.
         try:
             if in_forecast_season and past_noon:
+                self._budget.record_call(today=today)
                 await self._async_fetch_hourly_forecast(today=today)
             elif not in_forecast_season:
                 # Nov-Feb: nowcast is a pure keepalive with no time-of-day
                 # data-quality reason to wait, unlike the seasonal forecast
                 # call above — fire as soon as a new day starts.
+                self._budget.record_call(today=today)
                 await self._async_fetch_nowcast(today=today)
             # else: in forecast season but before local noon today — this
             # coordinator checks every 6h and may run before noon; simply
             # wait for a later check today (guaranteed within the same day,
             # since a 6h interval always has at least one check past noon).
+            # NOTHING is reserved on this path: no request is made.
         except Exception as err:  # noqa: BLE001
             # A failed keep-alive is worth logging loudly — losing API
             # access entirely from inactivity is worse than a routine
@@ -1859,6 +1888,8 @@ class ModelBCoordinator(DataUpdateCoordinator):
         combiprecip_coordinator: CombiPrecipCoordinator,
         meteoblue_coordinator: MeteoblueCoordinator,
         meteonomiqs_coordinator: MeteonomiqsCoordinator,
+        *,
+        diagnostics: Any = None,
     ) -> None:
         super().__init__(
             hass,
@@ -1871,6 +1902,13 @@ class ModelBCoordinator(DataUpdateCoordinator):
         self._combiprecip_coordinator = combiprecip_coordinator
         self._meteoblue_coordinator = meteoblue_coordinator
         self._meteonomiqs_coordinator = meteonomiqs_coordinator
+        # v0.1.26: this coordinator had no diagnostics recorder at all.
+        # P2-09's future-dated-sample fix referenced self._diagnostics
+        # anyway, which would have raised AttributeError on the first
+        # scoring cycle that encountered a future-dated row. Added as an
+        # optional keyword so the attribute always exists, defaulting to
+        # None exactly like every other coordinator here.
+        self._diagnostics = diagnostics
         self._previous_probability = 0.0
         self.current_probability = 0.0
         # v0.1.23 fix (L-09): _previous_probability above is still

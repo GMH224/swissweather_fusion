@@ -26,6 +26,7 @@ guessing further.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -295,21 +296,65 @@ def _pixel_indices(
     location. Now returns (None, None, ...) so the caller can represent
     it honestly as "no data here".
     """
-    xsize = int(where_attrs["xsize"])
-    ysize = int(where_attrs["ysize"])
-    ll_lon = float(where_attrs["LL_lon"])
-    ll_lat = float(where_attrs["LL_lat"])
-    ur_lon = float(where_attrs["UR_lon"])
-    ur_lat = float(where_attrs["UR_lat"])
+    # v0.1.27 fix (SWF-P2-003): validate the raster metadata before doing
+    # arithmetic with it. A malformed or truncated HDF5 product could
+    # otherwise produce a division by zero (zero extent), a silently
+    # mirrored grid (inverted extent), or nonsense indices from
+    # non-finite bounds. Rejecting the file as unusable is the honest
+    # outcome; returning a plausible-looking pixel from a broken grid is
+    # not.
+    try:
+        xsize = int(where_attrs["xsize"])
+        ysize = int(where_attrs["ysize"])
+        ll_lon = float(where_attrs["LL_lon"])
+        ll_lat = float(where_attrs["LL_lat"])
+        ur_lon = float(where_attrs["UR_lon"])
+        ur_lat = float(where_attrs["UR_lat"])
+    except (KeyError, TypeError, ValueError):
+        return None, None, 0, 0
+
+    if xsize <= 0 or ysize <= 0:
+        return None, None, max(xsize, 0), max(ysize, 0)
+    if not all(math.isfinite(v) for v in (ll_lon, ll_lat, ur_lon, ur_lat)):
+        return None, None, xsize, ysize
 
     ll_easting, ll_northing = wgs84_to_lv95(latitude=ll_lat, longitude=ll_lon)
     ur_easting, ur_northing = wgs84_to_lv95(latitude=ur_lat, longitude=ur_lon)
 
-    col = int((easting - ll_easting) / (ur_easting - ll_easting) * xsize)
-    row = int((ur_northing - northing) / (ur_northing - ll_northing) * ysize)
-    if not (0 <= col < xsize) or not (0 <= row < ysize):
+    easting_extent = ur_easting - ll_easting
+    northing_extent = ur_northing - ll_northing
+    if easting_extent <= 0 or northing_extent <= 0:
+        # Zero or inverted extent: the corners are not what they claim.
         return None, None, xsize, ysize
-    return row, col, xsize, ysize
+
+    # v0.1.27 fix (SWF-P1-002), CRITICAL for boundary correctness: the
+    # containment test is performed on the CONTINUOUS coordinate, before
+    # any conversion to an integer index.
+    #
+    # The v0.1.24 fix (P1-18) replaced edge-clamping with a bounds check,
+    # but placed that check AFTER `int(...)`. Python's int() truncates
+    # toward zero, so a point just outside the lower-left edge computes a
+    # continuous column of, say, -0.1, becomes column 0, and then passes
+    # `0 <= col < xsize` — returning the edge pixel it was meant to
+    # reject. Only the two boundaries where the value goes negative were
+    # affected (left and top); the right and bottom edges happened to be
+    # caught, which is precisely the kind of partial correctness that
+    # survives casual testing.
+    #
+    # The consequence is the same one P1-18 set out to eliminate: an
+    # out-of-coverage sampling point silently yielding real-looking radar
+    # data, and therefore a false storm signal.
+    col_continuous = (easting - ll_easting) / easting_extent * xsize
+    row_continuous = (ur_northing - northing) / northing_extent * ysize
+    if not math.isfinite(col_continuous) or not math.isfinite(row_continuous):
+        return None, None, xsize, ysize
+    if not (0.0 <= col_continuous < xsize) or not (0.0 <= row_continuous < ysize):
+        return None, None, xsize, ysize
+
+    # floor() rather than int() so the conversion is direction-independent.
+    # Inside the validated domain the two agree, but using floor makes the
+    # code correct on its own terms rather than correct-by-precondition.
+    return math.floor(row_continuous), math.floor(col_continuous), xsize, ysize
 
 
 def extract_values_at_points(

@@ -18,6 +18,8 @@ lacked).
 """
 from __future__ import annotations
 
+import math
+
 import base64
 import json
 import logging
@@ -129,6 +131,32 @@ def build_forecastpoint_url(geolocation_id: str) -> str:
 # sources use would silently corrupt Model A's blend — this constant
 # makes the conversion explicit and impossible to miss in review.
 KMH_TO_MS = 1.0 / 3.6
+
+
+def _kmh_to_ms(raw: Any) -> Optional[float]:
+    """Convert a km/h reading to m/s, defensively.
+
+    **v0.1.27 fix (SWF-P2-002).** Both wind call sites did
+    `entry[srf_key] * KMH_TO_MS` directly on the raw JSON value. A
+    provider returning a string ("12") raises TypeError inside the
+    parser, and a non-finite float sails through into storage — either
+    way the arithmetic happens BEFORE provider_validation.py's shared
+    physical-bounds check ever sees the value, so that safety net cannot
+    help. A TypeError here is not contained gracefully: it aborts the
+    whole SRF parse, discarding every other variable in the response.
+
+    Returns None for anything that is not a finite number, which is the
+    same shape the surrounding code already uses for a missing field.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return value * KMH_TO_MS
 
 TOKEN_LIFETIME = timedelta(days=7)
 # Refresh a bit before actual expiry rather than reacting only to a 401.
@@ -457,7 +485,7 @@ def _points_from_hourly_entries(
                 variables[internal_name] = SrfForecastPoint(
                     variable=internal_name,
                     valid_at=valid_at,
-                    value=entry[srf_key] * KMH_TO_MS,
+                    value=_kmh_to_ms(entry[srf_key]),
                 )
         by_valid_at[valid_at] = variables
     return by_valid_at
@@ -526,7 +554,8 @@ def parse_forecastpoint_response(payload: Any) -> list[SrfForecastPoint]:
                 if srf_key in entry and entry[srf_key] is not None:
                     points.append(
                         SrfForecastPoint(
-                            variable=internal_name, valid_at=valid_at, value=entry[srf_key] * KMH_TO_MS
+                            variable=internal_name, valid_at=valid_at,
+                            value=_kmh_to_ms(entry[srf_key]),
                         )
                     )
     return points

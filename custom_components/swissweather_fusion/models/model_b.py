@@ -370,8 +370,27 @@ def refine_with_meteonomiqs(
     # truth for the scale, not a duplicated constant.
     from ..clients.meteonomiqs import RADAR_RISK_SCALE_MAX
 
+    # v0.1.27 fix (SWF-P1-003): defence in depth. The parser now rejects
+    # out-of-scale risk values (clients/meteonomiqs._validated_risk_value),
+    # which is the primary fix — but this function is public, is called
+    # from the coordinator, and produces a value that is persisted into
+    # storm_predictions AND published as a percentage by
+    # StormOnsetProbabilitySensor. A single validation layer between a
+    # third-party payload and a user-visible "%" reading is not enough:
+    # before this release, a risk of 99 yielded 5.9, shown as 590%, and
+    # any automation thresholding on that sensor fired unconditionally.
+    #
+    # Clamping the NORMALISED value rather than rejecting outright,
+    # because by this point we are past the boundary where discarding is
+    # meaningful — the caller has already decided to refine. The parser
+    # is where a bad value should die; this is the seatbelt.
     normalized = meteonomiqs_risk_value / RADAR_RISK_SCALE_MAX
-    return (base_probability + normalized) / 2.0
+    normalized = max(0.0, min(1.0, normalized))
+    refined = (base_probability + normalized) / 2.0
+
+    # The stated domain of this function's result is [0, 1]. Enforced,
+    # not assumed, since base_probability arrives from a caller too.
+    return max(0.0, min(1.0, refined))
 
 
 @dataclass(frozen=True)

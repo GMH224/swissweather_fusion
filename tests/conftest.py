@@ -78,7 +78,31 @@ def _install_homeassistant_stubs() -> None:
     aiohttp_client.async_get_clientsession = lambda hass: None
 
     update_coordinator = _module("homeassistant.helpers.update_coordinator")
-    update_coordinator.DataUpdateCoordinator = type("DataUpdateCoordinator", (), {"__init__": lambda self, *a, **kw: None})
+    # v0.1.26 (INFRA-03): this stub used to be a no-op
+    # `lambda self, *a, **kw: None`, so a coordinator constructed through
+    # its real __init__ came out without `self.hass`, `self.name` or
+    # `self.update_interval` — attributes the REAL DataUpdateCoordinator
+    # always sets and that coordinator methods legitimately rely on.
+    #
+    # The consequence was that a genuinely-constructed coordinator could
+    # not have any of its methods called, which pushed every coordinator
+    # test toward object.__new__() and hand-set attributes — and that in
+    # turn is why __init__ went untested and why v0.1.25 shipped with a
+    # TypeError on a constructor call. Raising the stub's fidelity here
+    # is what makes tests/test_v0_1_26_construction.py able to do more
+    # than check that construction does not raise.
+    def _duc_init(self, hass=None, logger=None, *, name=None,
+                  update_interval=None, **kwargs):
+        self.hass = hass
+        self.logger = logger
+        self.name = name
+        self.update_interval = update_interval
+        self.data = None
+        self.last_update_success = True
+
+    update_coordinator.DataUpdateCoordinator = type(
+        "DataUpdateCoordinator", (), {"__init__": _duc_init}
+    )
     update_coordinator.UpdateFailed = type("UpdateFailed", (Exception,), {})
     update_coordinator.CoordinatorEntity = type("CoordinatorEntity", (), {"__init__": lambda self, *a, **kw: None})
 

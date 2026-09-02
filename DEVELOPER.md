@@ -1813,9 +1813,9 @@ for a `.status` attribute rather than importing aiohttp's exception
 types), so it's directly unit-tested without needing a live failure to
 trigger it.
 
-## v0.1.24 / v0.1.25 — architecture notes
+## v0.1.24–v0.1.27 — architecture notes
 
-Full remediation record: `swissweather_fusion_v0.1.25_remediation_audit.md`.
+Full remediation record: `swissweather_fusion_v0.1.27_remediation_audit.md`.
 The design decisions worth knowing before reading the code:
 
 ### Model A blend weights are dimensionless (IND-01)
