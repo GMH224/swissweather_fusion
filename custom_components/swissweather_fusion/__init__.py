@@ -5,6 +5,7 @@ classifier. See DEVELOPER.md for the full architecture rationale.
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 
 from homeassistant.config_entries import ConfigEntry
@@ -12,14 +13,16 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    CONF_STATION_PRESSURE_IS_SEA_LEVEL,
+    DEFAULT_STATION_PRESSURE_IS_SEA_LEVEL,
     CONF_DIAGNOSTIC_LOGGING_ENABLED,
-    CONF_ELEVATION_EFFECTIVE,
     CONF_ELEVATION_OVERRIDE,
     CONF_LATITUDE,
     CONF_LONGITUDE,
     CONF_METEOBLUE_API_KEY,
     CONF_METEONOMIQS_API_KEY,
     CONF_OPEN_METEO_API_KEY,
+    CONF_PURGE_DAYS,
     CONF_SRF_CONSUMER_KEY,
     CONF_SRF_CONSUMER_SECRET,
     CONF_STATION_HUMIDITY_ENTITY,
@@ -28,9 +31,13 @@ from .const import (
     DB_FILENAME,
     DEFAULT_DIAGNOSTIC_LOGGING_ENABLED,
     DIAGNOSTIC_EVENT_BUFFER_SIZE,
+    DEFAULT_PURGE_DAYS,
     DOMAIN,
 )
+from homeassistant.exceptions import ConfigEntryAuthFailed
+
 from .coordinator import (
+    StormEventReconciliationCoordinator,
     CombiPrecipCoordinator,
     MeteoblueCoordinator,
     MeteonomiqsCoordinator,
@@ -38,6 +45,7 @@ from .coordinator import (
     ModelALearningCoordinator,
     ModelBCoordinator,
     OpenMeteoCoordinator,
+    RetentionCoordinator,
     SrfCoordinator,
     StationCoordinator,
 )
@@ -95,6 +103,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     open_meteo_api_key = options.get(
         CONF_OPEN_METEO_API_KEY, data.get(CONF_OPEN_METEO_API_KEY)
     )
+    # v0.1.23 fix (L-10): same options-first, data-fallback pattern as
+    # every other config value above — purge_days is set once in
+    # entry.data during initial setup and can be changed afterward via
+    # the options flow.
+    purge_days = options.get(CONF_PURGE_DAYS, data.get(CONF_PURGE_DAYS, DEFAULT_PURGE_DAYS))
 
     # v0.1.9: toggleable diagnostic logging — off by default. Since any
     # options change already triggers a full reload (see the update
@@ -108,8 +121,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     diagnostics_recorder = DiagnosticsRecorder(max_events=DIAGNOSTIC_EVENT_BUFFER_SIZE)
     diagnostics_recorder.set_enabled(diagnostic_logging_enabled)
 
+    # v0.1.24 (P1-22): the station coordinator now needs to know both
+    # whether the configured pressure entity is already sea-level
+    # normalised and the site elevation, so it can reduce a station-level
+    # reading before storing it. Resolved options-first like every other
+    # setting here.
+    pressure_is_sea_level = entry.options.get(
+        CONF_STATION_PRESSURE_IS_SEA_LEVEL,
+        entry.data.get(
+            CONF_STATION_PRESSURE_IS_SEA_LEVEL,
+            DEFAULT_STATION_PRESSURE_IS_SEA_LEVEL,
+        ),
+    )
     station_coordinator = StationCoordinator(
         hass, db, temp_entity, humidity_entity, pressure_entity,
+        pressure_is_sea_level=pressure_is_sea_level,
+        elevation_m=elevation_effective,
         diagnostics=diagnostics_recorder,
     )
     open_meteo_coordinator = OpenMeteoCoordinator(
@@ -134,7 +161,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass, db, latitude, longitude, diagnostics=diagnostics_recorder
     )
     meteonomiqs_coordinator = MeteonomiqsCoordinator(
-        hass, latitude, longitude, meteonomiqs_api_key,
+        hass, db, latitude, longitude, meteonomiqs_api_key,
         diagnostics=diagnostics_recorder,
     )
     model_b_coordinator = ModelBCoordinator(
@@ -153,7 +180,32 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # gets populated at all, and Model A's blend is only ever an
     # unweighted average of raw forecasts. See coordinator.py for the
     # full story of how this gap was found.
-    learning_coordinator = ModelALearningCoordinator(hass, db)
+    # v0.1.24 fix (P2-03 / P2-04): ONE lock object, constructed here on
+    # the event loop and injected into both coordinators that write
+    # forecast_snapshots. Two independently-created locks would serialize
+    # each coordinator against itself and nothing against the other,
+    # which is precisely the race being closed. Constructed directly
+    # rather than via an executor job, unlike the database connection —
+    # asyncio.Lock must be created on the loop it will be awaited on.
+    shared_learning_lock = asyncio.Lock()
+    learning_coordinator = ModelALearningCoordinator(
+        hass, db, reconcile_lock=shared_learning_lock
+    )
+    # v0.1.23 fix (L-10): the only caller of db.purge_older_than() — see
+    # RetentionCoordinator's docstring in coordinator.py. purge_days=0
+    # (the default) makes this coordinator a permanent no-op, matching
+    # the documented "0 = forever" meaning of the setting.
+    retention_coordinator = RetentionCoordinator(
+        hass,
+        db,
+        purge_days=purge_days,
+        retention_lock=shared_learning_lock,
+        diagnostics=diagnostics_recorder,
+    )
+    # v0.1.24 (P2-08): the first-ever writer to storm_events.
+    storm_reconciliation_coordinator = StormEventReconciliationCoordinator(
+        hass, db, diagnostics=diagnostics_recorder
+    )
 
     # First refresh for each. **Fixed in v0.1.1**: this used to be a bare
     # loop where any single coordinator raising (e.g. the SRF crash) would
@@ -193,11 +245,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         combiprecip_coordinator,
         meteonomiqs_coordinator,
     )
+    # v0.1.24 (P2-12): named before the gather below so the auth-failure
+    # cleanup path can shut down EVERY already-constructed coordinator,
+    # not only the source ones.
+    derived_coordinators_for_cleanup = (
+        model_b_coordinator,
+        blend_coordinator,
+        learning_coordinator,
+        retention_coordinator,
+        storm_reconciliation_coordinator,
+    )
     results = await asyncio.gather(
         *(c.async_config_entry_first_refresh() for c in source_coordinators),
         return_exceptions=True,
     )
     for coordinator, result in zip(source_coordinators, results):
+        if isinstance(result, ConfigEntryAuthFailed):
+            # v0.1.24 fix (P2-12): a genuinely bad credential entered
+            # during initial setup used to be logged and swallowed like
+            # any other failure, so setup finished looking successful and
+            # no reauth prompt was ever shown. ConfigEntryAuthFailed only
+            # triggers Home Assistant's reauth flow when it is RAISED OUT
+            # OF async_setup_entry — catching and logging it inside does
+            # nothing.
+            #
+            # This raise happens BEFORE the single pre-existing cleanup
+            # try/except further down the file, so without explicit
+            # cleanup here it would leak the open database connection and
+            # every already-constructed coordinator. Every coordinator is
+            # shut down, not just the one that failed.
+            _LOGGER.error(
+                "Authentication failed for %s during setup — requesting "
+                "reauthentication", coordinator.name,
+            )
+            for started in (*source_coordinators, *derived_coordinators_for_cleanup):
+                await started.async_shutdown()
+            await hass.async_add_executor_job(db.close)
+            raise result
         if isinstance(result, Exception):
             _LOGGER.warning(
                 "Initial refresh failed for %s, continuing setup with the "
@@ -207,8 +291,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 result,
             )
 
-    derived_coordinators = (model_b_coordinator, blend_coordinator, learning_coordinator)
-    derived_labels = ("Model B scoring", "Model A blend computation", "Model A learning reconciliation")
+    derived_coordinators = (
+        model_b_coordinator, blend_coordinator, learning_coordinator,
+        retention_coordinator, storm_reconciliation_coordinator,
+    )
+    derived_labels = (
+        "Model B scoring", "Model A blend computation",
+        "Model A learning reconciliation", "retention purge",
+        "storm event reconciliation",
+    )
     derived_results = await asyncio.gather(
         *(c.async_config_entry_first_refresh() for c in derived_coordinators),
         return_exceptions=True,
@@ -234,6 +325,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "model_b_coordinator": model_b_coordinator,
         "blend_coordinator": blend_coordinator,
         "learning_coordinator": learning_coordinator,
+        "retention_coordinator": retention_coordinator,
+        "storm_reconciliation_coordinator": storm_reconciliation_coordinator,
         "diagnostics_recorder": diagnostics_recorder,
     }
 
@@ -252,18 +345,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # plausible contributor to some of the confusing, hard-to-reproduce
     # symptoms seen throughout this project, though it can't be confirmed
     # in hindsight without reproducing the exact failure.
-    for coordinator in (
-        station_coordinator,
-        open_meteo_coordinator,
-        srf_coordinator,
-        meteoblue_coordinator,
-        combiprecip_coordinator,
-        meteonomiqs_coordinator,
-        model_b_coordinator,
-        blend_coordinator,
-        learning_coordinator,
-    ):
-        entry.async_on_unload(coordinator.async_shutdown)
+    # v0.1.24 fix (P0-03), CRITICAL: the
+    # `entry.async_on_unload(coordinator.async_shutdown)` loop that used
+    # to live here has been REMOVED, and async_unload_entry now awaits
+    # every coordinator's shutdown explicitly instead.
+    #
+    # The v0.1.15 fix above was right that shutdowns were missing, but
+    # async_on_unload was the wrong mechanism for this particular pairing.
+    # Home Assistant fires those callbacks from
+    # ConfigEntries.async_unload() AFTER the integration's own
+    # async_unload_entry returns — not as part of it. Since
+    # async_unload_entry closes the database directly, db.close() ALWAYS
+    # ran before any coordinator had actually stopped, leaving a window
+    # in which an in-flight or about-to-fire refresh could reach a closed
+    # SQLite connection. Every options change triggers a reload, so this
+    # sat on a routine path, and it is a plausible source of the
+    # intermittent ProgrammingError-shaped symptoms this project has
+    # chased before.
+    #
+    # See _all_coordinators() and async_unload_entry below.
 
     # v0.1.16 fix — very likely the actual root cause of the reported
     # multi-hour freeze, found from a third outside review and confirmed
@@ -297,6 +397,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     def _noop() -> None:
         return None
 
+    # v0.1.23: retention_coordinator added to this list for the same
+    # reason as every coordinator already here — it has no CoordinatorEntity
+    # of its own either, so without a listener it would run its one
+    # guaranteed first refresh and then never be rescheduled again.
     for coordinator in (
         station_coordinator,
         open_meteo_coordinator,
@@ -306,6 +410,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         meteonomiqs_coordinator,
         model_b_coordinator,
         learning_coordinator,
+        retention_coordinator,
     ):
         entry.async_on_unload(coordinator.async_add_listener(_noop))
 
@@ -330,6 +435,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             model_b_coordinator,
             blend_coordinator,
             learning_coordinator,
+            retention_coordinator,
+            storm_reconciliation_coordinator,
         ):
             await coordinator.async_shutdown()
         await hass.async_add_executor_job(db.close)
@@ -350,9 +457,108 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
     await hass.config_entries.async_reload(entry.entry_id)
 
 
+def _all_coordinators(runtime: dict) -> list:
+    """Every coordinator in a runtime dict, in shutdown order.
+
+    v0.1.24 (P0-03): the setup-failure cleanup path keeps its own
+    explicit tuple rather than calling this, because at that point the
+    runtime dict does not exist yet. The two lists must always agree; a
+    silent divergence would reintroduce exactly the leak both are there
+    to prevent, which is why tests/test_lifecycle.py asserts they match.
+    """
+    keys = (
+        "station_coordinator",
+        "open_meteo_coordinator",
+        "srf_coordinator",
+        "meteoblue_coordinator",
+        "combiprecip_coordinator",
+        "meteonomiqs_coordinator",
+        "model_b_coordinator",
+        "blend_coordinator",
+        "learning_coordinator",
+        "retention_coordinator",
+        "storm_reconciliation_coordinator",
+    )
+    return [runtime[k] for k in keys if k in runtime]
+
+
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
         runtime = hass.data[DOMAIN].pop(entry.entry_id)
+        # v0.1.24 fix (P0-03): stop every coordinator FIRST, and await
+        # each one, before closing the connection they all hold a
+        # reference to. Deterministic ordering here is the entire fix —
+        # see the comment in async_setup_entry for why
+        # entry.async_on_unload could not provide it.
+        for coordinator in _all_coordinators(runtime):
+            await coordinator.async_shutdown()
         await hass.async_add_executor_job(runtime["db"].close)
     return unloaded
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete this entry's database when the integration is removed.
+
+    **v0.1.24 fix (IND-05).** No removal handler existed, so removing the
+    integration orphaned
+    `.storage/{DOMAIN}_{entry_id}_{DB_FILENAME}` — plus its `-wal` and
+    `-shm` sidecars — permanently, holding the full station observation
+    history and, implicitly, the configured location. Re-adding the
+    integration produces a new entry_id and therefore a new database, so
+    the old file was not merely undeleted but unreachable.
+
+    Failure to delete is logged rather than raised: Home Assistant has
+    already removed the entry by this point, and making removal fail over
+    a leftover file would leave the user with no way to complete it.
+    """
+    # Same path construction as async_setup_entry above — kept
+    # deliberately identical rather than factored out, since a divergence
+    # would silently delete nothing.
+    db_path = hass.config.path(f".storage/{DOMAIN}_{entry.entry_id}_{DB_FILENAME}")
+
+    def _remove() -> None:
+        for suffix in ("", "-wal", "-shm"):
+            path = db_path + suffix
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                continue
+            except OSError as err:
+                _LOGGER.warning("Could not remove %s: %s", path, err)
+
+    await hass.async_add_executor_job(_remove)
+    _LOGGER.info("Removed SwissWeather Fusion database for entry %s", entry.entry_id)
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Migrate a config entry to the current version.
+
+    **v0.1.24 fix (IND-05).** SwissWeatherFusionConfigFlow declared
+    VERSION = 1 with no migration handler at all, which is fine right up
+    until the entry's data shape changes — and this release changes it,
+    adding CONF_STATION_PRESSURE_IS_SEA_LEVEL (P1-22). Without a handler,
+    Home Assistant refuses to load an entry whose version is lower than
+    the flow's, so upgrading would have broken every existing
+    installation.
+
+    v1 -> v2 fills in the new key with its default. Existing users are
+    asked to confirm it rather than being silently assumed correct — the
+    default is "station pressure, needs reduction", which is right for a
+    Netatmo absolute-pressure entity but wrong for a normalised one, and
+    there is no way to tell from the entity itself. See
+    CONF_STATION_PRESSURE_IS_SEA_LEVEL in const.py.
+    """
+    if entry.version == 1:
+        data = dict(entry.data)
+        data.setdefault(
+            CONF_STATION_PRESSURE_IS_SEA_LEVEL,
+            DEFAULT_STATION_PRESSURE_IS_SEA_LEVEL,
+        )
+        hass.config_entries.async_update_entry(entry, data=data, version=2)
+        _LOGGER.info(
+            "Migrated SwissWeather Fusion config entry to version 2 "
+            "(added station pressure reference; please confirm it under "
+            "Configure if your station reports sea-level-normalised pressure)"
+        )
+    return True

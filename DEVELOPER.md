@@ -1,6 +1,198 @@
 # Developer notes: architecture rationale
 
-## v0.1.22 — a self-inflicted production crash, found in a real HA log, fixed with a new class of test
+## v0.1.23 — Remediation of the independent ICS code/system audit
+
+An independent code/system audit (`swissweather-fusion-v0_1_22.zip`,
+dated 11 August 2026, scope: Model A learning, SRF/SRG forecasting,
+persistence, restart/recovery, quotas, deduplication, lifecycle) found
+12 defects (L-01 through L-12), plus 4 more found in a follow-up
+internal review of areas the audit didn't cover. The full audit findings,
+fix descriptions, and verification approach for every one of them are in
+`swissweather_fusion_v0.1.23_remediation_audit.md`. Summary here; that
+document is the authoritative record.
+
+**The headline defect (L-01, CRITICAL)**: the retry-watermark design
+could re-select and re-fold already-reconciled forecast rows into
+`bucket_stats` during any station-data gap, silently corrupting every
+learned source weight, including SRF's. Its mirror-image (L-02, HIGH): a
+late-arriving forecast row could land after the watermark had already
+passed its `valid_at`, making it permanently unreachable. Both are fixed
+by the same change: `forecast_snapshots` gained a per-row
+`reconciliation_status` ('pending'/'reconciled'/'skipped') via a real
+schema migration (v1→v2), replacing the single global watermark
+entirely. A row transitions out of 'pending' exactly once, ever — which
+makes both L-01's double-counting and L-02's permanent loss structurally
+impossible, not just less likely. See `storage/db.py`'s
+`get_pending_forecast_snapshots()`/`mark_forecast_snapshots_status()`
+and `coordinator.py`'s rewritten `ModelALearningCoordinator._reconcile`.
+
+**The migration itself also wipes `bucket_stats`.** The audit's own
+verdict was explicit: persisted source weights are "NOT READY... until
+the learning identity/reconciliation layer and EMA ordering are
+corrected." There's no way to retroactively separate genuine samples
+from L-01's duplicated ones in existing bucket_stats rows after the
+fact, so starting clean on upgrade is the only way to make that
+persistence layer trustworthy again — see `_migrate_to_v2()`'s
+docstring. Rows older than 14 days (`MIGRATION_REOPEN_WINDOW`, same
+value as the project's own `INITIAL_LOOKBACK`) are marked already-
+`reconciled` so the first post-upgrade run doesn't try to reprocess
+years of history; anything more recent comes back as `pending` and gets
+a fresh, correct pass.
+
+**L-03 (HIGH, EMA self-fitting)**: `update_bucket_ema()` computed the
+new bias first, then measured `ema_abs_error` against that *same*,
+already-updated bias — so the current observation partially fit itself
+before it ever contributed to the error statistic, making
+`ema_weight = 1 / (ema_abs_error + epsilon)` systematically too
+generous. Worst case (cold start, `previous_sample_count == 0`): the old
+code was mathematically guaranteed to produce `ema_abs_error == 0.0` for
+every bucket's first sample, every time (`debiased_forecast =
+forecast_value - new_bias` collapses to exactly `actual_value` when
+`new_bias == raw_error`). Fixed by judging the residual against
+`previous_bias` — the bias as it stood *before* this sample — before
+updating it. Standard predict-then-update discipline; see
+`test_update_bucket_ema_cold_start` and
+`test_update_bucket_ema_judges_second_sample_against_bias_before_this_update`
+in `tests/test_model_a.py` for both the fixed numeric behavior and a
+direct check that it's NOT the old formula.
+
+**L-04/L-05/L-06 (HIGH, no durable provider-run identity)**: three
+separate symptoms — SRF's `forecast_snapshots` rows carry no run
+identity at all, Meteoblue had no dedup mechanism whatsoever, and
+Open-Meteo's dedup fingerprint lived only in a coordinator instance
+dict, reset on every restart — turned out to be the same missing piece.
+New shared `fingerprint.py` module: `fingerprint_points()` hashes a
+provider's already-*parsed* points (variable, valid_at, value) rather
+than raw response bytes, deliberately robust to a provider's internal
+metadata shape changing without the forecast itself changing (SRF's
+response shape in particular has already proven to be a moving target —
+see the v0.1.18/v0.1.21 entries below). The fingerprint is persisted via
+`SwissWeatherDB.get/set_provider_run_fingerprint` (schema_meta-backed),
+not just held in memory — that's what makes the fix survive a restart.
+Wired into all three of Open-Meteo, Meteoblue, and SRF's coordinators,
+each with an in-memory fast-path cache loaded from the DB exactly once
+per coordinator lifetime.
+
+**L-07/L-08 (HIGH/MEDIUM-HIGH, quota and scheduling state reset on
+restart)**: `AnnualCallBudget` (Meteonomiqs' 1000-calls/year tracker),
+`BonusCallTracker` (Meteoblue's — and, by the identical bug class,
+Meteonomiqs' own — same-day bonus-call allowance), and Meteoblue's
+`_last_scheduled_call_hour` all lived only as plain instance attributes,
+reset to their empty defaults on every restart/reload. Both tracker
+classes gained `to_state()`/`from_state()` (or `load_state()`)
+serialization; each affected coordinator now loads persisted state from
+the DB exactly once per lifetime and re-persists immediately after every
+mutation — not at some later checkpoint, since the whole point is
+surviving a restart that could happen at any moment.
+
+**L-09 (MEDIUM-HIGH, Model B false-trigger risk on restart)**:
+`_previous_probability` reset to `0.0` on every restart. If a storm
+probability was already elevated above the crossing threshold when HA
+restarted, the first post-restart score could look like a fresh upward
+crossing and fire an unwarranted bonus call. Now persisted
+(`get/set_model_b_previous_probability`) and loaded once per lifetime —
+which turns out to need no special-casing at all: comparing a fresh
+score against the genuinely-last-known probability (rather than a reset
+`0.0`) naturally makes an already-elevated-then-restarted scenario read
+as "no new crossing," exactly as intended.
+
+**L-10 (MEDIUM, retention purge never wired in)**: `purge_older_than()`
+was correctly implemented but had no caller anywhere in production — the
+configured `purge_days` setting had no operational effect, and
+high-volume tables could grow unbounded. New `RetentionCoordinator`
+(its own 24h schedule, independent of any polling coordinator) is now
+the sole caller. Per the audit's own explicit recommendation, `purge_older_than`
+also now excludes `reconciliation_status = 'pending'` rows from deletion
+regardless of age — a `purge_days` window shorter than
+`RETRY_GIVE_UP_AGE` (48h) must not silently convert a retryable gap into
+a permanently lost learning sample.
+
+**L-11 (MEDIUM, SRF fallback treats every failure as fallback-eligible)**:
+a broad `except Exception` around the primary forecastpoint fetch meant
+a *permanent* 4xx (confirmed real: the free plan's one-registered-
+location restriction) got the exact same fallback-to-daily-endpoint
+treatment as a genuine transient 5xx — wasting a call on every single
+poll forever, while hiding the real, permanent cause behind what looked
+like ordinary degraded operation. New `SrfPermanentError` (carries the
+HTTP status) is raised specifically for 4xx and is NOT fallback-eligible;
+5xx and other transient failures still fall through to the existing
+fallback path unchanged.
+
+**L-12 (MEDIUM, no 401 invalidation for cached SRF token)**: the only
+token-refresh trigger was local expiry — a token invalidated for any
+other reason (revocation, server-side rotation) stayed cached and kept
+being sent as-is until its local expiry arrived on its own, causing
+repeated auth failures in between. New `_async_get_with_token_retry`
+wrapper: on a 401, clears the cache, refreshes exactly once, retries the
+same request exactly once. Every SRF request (geolocation, forecast,
+forecastpoint) now goes through it uniformly.
+
+**Four more, found in a follow-up internal review (not in the external
+audit)**:
+
+- Meteoblue's request URL had no `&tz=` parameter. Per meteoblue's own
+  API documentation (§3.6–3.7 of their data-packages doc): omitting `tz`
+  makes the API auto-detect a *local* timezone from the request
+  coordinates and return human-readable timestamps in that zone — only
+  the numeric-epoch time formats are UTC "by definition." This client's
+  parser tagged every parsed timestamp `tzinfo=timezone.utc` regardless,
+  silently mislabeling what was very likely Europe/Zurich local time as
+  UTC. Fixed with `&tz=UTC`, matching Open-Meteo's already-correct
+  `&timezone=UTC` and meteoblue's own documented recommendation
+  ("for autonomous systems we recommend to use UTC").
+- Meteonomiqs' seasonal `/forecast/hourly` call fetched and parsed data
+  into `last_hourly_forecast`, spending real annual-budget quota, and
+  nothing ever read that attribute again — not persisted, not exposed,
+  not fed into Model B, despite `const.py`'s own comment describing the
+  call as "useful for Model B" during those months. That usefulness was
+  never actually wired up. Rather than invent new Model B scoring
+  behavior nothing specified, the data is now persisted into
+  `forecast_snapshots` under `meteonomiqs_`-prefixed variable names — the
+  same pattern SRF's own daily-only fields already use — specifically so
+  it can never be picked up by Model A's blend even by accident
+  (Meteonomiqs stays deliberately excluded from `ALL_FORECAST_SOURCES`).
+- `aggregate_twice_daily_forecast()` used `max(temps)` for BOTH the day
+  AND the night period — a night entry reported its warmest point
+  (usually right after sunset) rather than the overnight low, the
+  opposite of what "night temperature" conventionally means and
+  inconsistent with `aggregate_daily_forecast`'s own separate
+  `native_temperature`/`native_templow` split. This was silent: the
+  shipped unit tests asserted the max()-for-night behavior as if it were
+  correct. Night periods now use `min(temps)`.
+- Dead code cleanup: `get_all_bucket_stats_for_measurement_hour()`
+  (untested, no production caller, predated the v0.1.13 bulk-query
+  rework) removed. `METEONOMIQS_MAX_CALLS_PER_EVENT` (an exact duplicate
+  of `METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT`, which is the constant
+  actually used) and `METEONOMIQS_KEEPALIVE_INTERVAL`'s dead sibling
+  removed from `const.py`. `insert_forecast_snapshot()` (singular) and
+  `get_forecast_values_for_valid_at()` were kept, not removed — both
+  have direct test coverage of their own as documented test-setup
+  utilities, even though production always uses the bulk variants.
+
+**Verification**: every fix has direct test coverage — 198 tests total
+(up from 169), including a from-scratch v1→v2 migration test that hand-
+builds a raw pre-migration database file and confirms the exact
+recent-vs-old row split and the `bucket_stats` wipe; two direct
+regression tests reproducing L-01's mixed-batch re-learning scenario and
+L-02's late-arrival scenario end-to-end; new async SRF client tests
+(built around a small fake `aiohttp` session, since none existed before
+this at that layer) for the 401-retry-once and permanent-vs-transient
+error classification; persistence round-trip tests for every one of the
+L-04 through L-09 durable-state fixes; and — new territory for this
+project's test suite — coordinator-level tests that bypass `__init__`
+and call the real async coordinator methods directly under a minimal
+`FakeHass`, rather than only mirroring the logic elsewhere. That last
+category earned its keep immediately: it caught a real bug in this same
+pass's own L-07 fix (`set_annual_call_budget_state`'s keyword-only
+parameters made it silently uncallable through the actual
+`hass.async_add_executor_job` positional-only call path, despite passing
+every DB-layer test written against it directly) before it shipped. See
+`swissweather_fusion_v0.1.23_remediation_audit.md`'s "Coordinator-level
+tests" section for the full account. `pyflakes` across the whole
+integration shows no new issues introduced by this change (only the
+same pre-existing cosmetic unused-import warnings from before).
+
+
 
 **The bug**: `diagnostics.py` had two separate
 `async def async_get_config_entry_diagnostics` definitions — an
@@ -1621,22 +1813,136 @@ for a `.status` attribute rather than importing aiohttp's exception
 types), so it's directly unit-tested without needing a live failure to
 trigger it.
 
-## Known v0.1 gaps (the honest list)
+## v0.1.24 — architecture notes
 
-- `forecast_accuracy` and `last_learning_a/b` are still wired as stubs
-  returning `None` rather than fabricated placeholder numbers — computing
-  a true rolling MAE needs a join between `forecast_snapshots` and
-  `station_observations` by `valid_at`, meaningful work best validated
-  against real data rather than built speculatively.
-- `weather.async_forecast_hourly` returns an empty list — a full
-  multi-hour blended forecast (not just "now") is the natural next
-  iteration once the core loop is proven.
-- The elevation lapse-rate pre-correction (`models/model_a.py`) is
-  implemented but not yet wired into the live blend in `weather.py` — it
-  needs each source's own grid elevation (`HSURF` for CH1/CH2/D2,
-  `height` for meteoblue) threaded through from the forecast responses,
-  which wasn't completed for v0.1.
-- Dynamic (wind-direction-based) upwind sampling, wind-direction and
+Full remediation record: `swissweather_fusion_v0.1.24_remediation_audit.md`.
+The design decisions worth knowing before reading the code:
+
+### Model A blend weights are dimensionless (IND-01)
+
+`blend()` used to give a cold-start source a hard-coded weight of `1.0`
+and a trusted source `1 / (ema_abs_error + EMA_WEIGHT_EPSILON)`. Those
+two numbers are not on the same scale, and the second carries the
+measurement's units:
+
+```
+humidity, trusted source with MAE 5%      -> weight 0.20
+pressure, trusted source with MAE 0.3 hPa -> weight 3.23
+```
+
+against a cold-start weight of `1.0` in both cases. For humidity and
+precipitation, every well-characterised source was weighted *below* every
+unvalidated one — a source with 200 samples outvoted roughly 5:1 by a
+source with one. Learning made the blend worse.
+
+Both weights are now drawn from the same scale: `_reference_weight()`
+returns the median learned weight among this blend's trusted
+contributors, which is what a cold-start source is worth (neither better
+nor worse than typical), and `_clamp_learned_weight()` bounds the ratio
+at `MAX_LEARNED_WEIGHT_RATIO` (8:1) so one transiently-lucky bucket
+cannot dominate.
+
+The 8:1 cap is judgement, not measurement. It is wide enough to let a
+genuinely better source lead decisively while keeping the others audible.
+
+### Model B's radar input is an hourly accumulation (P1-14)
+
+MeteoSwiss's CPC product is "Combiprecip 60-minute total" — millimetres
+accumulated over the preceding hour. It is *not* an instantaneous rate;
+that is RZC/PRECIP, a different product in the same STAC collection. The
+field is `precip_accum_mm_1h` throughout, and the threshold is
+`RADAR_PRECIP_ACCUM_MM_THRESHOLD`.
+
+The practical consequence for anyone extending Model B: an hourly
+accumulation *lags* convective onset. Distance-graded upwind sampling
+still carries real signal, but no arrival-time claim can be attached to
+it, which is why the "~20/35/60 min" comments were removed rather than
+corrected.
+
+### Asymmetric handling of unknowns in radar gating (P1-13 / P1-16)
+
+Deliberate and worth not "tidying":
+
+- **Freshness unknown → exclude.** A reading whose age cannot be
+  established gives no evidence of being current, and a stale echo
+  causing a false storm warning costs more than ignoring one point.
+- **Quality unknown → include.** The quality code comes from the CPC
+  filename, but this project has never verified a real downloaded file.
+  If it turns out never to parse, treating unknown as bad would silently
+  disable the entire radar signal.
+
+### Crossing state vs displayed value (P0-02)
+
+`_previous_probability` stores the **unrefined base** score;
+`current_probability` stays refined for display and history. They must
+not be unified: crossing detection compares against the next cycle's
+unrefined base, and mixing scales produced a spurious "upward crossing"
+on essentially every cycle of any sustained signal.
+
+### Station pressure reference (P1-22)
+
+`CONF_STATION_PRESSURE_IS_SEA_LEVEL` exists because Netatmo publishes
+both a normalised `Pressure` and a raw `AbsolutePressure`, and Home
+Assistant gives both the same device class. No heuristic can distinguish
+them. Default `False` (station-level) — the physically honest reading.
+Every provider reports MSL, so without reduction Model A absorbs a fixed
+elevation offset as bias.
+
+### Storm-event ground truth (P2-08)
+
+`StormEventReconciliationCoordinator` reuses Model B's *own* v0
+thresholds when deciding whether a prediction verified. Inventing a
+second definition of "a storm signature" would mean the training labels
+described a different phenomenon from the one the model predicts. The
+honest reading of `storm_events` is therefore "the v0 signature was
+observed", not "a meteorologist would call this a storm".
+
+---
+
+## Known gaps (the honest list, updated for v0.1.24)
+
+**Closed since v0.1.1:**
+
+- `forecast_accuracy` now computes a real sample-count-weighted mean
+  absolute error from `bucket_stats.ema_abs_error`, with its methodology
+  disclosed in entity attributes (P3-02).
+- `last_learning_a` reports the learning coordinator's real heartbeat;
+  `last_learning_b` now explicitly discloses that it is not applicable to
+  a fixed v0 heuristic and is hidden by default (P3-01).
+- `weather.async_forecast_hourly` returns a genuine multi-hour blended
+  forecast.
+- `storm_events` finally has a writer (P2-08).
+
+**Still open:**
+
+- **Repairs and service actions (IND-11).** No `async_create_issue`
+  usage, no `services.yaml`. Exhausted quota, a revoked key or an
+  oversized database cannot raise a user-visible repair, and there is no
+  supported way to force a learning run or reset a poisoned bucket
+  without opening the SQLite file by hand. First item for v0.1.25 —
+  deferred from v0.1.24 deliberately, because these are new features
+  rather than defect fixes and would have expanded the untested surface
+  during a release aimed at shrinking it.
+- **The elevation lapse-rate pre-correction** is implemented in
+  `models/model_a.py` but still not wired into the live blend — it needs
+  each source's own grid elevation (`HSURF` for CH1/CH2/D2, `height` for
+  meteoblue) threaded through from the forecast responses.
+- **CombiPrecip's HDF5 internal layout is unverified** against a real
+  downloaded file. The filename/product contract is now grounded in
+  MeteoSwiss's published documentation; the in-file group structure is
+  not.
+- **Cross-source pressure semantics (IND-12).** Open-Meteo requests
+  `pressure_msl` and meteoblue maps `sealevelpressure`, both explicitly
+  MSL. Whether SRF's `PRESSURE_HPA` is MSL or station-level is
+  undocumented. If it is station-level, SRF's learned bias silently
+  absorbs a fixed elevation offset — learnable, so nothing breaks
+  visibly, but it makes that bias number physically meaningless.
+  `srf_probe.py` can settle this with one live response.
+- **Dynamic (wind-direction-based) upwind sampling**, wind-direction and
   cloud-cover EMA bucket dimensions, and Model B's winter/frontal
-  classifier are all deliberately deferred — see the relevant sections
+  classifier remain deliberately deferred — see the relevant sections
   above for why each is a "later" decision rather than a gap.
+- **Model B v1** is now *possible* (predictions and events both
+  accumulate) but not built. The natural first step is extending Model
+  A's EMA-learned source weighting to Model B's signal combination,
+  replacing the unjustified 50/50 Meteonomiqs blend.

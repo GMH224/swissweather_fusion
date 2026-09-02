@@ -40,6 +40,13 @@ REDACTED_MARKER = "[REDACTED]"
 SENSITIVE_KEY_SUBSTRINGS: tuple[str, ...] = (
     # Credentials
     "key", "secret", "token", "password", "auth",
+    # v0.1.24 fix (P1-05): station entity IDs. The three
+    # station_*_entity config values hold real Home Assistant entity IDs
+    # such as sensor.bedroom_temperature — not credentials, but they
+    # describe the layout and room names of someone's home, and appeared
+    # verbatim in a file intended to be shared for troubleshooting.
+    # Verified safe: no other config key in const.py contains "entity".
+    "entity",
     # Coordinates and elevation
     "lat", "lon", "elevation", "altitude", "height",
     # Location/identity fields confirmed present in a real captured SRF

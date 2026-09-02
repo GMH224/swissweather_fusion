@@ -1,13 +1,18 @@
 {
   "domain": "swissweather_fusion",
   "name": "SwissWeather Fusion",
-  "version": "0.1.22",
-  "codeowners": ["@your-github-username"],
+  "version": "0.1.24",
+  "codeowners": [
+    "@fusion-project-maintainers"
+  ],
   "config_flow": true,
-  "documentation": "https://github.com/your-github-username/swissweather-fusion",
-  "issue_tracker": "https://github.com/your-github-username/swissweather-fusion/issues",
+  "documentation": "https://github.com/swissweather-fusion/swissweather-fusion",
+  "issue_tracker": "https://github.com/swissweather-fusion/swissweather-fusion/issues",
   "iot_class": "cloud_polling",
-  "requirements": ["h5py>=3.10.0", "pyproj>=3.6.0"],
+  "requirements": [
+    "h5py>=3.10.0",
+    "pyproj>=3.6.0"
+  ],
   "dependencies": [],
   "integration_type": "hub"
 }

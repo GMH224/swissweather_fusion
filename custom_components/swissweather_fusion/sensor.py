@@ -8,10 +8,15 @@ and forecast_accuracy below.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Any, Optional
 
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -84,6 +89,29 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
+def is_source_healthy(health: Any) -> bool:
+    """Whether a source is genuinely working, as opposed to untried.
+
+    **v0.1.24 fix (P2-11 / IND-03).** Health was derived from
+    `consecutive_failures == 0` alone — which is equally true of a source
+    that has never been polled at all, since zero is the attribute's own
+    initial value. A cold start therefore reported every source as active
+    and the integration as "Active" before a single successful fetch.
+
+    The audit flagged this only on ActiveSourcesSensor. The identical
+    test appeared in StatusSensor and in DegradedBinarySensor, which are
+    the two entities users and automations actually watch — so fixing
+    only where the audit pointed would have left the visible symptom
+    entirely intact. All three now route through this one helper.
+
+    last_success_time is the discriminator because it is set in exactly
+    one place: SourceHealth.record_success().
+    """
+    if health is None:
+        return False
+    return health.consecutive_failures == 0 and health.last_success_time is not None
+
+
 class _BaseSensor(SensorEntity):
     _attr_has_entity_name = True
 
@@ -105,11 +133,14 @@ class StatusSensor(_BaseSensor):
 
     @property
     def native_value(self) -> str:
-        failure_counts = [
-            _get_health(self._runtime, source).consecutive_failures
+        # v0.1.24 (IND-03): "no failures yet" is not the same as
+        # "working" — see is_source_healthy.
+        healths = [
+            _get_health(self._runtime, source)
             for source in ALL_TELEMETRY_SOURCES
             if _get_health(self._runtime, source) is not None
         ]
+        failure_counts = [0 if is_source_healthy(h) else 1 for h in healths]
         if not failure_counts:
             return "Active"
         if all(count > 0 for count in failure_counts):
@@ -130,25 +161,78 @@ class ForecastAccuracySensor(_BaseSensor):
     """
 
     _attr_native_unit_of_measurement = "°C"
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, entry: ConfigEntry, db: SwissWeatherDB) -> None:
-        super().__init__(entry, "forecast_accuracy", "Forecast accuracy (7d MAE)")
+        # v0.1.24 fix (P3-02): renamed from "Forecast accuracy (7d MAE)",
+        # a methodology this sensor never actually implemented.
+        super().__init__(
+            entry, "forecast_accuracy", "Forecast accuracy (learned temperature MAE)"
+        )
         self._db = db
-        self._attr_extra_state_attributes: dict[str, Any] = {}
+        self._bucket_count = 0
+        self._sample_count = 0
 
     @property
     def native_value(self) -> Optional[float]:
-        # v0.1: computing a true rolling MAE requires joining
-        # forecast_snapshots against station_observations by valid_at,
-        # which is meaningful work best done once real data exists to
-        # validate the join logic against. Exposed as a stub (None) with a
-        # clear docstring rather than a fabricated placeholder number —
-        # wiring this up properly is flagged as the first thing to build
-        # once the core loop has been running for a few days.
-        return None
+        """Sample-count-weighted mean absolute error across temperature buckets.
+
+        **v0.1.24 fix (P3-02).** This returned None unconditionally, with
+        a docstring saying a true rolling MAE was "best done once real
+        data exists" — while bucket_stats.ema_abs_error had been real,
+        durable, continuously-updated error data the whole time,
+        maintained by the same learning loop the blend already depends on
+        and corrected in the v0.1.23 L-03 fix to measure the residual
+        against previous_bias rather than self-fittingly.
+
+        Weighted by sample_count so a bucket with three observations does
+        not carry the same authority as one with three hundred. Returns
+        None only when nothing has genuinely been learned yet, which on a
+        fresh install is the honest answer.
+        """
+        try:
+            all_stats = self._db.get_all_bucket_stats()
+        except Exception:  # noqa: BLE001 - a sensor must never break setup
+            return None
+
+        total_weighted = 0.0
+        total_samples = 0
+        buckets = 0
+        for key, stats in all_stats.items():
+            if key.measurement != "temperature":
+                continue
+            if stats.sample_count <= 0:
+                continue
+            total_weighted += stats.ema_abs_error * stats.sample_count
+            total_samples += stats.sample_count
+            buckets += 1
+
+        self._bucket_count = buckets
+        self._sample_count = total_samples
+        if total_samples == 0:
+            return None
+        return round(total_weighted / total_samples, 3)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """v0.1.24 (P3-02): the methodology is disclosed on the entity
+        rather than only in a source comment, so anyone reading this
+        number in the UI can see what it actually measures."""
+        return {
+            "methodology": (
+                "sample-count-weighted mean of bucket_stats.ema_abs_error "
+                "across temperature buckets; an EMA of |forecast - observed|, "
+                "not a fixed-window MAE"
+            ),
+            "temperature_bucket_count": self._bucket_count,
+            "total_sample_count": self._sample_count,
+        }
 
 
 class ActiveSourcesSensor(_BaseSensor):
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
     """Count of sources whose most recent poll succeeded — now genuinely
     computed from health state, not a hardcoded total.
     """
@@ -162,13 +246,17 @@ class ActiveSourcesSensor(_BaseSensor):
     def native_value(self) -> int:
         active = 0
         for source in ALL_TELEMETRY_SOURCES:
-            health = _get_health(self._runtime, source)
-            if health is not None and health.consecutive_failures == 0:
+            # v0.1.24 fix (P2-11): a source that has never succeeded is
+            # not active. See is_source_healthy.
+            if is_source_healthy(_get_health(self._runtime, source)):
                 active += 1
         return active
 
 
 class LastLearningASensor(_BaseSensor):
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
     """When Model A's EMA buckets last updated. **Fixed in v0.1.7**: this
     was a permanent stub (always None) because nothing in production code
     actually ran the reconciliation step — see ModelALearningCoordinator
@@ -203,8 +291,24 @@ class LastLearningBSensor(_BaseSensor):
     from the live scoring cadence.
     """
 
+    # v0.1.24 fix (P3-01): hidden by default on new installations. An
+    # entity that is permanently None looks broken, and this one is
+    # permanently None BY DESIGN — Model B v0 is a fixed heuristic with
+    # no training step at all.
+    _attr_entity_registry_enabled_default = False
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
     def __init__(self, entry: ConfigEntry, db: SwissWeatherDB) -> None:
-        super().__init__(entry, "last_learning_b", "Model B last training")
+        # The entity key and unique_id ("last_learning_b") are
+        # deliberately UNCHANGED. Renaming would orphan every existing
+        # installation's entity_id, automations and history — a worse
+        # outcome than the labelling problem being fixed. Only the
+        # user-visible name and attributes change.
+        super().__init__(
+            entry,
+            "last_learning_b",
+            "Model B training status (not applicable — v0 uses fixed rules)",
+        )
         self._db = db
 
     @property
@@ -212,8 +316,22 @@ class LastLearningBSensor(_BaseSensor):
         return None  # None until v1 training actually happens — v0 is a
                      # fixed rule, not something that "learns" per se
 
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "not_applicable": True,
+            "reason": (
+                "Model B v0 is a fixed threshold heuristic with no training "
+                "step. This becomes meaningful only once a v1 classifier is "
+                "trained on accumulated storm_events."
+            ),
+        }
+
 
 class ExpertWeightSensor(CoordinatorEntity, _BaseSensor):
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
     """One per Model A source — for debugging the live blend, per plan
     doc §7. Exposes the current-hour/season/short-lead-time weight as a
     representative snapshot rather than every bucket (which would be a lot
@@ -249,17 +367,54 @@ class StormOnsetProbabilitySensor(_BaseSensor):
     """
 
     _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
 
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
-        super().__init__(entry, "storm_onset_probability", "Storm onset probability")
+        # v0.1.24 fix (P2-06): renamed from "Storm onset probability".
+        # Calling it a probability implies statistical calibration the v0
+        # heuristic does not have — the score is max() of two
+        # hand-authored signals, optionally averaged with an external
+        # risk index. "Risk score" is what it actually is.
+        #
+        # The entity key and unique_id are deliberately unchanged, for
+        # the same orphaning reason as LastLearningBSensor above.
+        super().__init__(entry, "storm_onset_probability", "Storm onset risk score")
         self._runtime = runtime
 
     @property
-    def native_value(self) -> float:
-        return round(self._runtime["model_b_coordinator"].current_probability * 100, 1)
+    def native_value(self) -> Optional[float]:
+        coordinator = self._runtime.get("model_b_coordinator")
+        if coordinator is None:
+            return None
+        return round(coordinator.current_probability * 100, 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """v0.1.24 fix (P2-06 / P2-07): disclose the methodology on the
+        entity itself — reachable from the UI, templates and the REST
+        API — rather than only in a source comment that no user will
+        ever read."""
+        return {
+            "is_calibrated_probability": False,
+            "methodology": (
+                "v0 heuristic: the higher of a station-tendency threshold "
+                "score and a distance-graded radar score. When an "
+                "independent Meteonomiqs nowcast is available it is blended "
+                "50/50 — a weighting with no statistical basis beyond there "
+                "being no measured reason to favour either source."
+            ),
+        }
 
 
 class LastSuccessSensor(_BaseSensor):
+    # v0.1.24 fix (IND-08): native_value returns a datetime, and Home
+    # Assistant requires SensorDeviceClass.TIMESTAMP for that to be
+    # stored and rendered as a timestamp rather than coerced to a string.
+    # No entity in this integration declared a device class, a state
+    # class or an entity category before this release.
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], source: str) -> None:
         super().__init__(entry, f"{source}_last_success", f"{source}: last success")
         self._runtime = runtime
@@ -273,6 +428,11 @@ class LastSuccessSensor(_BaseSensor):
 
 class LastPollDurationSensor(_BaseSensor):
     _attr_native_unit_of_measurement = "ms"
+    # v0.1.24 (IND-08): MEASUREMENT is what makes this eligible for Home
+    # Assistant's long-term statistics, so poll latency can actually be
+    # charted over time rather than only inspected as a live value.
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], source: str) -> None:
         super().__init__(entry, f"{source}_last_poll_duration", f"{source}: last poll duration")
@@ -290,6 +450,8 @@ class LastDataErrorSensor(_BaseSensor):
     the graceful-degradation cooldown+retry case, distinct from an auth
     error which won't resolve on its own. See health.py.
     """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], source: str) -> None:
         super().__init__(entry, f"{source}_last_data_error", f"{source}: last data error")
@@ -316,6 +478,8 @@ class LastAuthErrorSensor(_BaseSensor):
     wait for a retry that will just fail the same way again.
     """
 
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], source: str) -> None:
         super().__init__(entry, f"{source}_last_auth_error", f"{source}: last auth error")
         self._runtime = runtime
@@ -335,6 +499,9 @@ class LastAuthErrorSensor(_BaseSensor):
 
 
 class ConsecutiveFailuresSensor(_BaseSensor):
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], source: str) -> None:
         super().__init__(entry, f"{source}_consecutive_failures", f"{source}: consecutive failures")
         self._runtime = runtime

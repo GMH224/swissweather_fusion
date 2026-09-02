@@ -5,14 +5,17 @@ from __future__ import annotations
 
 from typing import Any
 
-from homeassistant.components.binary_sensor import BinarySensorEntity
+from homeassistant.components.binary_sensor import (
+    BinarySensorDeviceClass,
+    BinarySensorEntity,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .device import build_device_info
-from .sensor import ALL_TELEMETRY_SOURCES, _get_health
+from .sensor import ALL_TELEMETRY_SOURCES, _get_health, is_source_healthy
 
 
 async def async_setup_entry(
@@ -23,6 +26,11 @@ async def async_setup_entry(
 
 
 class DegradedBinarySensor(BinarySensorEntity):
+
+    # v0.1.24 fix (IND-08): without a device class this rendered as a
+    # generic on/off rather than OK/Problem, which is the semantic every
+    # dashboard and automation actually wants from it.
+    _attr_device_class = BinarySensorDeviceClass.PROBLEM
     _attr_has_entity_name = True
     _attr_name = "Degraded"
 
@@ -48,7 +56,11 @@ class DegradedBinarySensor(BinarySensorEntity):
         # uses — every individual source, not just the coordinator
         # wrapping it.
         return any(
-            health.consecutive_failures > 0
+            # v0.1.24 fix (IND-03): "no failures yet" was treated as
+            # healthy, so a cold start reported "not degraded" before any
+            # source had ever succeeded — on the one entity most likely
+            # to be wired into an automation. See sensor.is_source_healthy.
+            not is_source_healthy(health)
             for source in ALL_TELEMETRY_SOURCES
             if (health := _get_health(self._runtime, source)) is not None
         )

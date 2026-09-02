@@ -111,6 +111,29 @@ def test_aggregate_twice_daily_forecast_splits_day_and_night():
     assert night_periods[0]["native_temperature"] == 16.0
 
 
+def test_aggregate_twice_daily_forecast_night_uses_min_day_uses_max():
+    """v0.1.23 regression test (own-review finding, not in the external
+    audit): the night period must report the overnight LOW
+    (min(temps)) and the day period must report the daytime HIGH
+    (max(temps)) — previously both periods used max(), so a night entry
+    silently reported its warmest point instead of its low.
+    """
+    hourly = [
+        _hourly_entry("2026-07-25T08:00:00+00:00", 12.0, 0.0),  # day
+        _hourly_entry("2026-07-25T14:00:00+00:00", 27.0, 0.0),  # day (high)
+        _hourly_entry("2026-07-25T09:00:00+00:00", 19.0, 0.0),  # day
+        _hourly_entry("2026-07-25T19:00:00+00:00", 11.0, 0.0),  # night
+        _hourly_entry("2026-07-25T23:00:00+00:00", 4.0, 0.0),   # night (low)
+        _hourly_entry("2026-07-26T02:00:00+00:00", 8.0, 0.0),   # night
+    ]
+    periods = model_a.aggregate_twice_daily_forecast(hourly)
+    day = next(p for p in periods if p["is_daytime"])
+    night = next(p for p in periods if not p["is_daytime"])
+
+    assert day["native_temperature"] == 27.0  # max across day entries
+    assert night["native_temperature"] == 4.0  # min across night entries
+
+
 def test_aggregate_twice_daily_forecast_early_morning_belongs_to_previous_nights_period():
     """Regression test for a real bug caught before shipping: early
     morning hours (00:00-05:59) must be grouped with the PREVIOUS day's
@@ -131,7 +154,9 @@ def test_aggregate_twice_daily_forecast_early_morning_belongs_to_previous_nights
     # The 22:00 (25th) and 02:00 (26th) entries must land in the SAME
     # night period, not two separate ones.
     assert len(night_periods) == 1
-    assert night_periods[0]["native_temperature"] == 15.0  # max of 15.0 and 13.0
+    # v0.1.23 fix: night periods now report min(temps) (overnight low),
+    # not max(temps) — see aggregate_twice_daily_forecast's docstring.
+    assert night_periods[0]["native_temperature"] == 13.0  # min of 15.0 and 13.0
     assert night_periods[0]["native_precipitation"] == 0.5  # summed from both hours
 
     day_periods = [p for p in periods if p["is_daytime"]]

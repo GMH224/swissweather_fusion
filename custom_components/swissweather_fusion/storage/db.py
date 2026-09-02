@@ -34,14 +34,32 @@ racing on the same connection.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
-SCHEMA_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
+
+# v0.1.23 fix (L-01/L-02, audit finding): schema version bumped 1 -> 2 for
+# the reconciliation_status column below. See _migrate_to_v2() for what
+# actually happens to existing data on upgrade — this number alone is not
+# the migration, just the trigger for it.
+# v0.1.24: bumped to 3. See _migrate_to_v3 for what changes and why this
+# one is a clean rebuild rather than an additive migration.
+SCHEMA_VERSION = 3
+
+# v0.1.23: how far back the v1->v2 migration re-opens forecast_snapshots
+# rows for a fresh, correct reconciliation pass. Deliberately reuses the
+# exact same value as ModelALearningCoordinator.INITIAL_LOOKBACK (the
+# project's own established "how far back is worth reconciling from cold"
+# window) rather than inventing a second number that could drift out of
+# sync with it.
+MIGRATION_REOPEN_WINDOW = timedelta(days=14)
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -65,15 +83,30 @@ CREATE TABLE IF NOT EXISTS forecast_snapshots (
     valid_at TEXT NOT NULL,
     variable TEXT NOT NULL,
     value REAL,
-    trigger_reason TEXT DEFAULT 'scheduled'
+    trigger_reason TEXT DEFAULT 'scheduled',
+    -- v0.1.23 fix (L-01/L-02): durable per-row reconciliation identity,
+    -- replacing the old single global watermark. A row is 'pending' until
+    -- Model A learning either folds it into bucket_stats ('reconciled')
+    -- or gives up on it after RETRY_GIVE_UP_AGE ('skipped'). Because this
+    -- is a per-row fact, not a single global cursor position, a row can
+    -- never be double-counted (L-01) and a late-arriving row is never
+    -- invisible just because it landed after some other row's valid_at
+    -- (L-02) — see ModelALearningCoordinator._reconcile().
+    reconciliation_status TEXT NOT NULL DEFAULT 'pending'
 );
 CREATE INDEX IF NOT EXISTS idx_forecast_source_ts ON forecast_snapshots(source, valid_at);
 
+-- v0.1.24 (P1-14): column renamed from precip_rate_mmh. CombiPrecip
+-- reports a ONE-HOUR ACCUMULATION in mm (MeteoSwiss product CPC,
+-- "Combiprecip 60-minute total"), not an instantaneous rate — that is
+-- RZC/PRECIP, a different product in the same collection. quality is
+-- MeteoSwiss's own radar quality code (0-9) for the source file.
 CREATE TABLE IF NOT EXISTS radar_observations (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
-    precip_rate_mmh REAL,
-    precip_type TEXT
+    precip_accum_mm_1h REAL,
+    precip_type TEXT,
+    quality INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_radar_ts ON radar_observations(ts);
 
@@ -101,13 +134,33 @@ CREATE TABLE IF NOT EXISTS storm_events (
     notes TEXT
 );
 
+-- v0.1.24 (P2-08): `reconciled` lets StormEventReconciliationCoordinator
+-- check each prediction's outcome exactly once, after its follow-up
+-- window has fully elapsed, without ever re-checking it.
 CREATE TABLE IF NOT EXISTS storm_predictions (
     id INTEGER PRIMARY KEY,
     ts TEXT NOT NULL,
     probability REAL NOT NULL,
-    features TEXT
+    features TEXT,
+    reconciled INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_predictions_ts ON storm_predictions(ts);
+CREATE INDEX IF NOT EXISTS idx_predictions_reconciled
+    ON storm_predictions(reconciled, ts);
+"""
+
+# Split out from _SCHEMA_SQL above and applied separately, always AFTER the
+# v1->v2 migration has run (see _ensure_schema): this partial index
+# references the reconciliation_status column, which does not exist yet on
+# a database being migrated from v1 at the point _SCHEMA_SQL's
+# `CREATE TABLE IF NOT EXISTS forecast_snapshots` is a no-op (the table
+# already exists in its old shape). Creating this index eagerly as part of
+# _SCHEMA_SQL would fail with "no such column" on exactly the upgrade path
+# it's meant to support.
+_PENDING_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_forecast_pending
+    ON forecast_snapshots(reconciliation_status, valid_at)
+    WHERE reconciliation_status = 'pending';
 """
 
 
@@ -190,12 +243,210 @@ class SwissWeatherDB:
             "SELECT value FROM schema_meta WHERE key = 'schema_version'"
         )
         row = cur.fetchone()
-        if row is None:
-            self._conn.execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),),
-            )
+        has_version_row = row is not None
+
+        # v0.1.24 fix (P2-01): migration detection is now based on the
+        # ACTUAL SHAPE OF THE TABLES, with the metadata row used only as a
+        # secondary signal.
+        #
+        # The old logic trusted the absence of a schema_version row, on
+        # its own, to mean "this is a genuinely fresh database". That is
+        # not the same claim as "the tables are actually in their current
+        # shape". A database whose schema_meta row was lost or never
+        # written, while the data tables survived, has no schema_version
+        # row either — and every CREATE TABLE IF NOT EXISTS above is a
+        # silent no-op against a table that already exists, regardless of
+        # its column shape. The old code would then treat that database as
+        # brand new and immediately create the partial index against
+        # columns that do not exist, failing on exactly the recovery path
+        # the branch was written to handle.
+        actual = self._table_shape()
+        looks_current = (
+            "reconciliation_status" in actual.get("forecast_snapshots", set())
+            and "reconciled" in actual.get("storm_predictions", set())
+            and "precip_accum_mm_1h" in actual.get("radar_observations", set())
+        )
+        # Metadata absence is used only as a SECONDARY signal: a database
+        # with no data tables and no version row is genuinely new. It can
+        # no longer, on its own, cause a populated database to be treated
+        # as fresh.
+        is_fresh = not actual.get("forecast_snapshots") and not has_version_row
+
+        if is_fresh or looks_current:
+            # Either genuinely new (the CREATE TABLE statements above just
+            # built everything at the current shape) or already current.
+            self._conn.executescript(_PENDING_INDEX_SQL)
+            self._write_schema_version()
             self._conn.commit()
+            return
+
+        # Tables exist but are not at the current shape. Migrate on the
+        # evidence of the shape itself, not on what the metadata claims.
+        self._migrate_to_v3()
+        self._conn.executescript(_PENDING_INDEX_SQL)
+        self._write_schema_version()
+        self._conn.commit()
+
+    def _table_shape(self) -> dict[str, set[str]]:
+        """Actual column names per table, straight from the database.
+
+        The evidence _ensure_schema migrates on (P2-01). A table that does
+        not exist is simply absent from the result.
+        """
+        shape: dict[str, set[str]] = {}
+        for table in ("forecast_snapshots", "storm_predictions", "radar_observations"):
+            cols = {
+                r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if cols:
+                shape[table] = cols
+        return shape
+
+    def _write_schema_version(self) -> None:
+        """Record the current schema version.
+
+        v0.1.24: this was a bare
+
+            UPDATE schema_meta SET value = ? WHERE key = 'schema_version'
+
+        which matches zero rows, and therefore silently writes nothing,
+        whenever the row does not already exist — which is precisely the
+        ambiguous case the P2-01 fix above exists to handle. A proper
+        upsert cannot have that failure mode.
+        """
+        self._conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+
+    def _migrate_to_v3(self) -> None:
+        """v0.1.24: rebuild the learning and event tables from scratch.
+
+        **Why a clean rebuild rather than an additive ALTER.** Three of
+        this release's fixes change what stored data MEANS, not merely
+        what shape it has:
+
+        1. IND-01 changes how Model A's learned weights relate to each
+           other. Every ema_weight in bucket_stats was produced on a
+           unit-dependent scale that the new blend does not use.
+        2. P1-14 changes what the radar value IS — millimetres
+           accumulated over an hour, not an instantaneous mm/h rate. Rows
+           written under the old interpretation are not convertible,
+           because the two quantities genuinely differ.
+        3. P0-01 and P0-02 both mean some historical reconciliation
+           results and storm predictions were produced by logic now known
+           to be wrong (double-counted EMA samples; spurious repeated
+           crossings).
+
+        Carrying any of that forward would silently poison the corrected
+        models with data generated by the uncorrected ones. There is no
+        transformation that recovers the intended meaning, so the honest
+        move is to discard and relearn — and the learning loop rebuilds
+        bucket_stats automatically from forecast_snapshots, which IS
+        preserved, so the cost is a warm-up period rather than lost
+        history.
+
+        forecast_snapshots and station_observations are preserved and
+        simply re-opened for reconciliation, since raw provider forecasts
+        and raw sensor readings are facts, not derived interpretations.
+        """
+        _LOGGER.warning(
+            "Migrating SwissWeather Fusion database to schema v%s: learned "
+            "bucket_stats, radar observations and storm predictions are being "
+            "rebuilt from scratch (v0.1.24 changed what those values mean — "
+            "see DEVELOPER.md). Raw forecasts and station observations are "
+            "preserved and will be re-reconciled.",
+            SCHEMA_VERSION,
+        )
+
+        cols = self._table_shape()
+
+        if "reconciliation_status" not in cols.get("forecast_snapshots", set()):
+            self._conn.execute(
+                "ALTER TABLE forecast_snapshots "
+                "ADD COLUMN reconciliation_status TEXT NOT NULL DEFAULT 'pending'"
+            )
+
+        # Re-open recent rows for a fresh, correct reconciliation pass;
+        # leave older ones settled rather than replaying years of history.
+        cutoff = (datetime.now(timezone.utc) - MIGRATION_REOPEN_WINDOW).isoformat()
+        self._conn.execute(
+            "UPDATE forecast_snapshots SET reconciliation_status = 'reconciled' "
+            "WHERE valid_at < ?",
+            (cutoff,),
+        )
+        self._conn.execute(
+            "UPDATE forecast_snapshots SET reconciliation_status = 'pending' "
+            "WHERE valid_at >= ?",
+            (cutoff,),
+        )
+
+        # Derived tables: drop and let _SCHEMA_SQL's CREATE statements
+        # rebuild them at the current shape on the next open. Dropping is
+        # what makes the CREATE IF NOT EXISTS statements meaningful again.
+        self._conn.execute("DELETE FROM bucket_stats")
+        self._conn.execute("DROP TABLE IF EXISTS radar_observations")
+        self._conn.execute("DROP TABLE IF EXISTS storm_predictions")
+        self._conn.execute("DROP TABLE IF EXISTS storm_events")
+        self._conn.executescript(_SCHEMA_SQL)
+        self._conn.commit()
+
+    def _migrate_to_v2(self) -> None:
+        """v0.1.23 fix (L-01/L-02): introduces reconciliation_status.
+
+        This is a real data migration, not just a schema change, because
+        the old watermark-based reconciliation design (audit findings
+        L-01/L-02) could both double-count and permanently skip rows —
+        the external audit's own conclusion was that persisted bucket_stats
+        weights are NOT trustworthy under the old logic. Rather than carry
+        that uncertainty forward silently, this migration:
+
+        1. Adds the reconciliation_status column (existing rows default to
+           'pending' per the column's own DEFAULT, so no separate UPDATE is
+           needed for the column value itself).
+        2. Marks rows older than MIGRATION_REOPEN_WINDOW as 'reconciled' —
+           re-processing years of history under the new logic on the first
+           post-upgrade run would be wasteful and is not needed for
+           correctness (the fix is forward-looking; nothing about
+           correctly-shaped old rows is unsafe to leave alone).
+        3. Leaves recent rows (within the window) as 'pending' so they get
+           a fresh, correct reconciliation pass under the new code.
+        4. Wipes bucket_stats entirely. Every remaining bias/weight in that
+           table may have been built from double-counted samples under
+           L-01 — there is no way to retroactively separate genuine
+           samples from duplicated ones after the fact, so starting clean
+           is the only way to make the "PASS" persistence layer trustworthy
+           again. Buckets rebuild themselves automatically as the 'pending'
+           rows above (and all new data going forward) get reconciled.
+        """
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(forecast_snapshots)")}
+        if "reconciliation_status" not in cols:
+            self._conn.execute(
+                "ALTER TABLE forecast_snapshots "
+                "ADD COLUMN reconciliation_status TEXT NOT NULL DEFAULT 'pending'"
+            )
+
+        cutoff = (datetime.now(timezone.utc) - MIGRATION_REOPEN_WINDOW).isoformat()
+        self._conn.execute(
+            "UPDATE forecast_snapshots SET reconciliation_status = 'reconciled' "
+            "WHERE valid_at < ?",
+            (cutoff,),
+        )
+
+        bucket_rows_cleared = self._conn.execute("SELECT COUNT(*) AS n FROM bucket_stats").fetchone()["n"]
+        self._conn.execute("DELETE FROM bucket_stats")
+
+        # The old global watermark is superseded by per-row status and is
+        # no longer read by the reconciliation loop, but it isn't deleted
+        # here — it's harmless leftover state and removing schema_meta
+        # rows during a migration adds risk for no benefit.
+        self._conn.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('v2_migration_bucket_stats_cleared', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"{bucket_rows_cleared} rows cleared at {datetime.now(timezone.utc).isoformat()}",),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -254,22 +505,15 @@ class SwissWeatherDB:
     # been compared against actual observations and folded into
     # bucket_stats), not worth a dedicated table for.
 
-    def get_reconciliation_watermark(self) -> Optional[str]:
-        with self._lock:
-            cur = self._conn.execute(
-                "SELECT value FROM schema_meta WHERE key = 'reconciliation_watermark'"
-            )
-            row = cur.fetchone()
-            return row["value"] if row else None
-
-    def set_reconciliation_watermark(self, ts: str) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO schema_meta (key, value) VALUES ('reconciliation_watermark', ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (ts,),
-            )
-            self._conn.commit()
+    # v0.1.24 cleanup (IND-10): get_reconciliation_watermark() and
+    # set_reconciliation_watermark() were removed here. They implemented
+    # the pre-v0.1.23 reconciliation design, which the
+    # reconciliation_status column replaced wholesale; both had zero
+    # production callers after that change and were dead code that
+    # actively misled readers into thinking two competing reconciliation
+    # mechanisms coexisted. The stored schema_meta key is left in place
+    # rather than deleted — it is inert, and removing it would be a data
+    # migration for no benefit.
 
     # -- forecast snapshots -----------------------------------------------------
 
@@ -282,6 +526,11 @@ class SwissWeatherDB:
         value: Optional[float],
         trigger_reason: str = "scheduled",
     ) -> None:
+        """Single-row insert. Production coordinators always use the bulk
+        variant below (one transaction per poll cycle) — this single-row
+        form is kept as a test-setup convenience (see tests/test_db.py and
+        tests/test_learning_integration.py, which exercise it directly)
+        rather than removed as dead production code."""
         with self._lock:
             self._conn.execute(
                 "INSERT INTO forecast_snapshots "
@@ -316,16 +565,31 @@ class SwissWeatherDB:
             )
             return cur.fetchall()
 
-    def get_forecast_snapshots_to_reconcile(
-        self, *, since_ts: str, until_ts: str, measurements: tuple[str, ...]
+    def get_pending_forecast_snapshots(
+        self, *, until_ts: str, measurements: tuple[str, ...]
     ) -> list[sqlite3.Row]:
-        """Rows whose valid_at has now passed (i.e. we should have a real
-        station observation to compare against) but haven't yet been
-        folded into bucket_stats — used by the Model A learning
-        reconciliation step (v0.1.7). Restricted to measurements the
-        local station can actually confirm (temperature/humidity/
+        """v0.1.23 fix (L-01/L-02): rows whose valid_at has now passed (i.e.
+        we should have a real station observation to compare against) and
+        whose reconciliation_status is still 'pending' — used by the
+        Model A learning reconciliation step. Restricted to measurements
+        the local station can actually confirm (temperature/humidity/
         pressure) — precip/wind_speed have no ground truth yet since the
         station doesn't have rain/wind sensors.
+
+        Replaces the old get_forecast_snapshots_to_reconcile(), which took
+        a `since_ts` watermark as its lower bound. That watermark was a
+        *global* cursor standing in for "has this been learned yet?" — the
+        external ICS audit (L-01) found that capping it to protect a
+        still-retryable row made every already-reconciled row after that
+        point eligible for re-selection (and thus re-learned) on the very
+        next cycle, and (L-02) that a forecast landing in the database
+        after the watermark had already passed its valid_at could never be
+        selected at all. Filtering on a per-row status instead of a global
+        position makes both classes of bug structurally impossible: a row
+        already marked 'reconciled' or 'skipped' can never be selected
+        again regardless of when it was inserted or where the cursor sits,
+        and a 'pending' row is selected exactly once it's actually old
+        enough to have a station reading, regardless of insertion order.
 
         Every matching row is returned individually, not deduplicated by
         (source, valid_at) — a source can have several snapshots for the
@@ -337,11 +601,36 @@ class SwissWeatherDB:
         with self._lock:
             cur = self._conn.execute(
                 f"SELECT * FROM forecast_snapshots "
-                f"WHERE valid_at > ? AND valid_at <= ? AND variable IN ({placeholders}) "
+                f"WHERE reconciliation_status = 'pending' AND valid_at <= ? "
+                f"AND variable IN ({placeholders}) "
                 f"ORDER BY valid_at ASC",
-                (since_ts, until_ts, *measurements),
+                (until_ts, *measurements),
             )
             return cur.fetchall()
+
+    def mark_forecast_snapshots_status(self, ids: Iterable[int], status: str) -> None:
+        """v0.1.23 fix (L-01/L-02): bulk-transitions rows out of 'pending'.
+
+        status must be 'reconciled' (successfully folded into bucket_stats)
+        or 'skipped' (gave up retrying — see RETRY_GIVE_UP_AGE). Either way
+        this is a one-way, one-time transition: once a row leaves 'pending'
+        it is permanently excluded from get_pending_forecast_snapshots(),
+        which is exactly the guarantee that prevents re-learning (L-01).
+
+        Uses executemany for one bulk transaction per reconciliation cycle
+        rather than one UPDATE per row, matching the project's existing
+        bulk-operation convention (v0.1.13) for the same performance reason.
+        """
+        assert status in ("reconciled", "skipped"), f"invalid status: {status!r}"
+        ids = list(ids)
+        if not ids:
+            return
+        with self._lock:
+            self._conn.executemany(
+                "UPDATE forecast_snapshots SET reconciliation_status = ? WHERE id = ?",
+                [(status, i) for i in ids],
+            )
+            self._conn.commit()
 
     def get_forecast_snapshots_in_window(
         self, *, start_valid_at: str, end_valid_at: str
@@ -381,15 +670,42 @@ class SwissWeatherDB:
     # -- radar observations (CombiPrecip) ----------------------------------------
 
     def insert_radar_observation(
-        self, ts: str, precip_rate_mmh: Optional[float], precip_type: Optional[str]
+        self,
+        ts: str,
+        precip_accum_mm_1h: Optional[float],
+        precip_type: Optional[str],
+        quality: Optional[int] = None,
     ) -> None:
+        """v0.1.24 (P1-14): parameter renamed alongside the column. The
+        value is millimetres accumulated over the preceding hour, which is
+        what MeteoSwiss's CPC product actually reports.
+        """
         with self._lock:
             self._conn.execute(
-                "INSERT INTO radar_observations (ts, precip_rate_mmh, precip_type) "
-                "VALUES (?, ?, ?)",
-                (ts, precip_rate_mmh, precip_type),
+                "INSERT INTO radar_observations "
+                "(ts, precip_accum_mm_1h, precip_type, quality) VALUES (?, ?, ?, ?)",
+                (ts, precip_accum_mm_1h, precip_type, quality),
             )
             self._conn.commit()
+
+    def get_radar_observations_between(
+        self, start_ts: str, end_ts: str
+    ) -> list[sqlite3.Row]:
+        """v0.1.24 (P2-08 / IND-10): radar_observations was written on the
+        5-minute radar path and never read by anything. This is its first
+        consumer — StormEventReconciliationCoordinator needs the radar
+        evidence across a prediction's follow-up window to decide whether
+        a predicted storm actually happened.
+
+        Mirrors the existing get_station_observations_between.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM radar_observations WHERE ts >= ? AND ts <= ? "
+                "ORDER BY ts ASC",
+                (start_ts, end_ts),
+            )
+            return cur.fetchall()
 
     def get_latest_radar_observation(self) -> Optional[sqlite3.Row]:
         with self._lock:
@@ -456,19 +772,97 @@ class SwissWeatherDB:
             )
             self._conn.commit()
 
-    def get_all_bucket_stats_for_measurement_hour(
-        self, hour_of_day: int, season: str, lead_time_bucket: str, measurement: str
-    ) -> list[sqlite3.Row]:
-        """All sources' stats for one (hour, season, lead_time, measurement) —
-        this is exactly the set the blend needs to renormalize weights over.
+    def apply_reconciliation_batch(
+        self,
+        bucket_updates: list[tuple[BucketKey, float, float, float, int, str]],
+        reconciled_ids: list[int],
+        skipped_ids: list[int],
+    ) -> None:
+        """Apply one reconciliation cycle's EMA writes and status
+        transitions as a single all-or-nothing transaction.
+
+        **v0.1.24 fix (P0-01), CRITICAL.** upsert_bucket_stats() committed
+        per row inside the reconciliation loop, while
+        mark_forecast_snapshots_status() ran once, in bulk, at the end. A
+        crash between those two points left bucket_stats already updated
+        for rows still marked 'pending' — so the next cycle re-selected
+        those rows and folded them into the EMA a second time. That
+        defeats the at-most-once learning guarantee the entire v0.1.23
+        reconciliation_status redesign exists to provide, reintroducing
+        the prior pass's L-01 double-counting bug through a crash
+        boundary instead of through watermark arithmetic.
+
+        An EMA cannot un-absorb a duplicated sample, so "we will notice
+        and fix it later" is not available as a recovery strategy. One
+        commit or none at all is the only safe shape.
+
+        **On the explicit rollback.** SQLite only auto-rolls-back an open
+        transaction on the next process start. An exception caught within
+        the same still-running process leaves the transaction open
+        indefinitely, holding locks and leaving subsequent writes to join
+        a transaction that was supposed to have been abandoned. The
+        explicit rollback below is what makes this actually atomic in the
+        case that matters most.
         """
+        if not bucket_updates and not reconciled_ids and not skipped_ids:
+            return
+
         with self._lock:
-            cur = self._conn.execute(
-                "SELECT * FROM bucket_stats WHERE hour_of_day = ? AND season = ? "
-                "AND lead_time_bucket = ? AND measurement = ?",
-                (hour_of_day, season, lead_time_bucket, measurement),
-            )
-            return cur.fetchall()
+            try:
+                for key, ema_bias, ema_abs_error, ema_weight, sample_count, last_updated in (
+                    bucket_updates
+                ):
+                    self._conn.execute(
+                        "INSERT INTO bucket_stats "
+                        "(hour_of_day, season, lead_time_bucket, source, measurement, "
+                        " ema_bias, ema_abs_error, ema_weight, sample_count, last_updated) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(hour_of_day, season, lead_time_bucket, source, measurement) "
+                        "DO UPDATE SET ema_bias=excluded.ema_bias, "
+                        "ema_abs_error=excluded.ema_abs_error, "
+                        "ema_weight=excluded.ema_weight, "
+                        "sample_count=excluded.sample_count, "
+                        "last_updated=excluded.last_updated",
+                        (
+                            key.hour_of_day,
+                            key.season,
+                            key.lead_time_bucket,
+                            key.source,
+                            key.measurement,
+                            ema_bias,
+                            ema_abs_error,
+                            ema_weight,
+                            sample_count,
+                            last_updated,
+                        ),
+                    )
+
+                for status, ids in (("reconciled", reconciled_ids), ("skipped", skipped_ids)):
+                    if not ids:
+                        continue
+                    placeholders = ",".join("?" for _ in ids)
+                    self._conn.execute(
+                        f"UPDATE forecast_snapshots SET reconciliation_status = ? "
+                        f"WHERE id IN ({placeholders})",
+                        (status, *ids),
+                    )
+
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    # v0.1.23 cleanup: get_all_bucket_stats_for_measurement_hour() was removed
+    # here. It predated the v0.1.13 bulk-query rework of the blend path
+    # (get_all_bucket_stats() now does one query for the whole blend cycle
+    # instead of one per hour/measurement), had no remaining production
+    # caller, and — unlike insert_forecast_snapshot()/
+    # get_forecast_values_for_valid_at() below, which are kept because
+    # tests exercise them directly as documented utilities — had no test
+    # coverage of its own either. Renormalization now happens inline in
+    # model_a.blend() via the weighted-average's own division by the
+    # summed weights, which is what its docstring's claim about
+    # renormalization was describing a design that no longer exists.
 
     # -- storm events (Model B ground truth) -------------------------------------
 
@@ -523,12 +917,32 @@ class SwissWeatherDB:
         bucket_stats stays small permanently by design and is never purged.
         storm_events is Model B's whole training set and is never purged.
         Returns a dict of table -> rows deleted, for logging/audit.
+
+        v0.1.23 fix (L-10): this method existed and was correctly
+        implemented, but nothing in production ever called it — the
+        configured purge_days setting had no operational effect at all.
+        See RetentionCoordinator in coordinator.py for the scheduled
+        caller added to fix that.
+
+        v0.1.23 fix (L-10, audit's own stated recommendation — "protect
+        unreconciled snapshots"): forecast_snapshots rows with
+        reconciliation_status = 'pending' are now excluded from deletion
+        regardless of age. Without this, a purge_days window shorter than
+        RETRY_GIVE_UP_AGE (48h) could delete a forecast row Model A
+        learning was still actively waiting to retry-match against a
+        station observation, permanently losing that learning sample
+        instead of the row aging out through the normal 'skipped' path.
         """
         deleted: dict[str, int] = {}
         with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM forecast_snapshots "
+                "WHERE valid_at < ? AND reconciliation_status != 'pending'",
+                (cutoff_ts,),
+            )
+            deleted["forecast_snapshots"] = cur.rowcount
             for table, ts_col in (
                 ("station_observations", "ts"),
-                ("forecast_snapshots", "valid_at"),
                 ("radar_observations", "ts"),
                 ("storm_predictions", "ts"),
             ):
@@ -538,3 +952,254 @@ class SwissWeatherDB:
                 deleted[table] = cur.rowcount
             self._conn.commit()
         return deleted
+
+    # -- durable runtime state (v0.1.23 fixes L-06/L-05/L-04/L-07/L-08/L-09) -----
+    # All of these reuse the schema_meta key/value table, the same pattern
+    # already established for reconciliation_watermark above — each is a
+    # single small value, not worth a dedicated table for. Restart-safety
+    # for these was the audit's core "L-0x resets on restart" complaint;
+    # persisting them here (instead of only in coordinator instance
+    # attributes) is the actual fix.
+
+    def _get_meta(self, key: str) -> Optional[str]:
+        with self._lock:
+            cur = self._conn.execute("SELECT value FROM schema_meta WHERE key = ?", (key,))
+            row = cur.fetchone()
+            return row["value"] if row else None
+
+    def _set_meta(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            self._conn.commit()
+
+    def get_provider_run_fingerprint(self, source: str) -> Optional[str]:
+        """Fixes L-06 (Open-Meteo's dedup fingerprint was memory-only) and
+        extends the same durable mechanism to Meteoblue (L-05, which had no
+        dedup at all) and SRF (L-04's practical concern) — see
+        fingerprint.py and each coordinator's use of it."""
+        return self._get_meta(f"run_fingerprint:{source}")
+
+    def set_provider_run_fingerprint(self, source: str, fingerprint: str) -> None:
+        self._set_meta(f"run_fingerprint:{source}", fingerprint)
+
+    def _safe_parse_meta(self, key: str, parse: Callable[[str], Any]) -> Optional[Any]:
+        """Read and parse a schema_meta value, tolerating corruption.
+
+        **v0.1.24 fix (P2-02).** get_annual_call_budget_state,
+        get_bonus_call_tracker_state and get_model_b_previous_probability
+        called json.loads() / float() directly against whatever text
+        happened to be in schema_meta, with no handling for a truncated
+        write (a crash mid-write) or manual tampering. The resulting
+        exception propagated out of the coordinator's
+        _async_load_persisted_state_if_needed() and prevented that
+        coordinator from starting AT ALL — a corrupted byte in a quota
+        counter took down the source it belonged to, permanently, on
+        every subsequent restart.
+
+        Recovery here has three parts, and the third is the one that
+        matters: the corrupt value is CLEARED, so the failure does not
+        repeat forever. Returning None puts the caller in the exact state
+        it already handles correctly — "nothing has ever been persisted"
+        — so no caller needs a new code path.
+        """
+        raw = self._get_meta(key)
+        if raw is None:
+            return None
+        try:
+            return parse(raw)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            _LOGGER.warning(
+                "Discarding corrupted persisted state for %s (value could not be "
+                "parsed); treating it as never-persisted and clearing it so this "
+                "does not recur on every restart",
+                key,
+            )
+            try:
+                self._set_meta(key, "")
+                with self._lock:
+                    self._conn.execute(
+                        "DELETE FROM schema_meta WHERE key = ?", (key,)
+                    )
+                    self._conn.commit()
+            except sqlite3.Error:  # pragma: no cover - defensive
+                pass
+            return None
+
+    def get_annual_call_budget_state(self, source: str) -> Optional[dict]:
+        """Fixes L-07 (Meteonomiqs' annual quota counter reset on restart).
+
+        v0.1.24 (P2-02): parsed defensively — see _safe_parse_meta.
+        """
+        return self._safe_parse_meta(f"annual_call_budget:{source}", json.loads)
+
+    def set_annual_call_budget_state(self, source: str, year: int, calls_used: int) -> None:
+        # v0.1.23 fix: originally `year` and `calls_used` were keyword-only
+        # (`*`-separated). Found broken by a coordinator-level test:
+        # hass.async_add_executor_job(func, *args) — both the real Home
+        # Assistant implementation and this project's own test fakes —
+        # only supports positional arguments, so the original signature
+        # made this method impossible to call through that path at all
+        # despite being written specifically to be called through it.
+        # Positional now, matching every other setter here.
+        self._set_meta(
+            f"annual_call_budget:{source}",
+            json.dumps({"year": year, "calls_used": calls_used}),
+        )
+
+    def get_bonus_call_tracker_state(self, source: str) -> Optional[dict]:
+        """Fixes L-08 (Meteoblue's — and, by the same bug class,
+        Meteonomiqs' — same-day bonus-call allowance reset on restart).
+
+        v0.1.24 (P2-02): parsed defensively — see _safe_parse_meta.
+        """
+        return self._safe_parse_meta(f"bonus_call_tracker:{source}", json.loads)
+
+    def set_bonus_call_tracker_state(self, source: str, state: dict) -> None:
+        self._set_meta(f"bonus_call_tracker:{source}", json.dumps(state))
+
+    def get_last_scheduled_call_hour(self, source: str) -> Optional[str]:
+        """Fixes L-08's other half (Meteoblue's already-serviced scheduled
+        slot forgotten on restart, risking a duplicate provider call for
+        the same slot right after a reload)."""
+        return self._get_meta(f"last_scheduled_call_hour:{source}")
+
+    def set_last_scheduled_call_hour(self, source: str, iso_ts: str) -> None:
+        self._set_meta(f"last_scheduled_call_hour:{source}", iso_ts)
+
+    def get_model_b_previous_probability(self) -> Optional[float]:
+        """Fixes L-09 (Model B's previous_probability reset to 0.0 on
+        restart, which could misread an already-elevated storm probability
+        as a fresh upward crossing and fire an unwarranted bonus call).
+
+        **v0.1.24 (P0-02)**: the value stored here is now Model B's
+        UNREFINED base probability, not the Meteonomiqs-refined one. See
+        ModelBCoordinator._async_update_data_inner for why storing the
+        refined value corrupted crossing detection.
+
+        v0.1.24 (P2-02): parsed defensively — see _safe_parse_meta.
+        """
+        return self._safe_parse_meta("model_b_previous_probability", float)
+
+    def set_model_b_previous_probability(self, probability: float) -> None:
+        self._set_meta("model_b_previous_probability", repr(probability))
+
+    # -- Meteonomiqs daily-call bookkeeping (v0.1.24, P1-08) -------------------
+
+    def get_meteonomiqs_last_successful_call_date(self) -> Optional[str]:
+        """The ISO date (YYYY-MM-DD) of the last successful Meteonomiqs call.
+
+        **v0.1.24 fix (P1-08).** MeteonomiqsCoordinator held this in
+        memory only, so it reset to None on every restart. The daily gate
+
+            if self._last_successful_call_date == today: return None
+
+        then failed to recognise a day already serviced, and fired an
+        unnecessary extra call against a 1000-calls/year budget after any
+        same-day restart — which, during setup or troubleshooting, can
+        easily be several restarts in one afternoon.
+
+        Stored as a plain string rather than JSON: it is a single scalar,
+        and _safe_parse_meta's protection is unnecessary for a value that
+        cannot fail to parse.
+        """
+        return self._get_meta("meteonomiqs_last_successful_call_date")
+
+    def set_meteonomiqs_last_successful_call_date(self, iso_date: str) -> None:
+        self._set_meta("meteonomiqs_last_successful_call_date", iso_date)
+
+    # -- SRF geolocation cache (v0.1.24, IND-07) -------------------------------
+
+    def get_srf_geolocation_id(self, coordinate_key: str) -> Optional[str]:
+        """SRF's geolocation ID for a rounded coordinate pair.
+
+        **v0.1.24 fix (IND-07).** SrfClient held both its OAuth token and
+        its resolved geolocation ID as plain instance attributes, and the
+        client is constructed fresh on every setup. Since every options
+        change triggers a config-entry reload, each one re-ran the
+        geolocation lookup — an avoidable quota-consuming call against
+        the one source with a rotating credential. This project already
+        persists exactly this class of state for meteoblue and
+        Meteonomiqs (the L-07/L-08 fixes); SRF simply never received the
+        same treatment.
+
+        Keyed by rounded coordinates so that relocating the installation
+        naturally invalidates the cache instead of silently reusing the
+        old location's ID.
+        """
+        return self._get_meta(f"srf_geolocation_id:{coordinate_key}")
+
+    def set_srf_geolocation_id(self, coordinate_key: str, geolocation_id: str) -> None:
+        self._set_meta(f"srf_geolocation_id:{coordinate_key}", geolocation_id)
+
+    # -- storm prediction reconciliation (v0.1.24, P2-08) ----------------------
+
+    def get_unreconciled_storm_predictions(
+        self, ts_before: str, min_probability: float
+    ) -> list[sqlite3.Row]:
+        """Predictions whose follow-up window has fully elapsed and which
+        were confident enough to be worth checking.
+
+        The probability floor matters: a score that never crossed the
+        reporting threshold made no claim, so there is no outcome to
+        confirm and marking it either way would pollute the training set.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM storm_predictions "
+                "WHERE reconciled = 0 AND ts < ? AND probability >= ? "
+                "ORDER BY ts ASC",
+                (ts_before, min_probability),
+            )
+            return cur.fetchall()
+
+    def mark_storm_predictions_reconciled(self, ids: list[int]) -> None:
+        """Mark predictions as checked, whatever the outcome was.
+
+        Confirmed and unconfirmed predictions are both marked, so nothing
+        is ever re-checked — a prediction that did not verify is a
+        negative training example, not an unfinished job.
+        """
+        if not ids:
+            return
+        with self._lock:
+            placeholders = ",".join("?" for _ in ids)
+            self._conn.execute(
+                f"UPDATE storm_predictions SET reconciled = 1 WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            self._conn.commit()
+
+    # -- database size telemetry (v0.1.24, IND-06) -----------------------------
+
+    def get_storage_stats(self) -> dict[str, Any]:
+        """Row counts per table plus the file size on disk.
+
+        **v0.1.24 (IND-06).** Retention defaulted to "keep forever" and
+        nothing anywhere reported how large the database had become, so
+        unbounded growth was invisible until the disk filled. Surfaced
+        through diagnostics.py and the storage sensor.
+        """
+        stats: dict[str, Any] = {}
+        with self._lock:
+            for table in (
+                "forecast_snapshots",
+                "station_observations",
+                "radar_observations",
+                "bucket_stats",
+                "storm_predictions",
+                "storm_events",
+            ):
+                try:
+                    cur = self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}")
+                    stats[f"{table}_rows"] = int(cur.fetchone()["n"])
+                except sqlite3.Error:
+                    stats[f"{table}_rows"] = None
+        try:
+            stats["file_size_bytes"] = os.path.getsize(self._db_path)
+        except OSError:
+            stats["file_size_bytes"] = None
+        return stats

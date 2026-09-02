@@ -16,14 +16,15 @@ loop.
 from __future__ import annotations
 
 import asyncio
+import math
 import logging
-import tempfile
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -32,16 +33,26 @@ from .clients.meteoblue import BonusCallTracker, MeteoblueClient, should_fire_sc
 from .clients.meteonomiqs import AnnualCallBudget, MeteonomiqsClient, needs_keepalive_call
 from .clients.open_meteo import OpenMeteoClient
 from .clients.srf import SrfClient
-from .health import SourceHealth
+from .health import SourceHealth, classify_exception
 from .const import (
+    METEOBLUE_ANNUAL_CALL_BUDGET,
+    METEOBLUE_SCHEDULED_RETRY_COOLDOWN,
+    METEONOMIQS_NOWCAST_TARGET_WINDOW,
+    STORM_FOLLOW_UP_WINDOW,
+    STORM_RECONCILIATION_INTERVAL,
+    STORM_RECONCILIATION_MIN_PROBABILITY,
+    V0_PRESSURE_DROP_HPA_THRESHOLD,
+    RADAR_PRECIP_ACCUM_MM_THRESHOLD,
     ALL_FORECAST_SOURCES,
     METEONOMIQS_ANNUAL_CALL_BUDGET,
     METEONOMIQS_FORECAST_CALL_HOUR_LOCAL,
     METEONOMIQS_FORECAST_SEASON_MONTHS,
+    METEONOMIQS_HOURLY_VARIABLE_PREFIX,
     METEONOMIQS_KEEPALIVE_MAX_DAYS_BETWEEN_CALLS,
     METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT,
     MODEL_B_SCORING_INTERVAL,
     OPEN_METEO_CHECK_INTERVAL,
+    RETENTION_CHECK_INTERVAL,
     SOURCE_CH1,
     SOURCE_CH2,
     SOURCE_ICON_D2,
@@ -53,6 +64,8 @@ from .const import (
     UPWIND_POINT_LABELS,
 )
 from .models import model_b
+from .redaction import redact_secret_values
+from . import provider_validation, unit_conversion
 from .storage.db import SwissWeatherDB
 
 _LOGGER = logging.getLogger(__name__)
@@ -99,6 +112,10 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         # SRF/meteoblue/Meteonomiqs, since their responses' own grid/
         # station elevation isn't currently captured.
         self._actual_elevation_m = actual_elevation_m
+        # v0.1.24 (P1-03): retained rather than constructed-and-discarded,
+        # so exception text can be scrubbed of it before it reaches a log
+        # or a diagnostics record.
+        self._api_key = api_key
         self._client = OpenMeteoClient(async_get_clientsession(hass), api_key=api_key)
         self._last_issued_at: dict[str, datetime] = {}
         # v0.1.19 fix (DEF-02): issued_at alone couldn't detect an
@@ -106,7 +123,17 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         # tracks the last actually-stored run's content fingerprint per
         # source so a repeated identical poll can be recognized and
         # skipped, the way the dedup check was always meant to behave.
+        #
+        # v0.1.23 fix (L-06): this in-memory cache is now only a
+        # same-session fast path — the durable source of truth is
+        # SwissWeatherDB.get/set_provider_run_fingerprint(). Previously
+        # this dict was the ONLY copy of that state, reset to empty on
+        # every Home Assistant restart/reload, so a restart made an
+        # unchanged upstream run look "new" again and re-store it. Each
+        # source's entry is lazily loaded from the DB the first time it's
+        # needed after (re)start — see _get_persisted_fingerprint below.
         self._last_run_fingerprint: dict[str, Optional[str]] = {}
+        self._fingerprint_loaded_from_db: set[str] = set()
         # One health tracker per model, not one for the whole coordinator —
         # CH1 can fail while CH2/D2 succeed (e.g. a MeteoSwiss-side issue
         # specific to one model), and that distinction is exactly what
@@ -118,10 +145,32 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
             SOURCE_ICON_D2: SourceHealth(),
         }
 
+    def _secret_values(self) -> list[str]:
+        """Values that must never appear in a log line or diagnostics
+        record for this coordinator (v0.1.24, P1-03)."""
+        return [v for v in (self._api_key,) if v]
+
+    async def _get_persisted_fingerprint(self, source: str) -> Optional[str]:
+        """v0.1.23 fix (L-06): lazily loads this source's last-stored run
+        fingerprint from durable storage exactly once per coordinator
+        lifetime (i.e. once per HA restart/reload), then relies on the
+        in-memory cache for every subsequent cycle — avoiding a DB round
+        trip on every single poll while still surviving a restart."""
+        if source not in self._fingerprint_loaded_from_db:
+            persisted = await self.hass.async_add_executor_job(
+                self._db.get_provider_run_fingerprint, source
+            )
+            if persisted is not None:
+                self._last_run_fingerprint[source] = persisted
+            self._fingerprint_loaded_from_db.add(source)
+        return self._last_run_fingerprint.get(source)
+
     async def _async_update_data(self) -> dict[str, Any]:
         from .models import model_a
 
         results: dict[str, Any] = {}
+        # v0.1.24 (P1-01): tracked across the loop, raised only after it.
+        auth_failure: Optional[str] = None
         for source in (SOURCE_CH1, SOURCE_CH2, SOURCE_ICON_D2):
             start = time.monotonic()
             try:
@@ -136,13 +185,23 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
             except Exception as err:  # noqa: BLE001
                 duration_ms = (time.monotonic() - start) * 1000
                 kind = self.health[source].record_error(err, duration_ms=duration_ms)
+                # v0.1.24 fix (P1-03): aiohttp's exception str() includes
+                # the full request URL, and this client embeds the API
+                # key directly in that URL (&apikey=...). Logging the raw
+                # exception therefore wrote the real key into Home
+                # Assistant's core log at WARNING level, where it is
+                # readable by anyone with log access and gets included in
+                # pasted troubleshooting output.
+                safe_err = redact_secret_values(str(err), secrets=self._secret_values())
                 _LOGGER.warning(
-                    "Open-Meteo fetch failed for %s (%s error): %s", source, kind, err
+                    "Open-Meteo fetch failed for %s (%s error): %s", source, kind, safe_err
                 )
                 if self._diagnostics is not None:
                     self._diagnostics.record(
-                        source=source, event_type="poll_failure", detail=str(err)
+                        source=source, event_type="poll_failure", detail=safe_err
                     )
+                if kind == "auth":
+                    auth_failure = safe_err
                 continue
             duration_ms = (time.monotonic() - start) * 1000
             self.health[source].record_success(duration_ms=duration_ms)
@@ -160,7 +219,7 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
             # fingerprint of the actual returned series instead (see
             # open_meteo.py's parse_forecast_response), which is stable
             # across polls when nothing has actually changed upstream.
-            previous_fingerprint = self._last_run_fingerprint.get(source)
+            previous_fingerprint = await self._get_persisted_fingerprint(source)
             if (
                 previous_fingerprint is not None
                 and parsed.run_fingerprint == previous_fingerprint
@@ -168,7 +227,6 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                 # No new run since last successful fetch — nothing to store.
                 continue
             self._last_issued_at[source] = parsed.issued_at
-            self._last_run_fingerprint[source] = parsed.run_fingerprint
 
             if parsed.array_length_mismatches and self._diagnostics is not None:
                 # v0.1.19 fix: surface Open-Meteo array-length mismatches
@@ -220,10 +278,55 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                         "scheduled",
                     )
                 )
+            # v0.1.24 fix (P1-23): provider-independent physical-bounds
+            # and finite check, applied to every provider immediately
+            # before storage. See provider_validation.py.
+            rows, rejected = provider_validation.validate_forecast_rows(rows)
+            if rejected and self._diagnostics is not None:
+                self._diagnostics.record(
+                    source=source, event_type="validation_rejected",
+                    detail=f"{rejected} value(s) outside physical bounds",
+                )
+
             await self.hass.async_add_executor_job(
                 self._db.insert_forecast_snapshots_bulk, rows
             )
+
+            # v0.1.24 fix (P0-04), CRITICAL: the fingerprint is now
+            # recorded ONLY AFTER the rows are durably stored.
+            #
+            # It used to be set — both in the in-memory cache and in the
+            # database — before insert_forecast_snapshots_bulk ran. The
+            # external audit described this as a crash window, but the
+            # in-memory half makes it worse than that: an ordinary insert
+            # failure (a transient SQLite error, a full disk, a
+            # connection closed by the P0-03 unload race) was enough. The
+            # run was then treated as already-processed for the rest of
+            # the process lifetime, and permanently after restart because
+            # the fingerprint had also been persisted. A complete
+            # provider run vanished with no error surfaced anywhere.
+            #
+            # Ordering alone closes it: if the insert raises, neither the
+            # cache nor the database is updated, so the next cycle
+            # re-attempts the same run.
+            self._last_run_fingerprint[source] = parsed.run_fingerprint
+            if parsed.run_fingerprint is not None:
+                await self.hass.async_add_executor_job(
+                    self._db.set_provider_run_fingerprint, source, parsed.run_fingerprint
+                )
             results[source] = parsed
+
+        # v0.1.24 fix (P1-01): if EVERY source failed and at least one of
+        # those failures was an authentication problem, surface it as
+        # ConfigEntryAuthFailed so Home Assistant actually starts its
+        # reauth flow. Raised only after the loop and only when nothing
+        # usable came back, which preserves the existing per-source fault
+        # tolerance for the common case where just one paid-tier key is
+        # bad and the free sources still work.
+        if auth_failure is not None and not results:
+            raise ConfigEntryAuthFailed(
+                f"Open-Meteo authentication failed: {auth_failure}"
+            ) from None
         return results
 
 
@@ -260,6 +363,9 @@ class SrfCoordinator(DataUpdateCoordinator):
         self.health = SourceHealth()
 
     async def _async_update_data(self) -> list[Any]:
+        from .clients.srf import SrfPermanentError
+        from .fingerprint import fingerprint_points
+
         start = time.monotonic()
         if self._diagnostics is not None:
             self._diagnostics.record(source="srf", event_type="poll_start", detail="polling")
@@ -277,14 +383,31 @@ class SrfCoordinator(DataUpdateCoordinator):
                     # v0.1.18: the confirmed-working v2/forecastpoint
                     # endpoint is now the primary fetch — genuine hourly
                     # data, not just daily. Falls back to the old
-                    # daily-only endpoint below if this fails for any
-                    # reason; better to have some data than none, and SRF's
-                    # API has surprised this project enough times that a
-                    # graceful fallback is worth keeping rather than
-                    # removing the old code path entirely.
+                    # daily-only endpoint below if this fails for a
+                    # TRANSIENT reason; better to have some data than
+                    # none, and SRF's API has surprised this project
+                    # enough times that a graceful fallback is worth
+                    # keeping rather than removing the old code path
+                    # entirely.
                     points = await self._client.async_fetch_forecastpoint(
                         latitude=self._latitude, longitude=self._longitude
                     )
+                except SrfPermanentError:
+                    # v0.1.23 fix (L-11): a permanent 4xx (account/plan
+                    # restriction, bad request, etc.) is NOT
+                    # fallback-eligible — the daily endpoint uses the
+                    # same auth and the same account, so it has no
+                    # reason to succeed where the primary endpoint was
+                    # permanently rejected. Falling back here used to
+                    # mean every single poll wasted a second request on
+                    # an endpoint that structurally cannot produce a
+                    # usable "temperature" measurement anyway (see
+                    # clients/srf.py's fallback docstring), while hiding
+                    # the real, permanent cause behind what looked like
+                    # ordinary degraded-but-functioning operation.
+                    # Re-raised as-is; the outer except below classifies
+                    # and records it same as any other failure.
+                    raise
                 except Exception as primary_err:  # noqa: BLE001
                     _LOGGER.warning(
                         "SRF v2/forecastpoint fetch failed, falling back to "
@@ -322,30 +445,92 @@ class SrfCoordinator(DataUpdateCoordinator):
                     detail=f"{kind} error: {err}",
                 )
             if kind == "auth":
-                # This is the "API key expired" case specifically — surface
-                # it distinctly rather than let it look like an ordinary
-                # transient fetch failure, since retrying won't fix it.
+                # v0.1.24 fix (P1-01): this branch used to only LOG, then
+                # fall through to the generic UpdateFailed below — which
+                # Home Assistant's config-entry framework does not
+                # recognise as an authentication problem, so no reauth
+                # flow was ever offered and the integration degraded
+                # silently and indefinitely on a revoked or rotated key.
+                #
+                # Note on the audit's stated evidence: it claimed the
+                # UpdateFailed wrapper hid the HTTP status from
+                # classify_exception. That is not the case —
+                # health.record_error(err) above runs on the ORIGINAL
+                # exception, so classification and diagnostics were
+                # always correct. The only thing missing was the raise
+                # Home Assistant actually reacts to.
+                #
+                # `from None` rather than `from err` (P1-03): the
+                # original exception's str() can contain a credential,
+                # and __cause__ would resurface it in any logged
+                # traceback regardless of what this message says.
                 _LOGGER.error(
                     "SRF authentication failed — credentials likely need "
                     "to be re-entered (reauth flow): %s",
                     err,
                 )
-            raise UpdateFailed(f"SRF fetch failed ({kind} error): {err}") from err
+                raise ConfigEntryAuthFailed(
+                    f"SRF authentication failed ({kind} error)"
+                ) from None
+            elif isinstance(err, SrfPermanentError):
+                _LOGGER.error(
+                    "SRF request permanently rejected (HTTP %d) — not an "
+                    "auth failure, but not transient either. See the error "
+                    "detail for the likely account/API-plan cause: %s",
+                    err.status,
+                    err,
+                )
+            raise UpdateFailed(f"SRF fetch failed ({kind} error): {err}") from None
         duration_ms = (time.monotonic() - start) * 1000
         self.health.record_success(duration_ms=duration_ms)
+
+        # v0.1.23 fix (L-04's practical concern): dedupe against the
+        # persisted content fingerprint of the last successfully stored
+        # SRF run, same mechanism as Open-Meteo (L-06) and Meteoblue
+        # (L-05) — see fingerprint.py's module docstring. An unchanged
+        # SRF response (e.g. two polls landing on the same underlying
+        # SRF model run within the 45-minute poll interval) no longer
+        # creates a duplicate set of forecast_snapshots training rows.
+        run_fingerprint = fingerprint_points(points)
+        previous_fingerprint = await self.hass.async_add_executor_job(
+            self._db.get_provider_run_fingerprint, "srf"
+        )
+        is_duplicate_run = points and run_fingerprint == previous_fingerprint
         if self._diagnostics is not None:
             self._diagnostics.record(
                 source="srf", event_type="poll_success",
-                detail=f"{len(points)} points" + (" (fallback endpoint)" if used_fallback else ""),
-                extra={"point_count": len(points), "used_fallback": used_fallback},
+                detail=(
+                    f"{len(points)} points"
+                    + (" (fallback endpoint)" if used_fallback else "")
+                    + (" (duplicate run, not stored)" if is_duplicate_run else "")
+                ),
+                extra={
+                    "point_count": len(points),
+                    "used_fallback": used_fallback,
+                    "duplicate_run": is_duplicate_run,
+                },
             )
+
+        if is_duplicate_run:
+            return points
 
         now_iso = datetime.now(timezone.utc).isoformat()
         rows = [
             ("srf", now_iso, p.valid_at.isoformat(), p.variable, p.value, "scheduled")
             for p in points
         ]
+        # v0.1.24 (P1-23): shared physical-bounds validation.
+        rows, rejected = provider_validation.validate_forecast_rows(rows)
+        if rejected and self._diagnostics is not None:
+            self._diagnostics.record(
+                source="srf", event_type="validation_rejected",
+                detail=f"{rejected} value(s) outside physical bounds",
+            )
         await self.hass.async_add_executor_job(self._db.insert_forecast_snapshots_bulk, rows)
+        if points:
+            await self.hass.async_add_executor_job(
+                self._db.set_provider_run_fingerprint, "srf", run_fingerprint
+            )
         return points
 
 
@@ -379,16 +564,93 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
         self._latitude = latitude
         self._longitude = longitude
         self._diagnostics = diagnostics
+        # v0.1.24 (P1-03): see OpenMeteoCoordinator.
+        self._api_key = api_key
         self._client = MeteoblueClient(async_get_clientsession(hass), api_key)
+        # v0.1.23 fix (L-08): these three are still constructed with
+        # empty/default in-memory state here — that part is unchanged and
+        # intentional (constructing them doesn't require I/O). What
+        # changed is that _async_load_persisted_state_if_needed() below
+        # now overlays any DB-persisted state onto them once per
+        # coordinator lifetime, so a restart no longer silently resets a
+        # same-day bonus-call count or forgets an already-serviced
+        # scheduled slot.
         self._bonus_tracker = BonusCallTracker()
         self._last_scheduled_call_hour: Optional[datetime] = None
+        # v0.1.24 fix (P1-09): tracks the last ATTEMPT, success or
+        # failure, separately from the success-only marker above.
+        # _last_scheduled_call_hour was only ever set on success, so a
+        # failing scheduled call re-entered the call path on every
+        # 5-minute poll for the rest of that hour — up to ~12 attempts,
+        # each spending a real API credit against the annual ceiling.
+        self._last_scheduled_attempt_at: Optional[datetime] = None
+        # v0.1.24 fix (P1-06): meteoblue had per-day and per-event caps
+        # but nothing bounding the annual total. Reuses the
+        # AnnualCallBudget class already built for Meteonomiqs rather
+        # than growing a second implementation of the same idea.
+        self._annual_budget = AnnualCallBudget(
+            max_calls_per_year=METEOBLUE_ANNUAL_CALL_BUDGET
+        )
+        self._state_loaded_from_db = False
         self.health = SourceHealth()
+
+    async def _async_load_persisted_state_if_needed(self) -> None:
+        """v0.1.23 fix (L-08): loads bonus-tracker and last-scheduled-hour
+        state from durable storage exactly once per coordinator lifetime
+        (i.e. once per HA restart/reload). Previously both of these lived
+        only as plain instance attributes — reset to their empty defaults
+        on every restart — meaning a restart could forget same-day bonus
+        usage already spent (letting the daily allowance be exceeded
+        across a reload) and forget the already-serviced scheduled slot
+        (risking a duplicate provider call for the same slot right after
+        the reload)."""
+        if self._state_loaded_from_db:
+            return
+        bonus_state = await self.hass.async_add_executor_job(
+            self._db.get_bonus_call_tracker_state, "meteoblue"
+        )
+        if bonus_state is not None:
+            self._bonus_tracker = BonusCallTracker.from_state(bonus_state)
+        # v0.1.24 (P1-06): restore the new annual budget the same way.
+        annual_state = await self.hass.async_add_executor_job(
+            self._db.get_annual_call_budget_state, "meteoblue"
+        )
+        if annual_state is not None:
+            self._annual_budget.load_state(annual_state)
+        last_hour_iso = await self.hass.async_add_executor_job(
+            self._db.get_last_scheduled_call_hour, "meteoblue"
+        )
+        if last_hour_iso is not None:
+            self._last_scheduled_call_hour = datetime.fromisoformat(last_hour_iso)
+        self._state_loaded_from_db = True
+
+    def _secret_values(self) -> list[str]:
+        """v0.1.24 (P1-03) — see OpenMeteoCoordinator._secret_values."""
+        return [v for v in (self._api_key,) if v]
+
+    async def _async_persist_annual_budget_state(self) -> None:
+        """v0.1.24 (P1-06): persist the annual counter the same way the
+        bonus tracker already is, so it survives restarts (the L-07 fix
+        applied to meteoblue's new budget)."""
+        state = self._annual_budget.to_state()
+        await self.hass.async_add_executor_job(
+            self._db.set_annual_call_budget_state,
+            "meteoblue",
+            state["year"],
+            state["calls_used"],
+        )
+
+    async def _async_persist_bonus_tracker_state(self) -> None:
+        await self.hass.async_add_executor_job(
+            self._db.set_bonus_call_tracker_state, "meteoblue", self._bonus_tracker.to_state()
+        )
 
     async def async_request_bonus_call(self) -> bool:
         """Called by the cross-model trigger (see ModelBCoordinator). Returns
         True if a bonus call was actually made, False if the daily
         allowance was already used.
         """
+        await self._async_load_persisted_state_if_needed()
         today = datetime.now(timezone.utc).date()
         # v0.1.15 fix: reserves the slot atomically before the fetch, not
         # after — the original race window was specifically the await
@@ -400,6 +662,11 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
         # calling coordinator's own overlap protection) this path is.
         if not self._bonus_tracker.try_use_bonus_call(today=today):
             return False
+        # v0.1.23 fix (L-08): persist immediately after reserving the
+        # slot, not just in memory — a restart between this point and the
+        # next scheduled poll must not forget that this call already
+        # counted against today's allowance.
+        await self._async_persist_bonus_tracker_state()
         await self._async_fetch_and_store(trigger_reason="storm_trigger")
         return True
 
@@ -412,11 +679,26 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
                 latitude=self._latitude, longitude=self._longitude
             )
         self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+
+        # v0.1.23 fix (L-05): meteoblue previously had NO dedup mechanism
+        # at all — every scheduled or bonus poll was inserted
+        # unconditionally, even if the upstream model run hadn't actually
+        # changed. Same persisted-fingerprint mechanism as Open-Meteo
+        # (L-06) and SRF (L-04's practical fix), see fingerprint.py.
+        previous_fingerprint = await self.hass.async_add_executor_job(
+            self._db.get_provider_run_fingerprint, "meteoblue"
+        )
+        is_duplicate_run = bool(parsed.points) and parsed.run_fingerprint == previous_fingerprint
         if self._diagnostics is not None:
             self._diagnostics.record(
                 source="meteoblue", event_type="poll_success",
-                detail=f"{len(parsed.points)} points ({trigger_reason})",
+                detail=(
+                    f"{len(parsed.points)} points ({trigger_reason})"
+                    + (" (duplicate run, not stored)" if is_duplicate_run else "")
+                ),
             )
+        if is_duplicate_run:
+            return
         rows = [
             (
                 "meteoblue",
@@ -428,7 +710,36 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
             )
             for p in parsed.points
         ]
+        # v0.1.24 fix (P1-24): surface an array-length mismatch instead
+        # of letting zip() truncate silently. Open-Meteo has done this
+        # since v0.1.19; meteoblue had no equivalent.
+        if parsed.array_length_mismatches:
+            _LOGGER.warning(
+                "meteoblue: hourly array length mismatch for %s — the longer "
+                "array's tail was truncated (see clients/meteoblue.py)",
+                ", ".join(parsed.array_length_mismatches),
+            )
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="meteoblue", event_type="parse_warning",
+                    detail=(
+                        "hourly array length mismatch for: "
+                        + ", ".join(parsed.array_length_mismatches)
+                    ),
+                )
+
+        # v0.1.24 (P1-23): shared physical-bounds validation.
+        rows, rejected = provider_validation.validate_forecast_rows(rows)
+        if rejected and self._diagnostics is not None:
+            self._diagnostics.record(
+                source="meteoblue", event_type="validation_rejected",
+                detail=f"{rejected} value(s) outside physical bounds",
+            )
         await self.hass.async_add_executor_job(self._db.insert_forecast_snapshots_bulk, rows)
+        if parsed.points and parsed.run_fingerprint is not None:
+            await self.hass.async_add_executor_job(
+                self._db.set_provider_run_fingerprint, "meteoblue", parsed.run_fingerprint
+            )
 
     async def _async_update_data(self) -> None:
         # v0.1.6 fix: this used hardcoded UTC ("local_dt" was a misnomer —
@@ -439,21 +750,59 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
         # meteoblue hadn't polled yet at a time it should have. Now uses
         # HA's own configured-timezone "now" helper, the standard pattern
         # for this rather than assuming UTC equals local time.
+        await self._async_load_persisted_state_if_needed()
         local_dt = dt_util.now()
         if not should_fire_scheduled_call(
             local_dt=local_dt, last_scheduled_call_hour=self._last_scheduled_call_hour
         ):
             return None
+        # v0.1.24 fix (P1-09): bound retry frequency within a slot that
+        # is still unserviced because the last attempt failed.
+        if self._last_scheduled_attempt_at is not None:
+            since_attempt = local_dt - self._last_scheduled_attempt_at
+            if since_attempt < METEOBLUE_SCHEDULED_RETRY_COOLDOWN:
+                return None
+
+        # v0.1.24 fix (P1-06): reserve against the annual budget before
+        # spending a credit. Deliberately a quiet skip rather than an
+        # UpdateFailed — an exhausted annual budget is a designed
+        # operating state, not a fault, and this matches the style of the
+        # "not a scheduled slot yet" early return directly above.
+        if not self._annual_budget.try_call(today=local_dt.date()):
+            _LOGGER.warning(
+                "meteoblue annual call budget exhausted (%s calls/year); "
+                "skipping this scheduled slot",
+                METEOBLUE_ANNUAL_CALL_BUDGET,
+            )
+            return None
+        await self._async_persist_annual_budget_state()
+
+        self._last_scheduled_attempt_at = local_dt
         try:
             await self._async_fetch_and_store(trigger_reason="scheduled")
             self._last_scheduled_call_hour = local_dt
+            # v0.1.23 fix (L-08): persist the serviced slot immediately —
+            # previously only held in memory, so a restart right after a
+            # successful scheduled call could forget it happened and fire
+            # a duplicate call for the same slot.
+            await self.hass.async_add_executor_job(
+                self._db.set_last_scheduled_call_hour, "meteoblue", local_dt.isoformat()
+            )
         except Exception as err:  # noqa: BLE001
-            self.health.record_error(err)
+            kind = self.health.record_error(err)
+            # v0.1.24 (P1-03): the meteoblue client also embeds its key in
+            # the request URL, so raw exception text can carry it.
+            safe_err = redact_secret_values(str(err), secrets=self._secret_values())
             if self._diagnostics is not None:
                 self._diagnostics.record(
-                    source="meteoblue", event_type="poll_failure", detail=str(err)
+                    source="meteoblue", event_type="poll_failure", detail=safe_err
                 )
-            raise UpdateFailed(f"meteoblue fetch failed: {err}") from err
+            # v0.1.24 fix (P1-01): meteoblue had no auth branch at all.
+            if kind == "auth":
+                raise ConfigEntryAuthFailed(
+                    "meteoblue authentication failed"
+                ) from None
+            raise UpdateFailed(f"meteoblue fetch failed: {safe_err}") from None
         return None
 
 
@@ -555,6 +904,8 @@ class StationCoordinator(DataUpdateCoordinator):
         humidity_entity: str,
         pressure_entity: str,
         *,
+        pressure_is_sea_level: bool = True,
+        elevation_m: Optional[float] = None,
         diagnostics: Any = None,
     ) -> None:
         super().__init__(
@@ -568,20 +919,87 @@ class StationCoordinator(DataUpdateCoordinator):
         self._humidity_entity = humidity_entity
         self._pressure_entity = pressure_entity
         self._diagnostics = diagnostics
+        # v0.1.24 (P1-22): see _async_update_data.
+        self._pressure_is_sea_level = pressure_is_sea_level
+        self._elevation_m = elevation_m
 
-    def _read_float_state(self, entity_id: str) -> Optional[float]:
+    def _read_float_state(
+        self, entity_id: str, measurement_kind: str
+    ) -> Optional[float]:
+        """Read one station entity, in the units the models expect.
+
+        **v0.1.24 fix (P1-20)**: float() happily parses "nan", "inf",
+        "-inf" and "Infinity" without raising, so those sailed straight
+        through the old `except ValueError` into station_observations and
+        from there into Model A's EMA and Model B's tendency math. A
+        single non-finite sample permanently poisons an EMA bucket —
+        there is no mechanism for an EMA to forget a value it has already
+        absorbed. Treated the same as "unknown"/"unavailable".
+
+        **v0.1.24 fix (P1-21)**: the reading is now converted from the
+        entity's own declared unit. Previously the raw number was used
+        as-is, so a Fahrenheit or inHg sensor produced numerically
+        plausible but badly wrong values which Model A would faithfully
+        learn as provider bias. An unrecognised unit yields None rather
+        than a guess — see unit_conversion.py.
+        """
         state = self.hass.states.get(entity_id)
         if state is None or state.state in ("unknown", "unavailable"):
             return None
         try:
-            return float(state.state)
-        except ValueError:
+            value = float(state.state)
+        except (ValueError, TypeError):
+            return None
+        if not math.isfinite(value):
             return None
 
+        unit = None
+        try:
+            unit = state.attributes.get("unit_of_measurement")
+        except AttributeError:  # pragma: no cover - defensive
+            unit = None
+
+        if measurement_kind == "temperature":
+            return unit_conversion.convert_temperature_to_celsius(value, unit)
+        if measurement_kind == "pressure":
+            return unit_conversion.convert_pressure_to_hpa(value, unit)
+        if measurement_kind == "humidity":
+            return unit_conversion.convert_humidity_to_percent(value, unit)
+        return value
+
     async def _async_update_data(self) -> dict[str, Optional[float]]:
-        temperature = self._read_float_state(self._temp_entity)
-        humidity = self._read_float_state(self._humidity_entity)
-        pressure = self._read_float_state(self._pressure_entity)
+        temperature = self._read_float_state(self._temp_entity, "temperature")
+        humidity = self._read_float_state(self._humidity_entity, "humidity")
+        pressure = self._read_float_state(self._pressure_entity, "pressure")
+
+        # v0.1.24 fix (P1-22): reduce a station-level pressure reading to
+        # mean sea level, so it is comparable with every provider's
+        # forecast pressure (all of which are MSL — Open-Meteo's
+        # pressure_msl, meteoblue's sealevelpressure). Without this,
+        # Model A absorbs a constant elevation-dependent offset as
+        # "bias".
+        #
+        # Gated on an explicit user answer rather than a heuristic
+        # because it genuinely cannot be inferred: Netatmo, the reference
+        # station here, publishes BOTH a sea-level-normalised "Pressure"
+        # and a raw "AbsolutePressure", and Home Assistant gives both the
+        # same device class. See CONF_STATION_PRESSURE_IS_SEA_LEVEL.
+        if pressure is not None and not self._pressure_is_sea_level:
+            pressure = unit_conversion.reduce_station_pressure_to_sea_level(
+                pressure, self._elevation_m, temperature
+            )
+
+        # v0.1.24 fix (IND-02): do not write a row when every value is
+        # missing. compute_tendency_features used to take samples[-1]
+        # wholesale, so one all-None row at the end of the window blanked
+        # all nine tendency features and dropped the storm score to zero
+        # despite an hour of good data sitting behind it. model_b.py now
+        # resolves its endpoints per measurement, which is the real fix;
+        # not writing empty rows in the first place keeps the table
+        # honest and reduces volume against the retention window.
+        if temperature is None and humidity is None and pressure is None:
+            return {"temperature": None, "humidity": None, "pressure": None}
+
         now_iso = datetime.now(timezone.utc).isoformat()
         # v0.1.14: same defense-in-depth backstop as every other
         # coordinator now has.
@@ -613,6 +1031,7 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
     def __init__(
         self,
         hass: HomeAssistant,
+        db: SwissWeatherDB,
         latitude: float,
         longitude: float,
         api_key: str,
@@ -625,6 +1044,7 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
             name="swissweather_fusion_meteonomiqs",
             update_interval=self.CHECK_INTERVAL,
         )
+        self._db = db
         self._latitude = latitude
         self._longitude = longitude
         self._diagnostics = diagnostics
@@ -639,13 +1059,89 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         self._last_successful_call_date: Optional[date] = None
         self.last_nowcast: Optional[Any] = None
         self.last_hourly_forecast: Optional[list[Any]] = None
+        # v0.1.23 fix (L-07, and the same L-08 bug class applied here
+        # too): _budget and _bonus_tracker above are both still
+        # constructed with empty in-memory state — that part is
+        # unchanged. _async_load_persisted_state_if_needed() below
+        # overlays DB-persisted state onto them once per coordinator
+        # lifetime, so a restart no longer resets the annual call counter
+        # (L-07) or the same-day bonus-call allowance (L-08's bug class,
+        # previously only fixed for meteoblue's own tracker).
+        self._state_loaded_from_db = False
         self.health = SourceHealth()
+
+    async def _async_load_persisted_state_if_needed(self) -> None:
+        if self._state_loaded_from_db:
+            return
+        budget_state = await self.hass.async_add_executor_job(
+            self._db.get_annual_call_budget_state, "meteonomiqs"
+        )
+        if budget_state is not None:
+            self._budget.load_state(budget_state)
+        bonus_state = await self.hass.async_add_executor_job(
+            self._db.get_bonus_call_tracker_state, "meteonomiqs"
+        )
+        if bonus_state is not None:
+            self._bonus_tracker = BonusCallTracker.from_state(
+                bonus_state, max_calls_per_day=METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT
+            )
+        # v0.1.24 fix (P1-08): restore the daily-call marker too. Every
+        # other piece of this coordinator's restart state was already
+        # persisted by the L-07/L-08 fixes; this one was missed, so a
+        # same-day restart forgot that today had been serviced and spent
+        # an extra call.
+        last_call_iso = await self.hass.async_add_executor_job(
+            self._db.get_meteonomiqs_last_successful_call_date
+        )
+        if last_call_iso:
+            try:
+                self._last_successful_call_date = date.fromisoformat(last_call_iso)
+            except ValueError:
+                # Same philosophy as P2-02's _safe_parse_meta: a corrupt
+                # value must not stop this coordinator from starting.
+                _LOGGER.warning(
+                    "Ignoring unparseable persisted Meteonomiqs call date %r",
+                    last_call_iso,
+                )
+        self._state_loaded_from_db = True
+
+    async def _async_persist_budget_and_bonus_state(self) -> None:
+        """Called after every successful call that mutates either
+        tracker, so the persisted state never lags behind what's actually
+        been spent — the whole point of L-07/L-08 is that these numbers
+        must survive a restart happening at ANY point, not just at a
+        convenient checkpoint."""
+        state = self._budget.to_state()
+        await self.hass.async_add_executor_job(
+            self._db.set_annual_call_budget_state,
+            "meteonomiqs",
+            state["year"],
+            state["calls_used"],
+        )
+        await self.hass.async_add_executor_job(
+            self._db.set_bonus_call_tracker_state, "meteonomiqs", self._bonus_tracker.to_state()
+        )
+
+    async def _async_persist_last_successful_call_date(self, day: date) -> None:
+        """v0.1.24 fix (P1-08): persist the daily-call marker.
+
+        This was memory-only, so it reset to None on every restart and
+        the daily gate then failed to recognise a day that had already
+        been serviced — firing an unnecessary extra call against a
+        1000-calls/year budget after any same-day restart. During setup
+        or troubleshooting that can easily be several restarts in one
+        afternoon.
+        """
+        await self.hass.async_add_executor_job(
+            self._db.set_meteonomiqs_last_successful_call_date, day.isoformat()
+        )
 
     async def async_request_bonus_call(self) -> bool:
         """Cross-model trigger bonus call — always nowcast (the fast,
         radar-based signal), regardless of season, since this is about an
         immediate storm check, not the daily outlook the noon call gives.
         """
+        await self._async_load_persisted_state_if_needed()
         today = datetime.now(timezone.utc).date()
         # v0.1.17 fix: this used to only check the overall annual budget
         # (self._budget.can_call), with no per-day cap at all — confirmed
@@ -658,22 +1154,27 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         # it's even a question of remaining annual budget.
         if not self._bonus_tracker.can_use_bonus_call(today=today):
             return False
-        # v0.1.15: AnnualCallBudget.try_call() exists (added alongside
-        # BonusCallTracker.try_use_bonus_call() for the same TOCTOU fix),
-        # but is deliberately NOT used here — _async_fetch_nowcast below
-        # already calls self._budget.record_call() internally on success
-        # (shared with the regular daily-keepalive path), so reserving
-        # via try_call() here too would double-count every bonus call.
-        # This check remains a plain pre-filter, not a full atomic
-        # reservation — an acceptable, low-risk gap given how rarely this
-        # path fires and the overlap protection already provided by
-        # ModelBCoordinator being a single, non-reentrant coordinator.
-        if not self._budget.can_call(today=today):
+        # v0.1.24 fix (P1-07): this used to be a plain can_call()
+        # pre-filter, with the matching record_call() happening inside
+        # _async_fetch_nowcast AFTER an awaited HTTP call. Two paths share
+        # this same self._budget object — this bonus path and the
+        # independent daily keepalive path — so both could pass the check
+        # before either committed, and the real annual quota could be
+        # exceeded.
+        #
+        # The v0.1.15 comment that used to sit here argued try_call()
+        # would double-count, because the fetch recorded the call
+        # itself. That was true then; the fix is to move the accounting
+        # rather than keep the race. Reservation now happens exactly once,
+        # synchronously, at the caller, and record_call() has been removed
+        # from both fetch methods.
+        if not self._budget.try_call(today=today):
             _LOGGER.warning(
                 "Meteonomiqs annual budget exhausted; skipping bonus call"
             )
             return False
         self._bonus_tracker.record_bonus_call_used(today=today)
+        await self._async_persist_budget_and_bonus_state()
         await self._async_fetch_nowcast(today=today)
         return True
 
@@ -699,8 +1200,12 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
             self._diagnostics.record(
                 source="meteonomiqs", event_type="poll_success", detail="nowcast",
             )
-        self._budget.record_call(today=today)
+        # v0.1.24 (P1-07): budget reservation now happens exactly once at
+        # the caller, synchronously, before this awaited fetch — not here
+        # afterwards. See async_request_bonus_call and _async_update_data.
         self._last_successful_call_date = today
+        await self._async_persist_last_successful_call_date(today)
+        await self._async_persist_budget_and_bonus_state()
 
     async def _async_fetch_hourly_forecast(self, *, today: date) -> None:
         start = time.monotonic()
@@ -722,10 +1227,51 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
             self._diagnostics.record(
                 source="meteonomiqs", event_type="poll_success", detail="hourly_forecast",
             )
-        self._budget.record_call(today=today)
+        # v0.1.24 (P1-07): see _async_fetch_nowcast.
         self._last_successful_call_date = today
+        await self._async_persist_last_successful_call_date(today)
+        await self._async_persist_budget_and_bonus_state()
+
+        # v0.1.23 fix (own-review finding — "Meteonomiqs hourly forecast
+        # fetched but never used"): previously self.last_hourly_forecast
+        # above was the only place this data ever went — nothing read it
+        # again, despite this call spending real annual-budget quota. Now
+        # persisted into forecast_snapshots under variable names prefixed
+        # with METEONOMIQS_HOURLY_VARIABLE_PREFIX (see const.py's comment
+        # there for why the prefix matters: Meteonomiqs stays deliberately
+        # excluded from ALL_FORECAST_SOURCES, so these rows can never be
+        # picked up by Model A's blend, even by accident — this only makes
+        # the data durable and available for future use, it does not
+        # change any current scoring behavior).
+        if self.last_hourly_forecast:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            # HourlyForecastPoint is wide-format (one row per hour with
+            # three named fields), unlike the narrow variable/value shape
+            # every other client's forecast point uses — unpacked into
+            # three narrow forecast_snapshots rows per hour here.
+            rows = []
+            for point in self.last_hourly_forecast:
+                for suffix, value in (
+                    ("pressure", point.mean_sea_level_pressure),
+                    ("precip_sum", point.precipitation_sum_mm),
+                    ("precip_probability", point.precipitation_probability),
+                ):
+                    rows.append(
+                        (
+                            "meteonomiqs",
+                            now_iso,
+                            point.valid_at.isoformat(),
+                            f"{METEONOMIQS_HOURLY_VARIABLE_PREFIX}{suffix}",
+                            value,
+                            "scheduled",
+                        )
+                    )
+            await self.hass.async_add_executor_job(
+                self._db.insert_forecast_snapshots_bulk, rows
+            )
 
     async def _async_update_data(self) -> None:
+        await self._async_load_persisted_state_if_needed()
         # v0.1.15 fix: "local_now" used to be datetime.now(timezone.utc) —
         # the same class of bug already fixed for meteoblue in v0.1.6, but
         # never checked here too, caught by an outside code review. In
@@ -764,6 +1310,17 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
         in_forecast_season = local_now.month in METEONOMIQS_FORECAST_SEASON_MONTHS
         past_noon = local_now.hour >= METEONOMIQS_FORECAST_CALL_HOUR_LOCAL
 
+        # v0.1.24 fix (P1-07): the scheduled/keepalive path now reserves
+        # its own call too, since record_call() no longer happens inside
+        # the fetch methods. Deliberately record_call() and NOT
+        # try_call(): AnnualCallBudget's own class docstring states the
+        # keepalive must never be skipped just because bonus calls
+        # consumed the budget elsewhere — losing API access to
+        # inactivity-revocation is worse than a slightly tighter annual
+        # count. This preserves that documented design while still
+        # closing the accounting race, because the recording is now
+        # synchronous rather than after an awaited call.
+        self._budget.record_call(today=today)
         try:
             if in_forecast_season and past_noon:
                 await self._async_fetch_hourly_forecast(today=today)
@@ -782,7 +1339,24 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
             # data-fetch error elsewhere in this system. Deliberately not
             # re-raised: the next scheduled check today (or tomorrow) will
             # retry via the same daily-gate logic above.
+            #
+            # v0.1.24 fix (P1-01): with ONE exception. This block used to
+            # swallow every failure kind, including a revoked key — so
+            # the single condition this coordinator exists to prevent
+            # produced no user-visible signal whatsoever. Authentication
+            # failures are now re-raised as ConfigEntryAuthFailed so Home
+            # Assistant starts its reauth flow; every other kind still
+            # degrades silently, exactly as designed.
+            #
+            # classify_exception() is called directly rather than
+            # health.record_error(), which already ran earlier in this
+            # same call chain inside the fetch methods — calling it again
+            # here would double-count the failure in diagnostics.
             _LOGGER.error("Meteonomiqs keep-alive call failed: %s", err)
+            if classify_exception(err) == "auth":
+                raise ConfigEntryAuthFailed(
+                    "Meteonomiqs authentication failed"
+                ) from None
         return None
 
 
@@ -975,7 +1549,12 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                     "native_pressure": pressure,
                     "native_precipitation": precip,
                     "native_wind_speed": wind_speed,
-                    "condition": "rainy" if (precip or 0) > 0.1 else "sunny",
+                    # v0.1.24 (P2-10): shared mapping. Raw precip and the
+                    # hourly 0.1 mm threshold, matching this site's own
+                    # pre-existing behaviour.
+                    "condition": model_a.derive_condition(
+                        precip, temperature, humidity
+                    ),
                 }
             )
 
@@ -1046,7 +1625,13 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
     # to be permanent.
     RETRY_GIVE_UP_AGE = timedelta(hours=48)
 
-    def __init__(self, hass: HomeAssistant, db: SwissWeatherDB) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        db: SwissWeatherDB,
+        *,
+        reconcile_lock: Optional[asyncio.Lock] = None,
+    ) -> None:
         super().__init__(
             hass,
             _LOGGER,
@@ -1055,45 +1640,73 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         )
         self._db = db
         self.last_reconciled_count: int = 0
+        # v0.1.24 fix (P2-03 / P2-04): ONE lock, shared with the other
+        # coordinator that writes the same tables.
+        #
+        # Every SwissWeatherDB method takes self._lock individually, but
+        # reconciliation's logical read-modify-write spans several
+        # separate locked calls, and RetentionCoordinator can delete rows
+        # in between them. Per-statement locking does not make a
+        # multi-step read snapshot-consistent. A shared object rather
+        # than two independent locks is the whole point — two
+        # uncoordinated locks would serialize nothing against each other.
+        #
+        # Falls back to a private lock when none is injected, so each
+        # coordinator remains independently constructible in tests.
+        self._reconcile_lock = reconcile_lock or asyncio.Lock()
 
     async def _async_update_data(self) -> Optional[datetime]:
         # v0.1.14: same defense-in-depth backstop as every other
         # coordinator now has.
-        async with asyncio.timeout(120):
-            return await self.hass.async_add_executor_job(self._reconcile)
+        async with self._reconcile_lock:
+            async with asyncio.timeout(120):
+                return await self.hass.async_add_executor_job(self._reconcile)
 
     def _reconcile(self) -> datetime:
-        """Synchronous — only ever called via the executor job above."""
+        """Synchronous — only ever called via the executor job above.
+
+        v0.1.23 fix (L-01/L-02): rewritten around per-row
+        reconciliation_status instead of a single global watermark. See
+        SwissWeatherDB.get_pending_forecast_snapshots()/
+        mark_forecast_snapshots_status() for the storage-layer half of
+        this fix and the full rationale. The behavioral guarantee this
+        gives: a row is folded into bucket_stats at most once, ever
+        (fixes L-01's re-learning), and a row is never permanently
+        unreachable just because other rows near it were already
+        processed (fixes L-02's silently-dropped late arrivals).
+        """
         from .models import model_a
         from .storage.db import BucketKey
 
         now = model_a.utcnow()
-        watermark_str = self._db.get_reconciliation_watermark()
-        since = (
-            datetime.fromisoformat(watermark_str)
-            if watermark_str is not None
-            else now - self.INITIAL_LOOKBACK
-        )
-        since_iso = since.isoformat()
         until_iso = now.isoformat()
 
-        rows_to_reconcile = self._db.get_forecast_snapshots_to_reconcile(
-            since_ts=since_iso,
+        pending_rows = self._db.get_pending_forecast_snapshots(
             until_ts=until_iso,
             measurements=self.RECONCILIATION_MEASUREMENTS,
         )
-        if not rows_to_reconcile:
-            self._db.set_reconciliation_watermark(until_iso)
+        if not pending_rows:
             self.last_reconciled_count = 0
             return now
 
         # One station-observation query for the whole batch (padded by
         # the matching tolerance on each side), not one query per forecast
         # row — matches the batching approach already used elsewhere in
-        # this project (e.g. ModelABlendCoordinator).
+        # this project (e.g. ModelABlendCoordinator). The lower bound uses
+        # INITIAL_LOOKBACK as a safety margin: pending_rows could in
+        # principle span further back than "now - tolerance" if something
+        # was pending for a long time, but station_observations itself is
+        # purged on the same RetentionCoordinator schedule, so anything
+        # genuinely that old has no station data left to match against
+        # anyway — this bound just keeps the query itself bounded.
+        earliest_pending_valid_at = min(
+            datetime.fromisoformat(r["valid_at"]) for r in pending_rows
+        )
         tolerance = timedelta(minutes=model_a.RECONCILIATION_TOLERANCE_MINUTES)
+        lookback_floor = now - self.INITIAL_LOOKBACK - tolerance
+        station_query_start = max(earliest_pending_valid_at - tolerance, lookback_floor)
         station_rows = self._db.get_station_observations_between(
-            (since - tolerance).isoformat(), (now + tolerance).isoformat()
+            station_query_start.isoformat(), (now + tolerance).isoformat()
         )
         candidates_by_measurement: dict[str, list[tuple[datetime, Any]]] = {
             "temperature": [],
@@ -1107,19 +1720,21 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
             candidates_by_measurement["pressure"].append((ts, row["pressure"]))
 
         reconciled_count = 0
-        # v0.1.15 fix: tracks the earliest valid_at among rows that
-        # couldn't be matched to a station reading but are still young
-        # enough to be worth retrying (see RETRY_GIVE_UP_AGE above) — the
-        # watermark below only advances up to this point, not
-        # unconditionally to "now", so these rows get another chance on
-        # the next cycle instead of being silently dropped forever.
-        earliest_retry_valid_at: Optional[datetime] = None
-        for fs_row in rows_to_reconcile:
+        reconciled_ids: list[int] = []
+        skipped_ids: list[int] = []
+        # v0.1.24 (P0-01): accumulated during the loop, applied atomically
+        # at the end. bucket_updates is keyed so that repeated hits on one
+        # bucket within a batch collapse to a single final write;
+        # pending_bucket_state carries the in-flight EMA state those
+        # repeats must build on.
+        bucket_updates: dict[BucketKey, tuple] = {}
+        pending_bucket_state: dict[BucketKey, tuple[float, float, int]] = {}
+        for fs_row in pending_rows:
             if fs_row["value"] is None:
                 # The stored forecast value itself is null — this can
                 # never change no matter how many times it's retried, so
-                # there's nothing to gain by holding the watermark back
-                # for it specifically.
+                # there's nothing to gain by leaving it 'pending' forever.
+                skipped_ids.append(fs_row["id"])
                 continue
             measurement = fs_row["variable"]
             valid_at = datetime.fromisoformat(fs_row["valid_at"])
@@ -1129,14 +1744,15 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
                 target=valid_at, candidates=candidates_by_measurement[measurement]
             )
             if actual_value is None:
-                if (now - valid_at) < self.RETRY_GIVE_UP_AGE:
-                    if earliest_retry_valid_at is None or valid_at < earliest_retry_valid_at:
-                        earliest_retry_valid_at = valid_at
-                # else: old enough that this gap is treated as permanent
-                # (e.g. a genuine, lasting station outage) — let the
-                # watermark advance past it rather than holding the retry
-                # window open forever for something that will never
-                # resolve.
+                if (now - valid_at) >= self.RETRY_GIVE_UP_AGE:
+                    # Old enough that this gap is treated as permanent
+                    # (e.g. a genuine, lasting station outage) — mark it
+                    # 'skipped' so it stops being selected every cycle.
+                    skipped_ids.append(fs_row["id"])
+                # else: still young enough to retry — leave it 'pending'
+                # and it will be picked up again next cycle, same as
+                # every other still-pending row (no separate watermark
+                # bookkeeping needed: per-row status IS the retry state).
                 continue
 
             key = BucketKey(
@@ -1146,13 +1762,29 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
                 source=fs_row["source"],
                 measurement=measurement,
             )
-            existing = self._db.get_bucket_stats(key)
-            if existing is None:
-                previous_bias, previous_abs_error, previous_sample_count = 0.0, 0.0, 0
+            # v0.1.24 fix (P0-01): consult this batch's own in-flight
+            # results before falling back to the database.
+            #
+            # A naive "defer every write, commit once" implementation
+            # breaks same-batch, same-bucket sequencing: two rows landing
+            # in the same bucket_stats key within one reconciliation
+            # batch must build on each other's result, not both read the
+            # same stale pre-batch state and then have one silently
+            # overwrite the other. Since a bucket is
+            # (hour, season, lead_time, source, measurement) and a batch
+            # routinely contains many hours of one source's forecast,
+            # this is a common case rather than a corner one.
+            pending_state = pending_bucket_state.get(key)
+            if pending_state is not None:
+                previous_bias, previous_abs_error, previous_sample_count = pending_state
             else:
-                previous_bias = existing.ema_bias
-                previous_abs_error = existing.ema_abs_error
-                previous_sample_count = existing.sample_count
+                existing = self._db.get_bucket_stats(key)
+                if existing is None:
+                    previous_bias, previous_abs_error, previous_sample_count = 0.0, 0.0, 0
+                else:
+                    previous_bias = existing.ema_bias
+                    previous_abs_error = existing.ema_abs_error
+                    previous_sample_count = existing.sample_count
 
             result = model_a.update_bucket_ema(
                 previous_bias=previous_bias,
@@ -1162,43 +1794,52 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
                 actual_value=actual_value,
                 lead_time_bucket=key.lead_time_bucket,
             )
-            self._db.upsert_bucket_stats(
+            pending_bucket_state[key] = (
+                result.ema_bias,
+                result.ema_abs_error,
+                result.sample_count,
+            )
+            bucket_updates[key] = (
                 key,
-                ema_bias=result.ema_bias,
-                ema_abs_error=result.ema_abs_error,
-                ema_weight=result.ema_weight,
-                sample_count=result.sample_count,
-                last_updated=now.isoformat(),
+                result.ema_bias,
+                result.ema_abs_error,
+                result.ema_weight,
+                result.sample_count,
+                now.isoformat(),
             )
             reconciled_count += 1
+            reconciled_ids.append(fs_row["id"])
 
-        # v0.1.15 fix: cap the new watermark at the earliest still-retryable
-        # skipped row's valid_at, if there is one — otherwise advance fully
-        # to now, same as before. See the loop above and RETRY_GIVE_UP_AGE.
+        # v0.1.24 fix (P0-01), CRITICAL: every EMA write and every status
+        # transition for this cycle is applied in ONE transaction.
         #
-        # v0.1.19 fix: the v0.1.15 fix capped the watermark AT the retry
-        # row's exact valid_at, but get_forecast_snapshots_to_reconcile
-        # queries with `valid_at > since_ts` (strict). That meant the very
-        # row the cap was meant to protect became the new lower bound and
-        # was then excluded by the strict inequality on the *next* pass —
-        # so it silently got zero retries rather than the intended chances
-        # up to RETRY_GIVE_UP_AGE. Confirmed by direct simulation: a row
-        # set as the watermark is provably ineligible on the very next
-        # query. Backing off by one microsecond keeps the row on the right
-        # side of the strict inequality without re-including anything that
-        # was already fully reconciled before it (nothing can legitimately
-        # sit in that 1-microsecond gap).
-        new_watermark = (
-            (earliest_retry_valid_at - timedelta(microseconds=1)).isoformat()
-            if earliest_retry_valid_at is not None
-            else until_iso
+        # Previously upsert_bucket_stats() committed per row inside the
+        # loop above, while the two mark_forecast_snapshots_status()
+        # calls ran once at the end. A crash between those two points
+        # left bucket_stats already updated for rows still marked
+        # 'pending' — so the next cycle re-selected them and folded them
+        # into the EMA a second time. That is the same double-counting
+        # the v0.1.23 reconciliation_status redesign was built to
+        # eliminate, arriving through a crash boundary instead of through
+        # watermark arithmetic. An EMA cannot un-absorb a duplicated
+        # sample, so there is no recovery after the fact.
+        #
+        # This is still the point of no return: once a row's status
+        # leaves 'pending', get_pending_forecast_snapshots() can never
+        # select it again. The difference is that now it leaves 'pending'
+        # if and only if its learning was also committed.
+        self._db.apply_reconciliation_batch(
+            list(bucket_updates.values()), reconciled_ids, skipped_ids
         )
-        self._db.set_reconciliation_watermark(new_watermark)
+
         self.last_reconciled_count = reconciled_count
         _LOGGER.debug(
-            "Model A learning: reconciled %d of %d due forecast snapshots",
+            "Model A learning: reconciled %d of %d pending forecast snapshots "
+            "(%d newly skipped, %d still pending for retry)",
             reconciled_count,
-            len(rows_to_reconcile),
+            len(pending_rows),
+            len(skipped_ids),
+            len(pending_rows) - reconciled_count - len(skipped_ids),
         )
         return now
 
@@ -1232,6 +1873,28 @@ class ModelBCoordinator(DataUpdateCoordinator):
         self._meteonomiqs_coordinator = meteonomiqs_coordinator
         self._previous_probability = 0.0
         self.current_probability = 0.0
+        # v0.1.23 fix (L-09): _previous_probability above is still
+        # initialized to 0.0 here — that part is unchanged. What's new is
+        # _async_load_persisted_state_if_needed() below, called once at
+        # the top of the first post-(re)start scoring cycle, which
+        # overlays the last-persisted probability if one exists. Without
+        # this, a restart happening while a storm probability was already
+        # elevated above the crossing threshold would reset
+        # _previous_probability to 0.0, and the very next fresh score
+        # (also elevated) would look like a brand-new upward crossing —
+        # firing an unwarranted bonus call for a "crossing" that never
+        # actually happened, just a restart.
+        self._state_loaded_from_db = False
+
+    async def _async_load_persisted_state_if_needed(self) -> None:
+        if self._state_loaded_from_db:
+            return
+        persisted = await self.hass.async_add_executor_job(
+            self._db.get_model_b_previous_probability
+        )
+        if persisted is not None:
+            self._previous_probability = persisted
+        self._state_loaded_from_db = True
 
     async def _async_update_data(self) -> float:
         # v0.1.14: same defense-in-depth backstop as every other
@@ -1240,6 +1903,7 @@ class ModelBCoordinator(DataUpdateCoordinator):
         # independently timed-out, but bounding the whole cycle here too
         # is cheap insurance).
         async with asyncio.timeout(90):
+            await self._async_load_persisted_state_if_needed()
             return await self._async_update_data_inner()
 
     async def _async_update_data_inner(self) -> float:
@@ -1247,19 +1911,51 @@ class ModelBCoordinator(DataUpdateCoordinator):
             self._db.get_station_observations_since,
             (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
         )
-        samples = [
-            model_b.StationSample(
-                ts_epoch_seconds=datetime.fromisoformat(r["ts"]).timestamp(),
-                temperature=r["temperature"],
-                humidity=r["humidity"],
-                pressure=r["pressure"],
+        now = datetime.now(timezone.utc)
+        # v0.1.24 fix (P2-09): get_station_observations_since bounds only
+        # the LOWER time edge, so nothing rejected a sample stamped in the
+        # future — from clock skew, or a restored/replayed state. A
+        # future-dated row becomes the window endpoint and silently
+        # distorts every tendency delta.
+        samples = []
+        future_dated = 0
+        for r in rows:
+            try:
+                ts = datetime.fromisoformat(r["ts"])
+            except (TypeError, ValueError):
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            if ts > now:
+                future_dated += 1
+                continue
+            samples.append(
+                model_b.StationSample(
+                    ts_epoch_seconds=ts.timestamp(),
+                    temperature=r["temperature"],
+                    humidity=r["humidity"],
+                    pressure=r["pressure"],
+                )
             )
-            for r in rows
-        ]
+        if future_dated and self._diagnostics is not None:
+            self._diagnostics.record(
+                source="model_b", event_type="data_quality",
+                detail=f"{future_dated} future-dated station sample(s) ignored",
+            )
 
         radar_values = self._combiprecip_coordinator.data or []
+        # v0.1.24 fix (P1-13 / P1-16): valid_at and quality are now
+        # threaded through. valid_at was captured from the HDF5 file's own
+        # scan-time metadata into RadarPixelValue and then DROPPED right
+        # here, which is what left the freshness of a radar reading
+        # unknowable downstream.
         radar_points = tuple(
-            model_b.RadarPointReading(label=v.label, precip_rate_mmh=v.precip_rate_mmh)
+            model_b.RadarPointReading(
+                label=v.label,
+                precip_accum_mm_1h=v.precip_accum_mm_1h,
+                valid_at=v.valid_at,
+                quality=v.quality,
+            )
             for v in radar_values
         )
 
@@ -1268,8 +1964,16 @@ class ModelBCoordinator(DataUpdateCoordinator):
             now_epoch_seconds=time.time(),
             radar_points=radar_points,
         )
-        base_probability = model_b.score_v0_graduated(features)
+        base_probability = model_b.score_v0_graduated(features, now=now)
         probability = base_probability
+
+        # v0.1.24 fix (P2-05): initialised unconditionally. These were
+        # previously defined only inside the `if decision.should_trigger:`
+        # block below, so referencing them in the richer prediction
+        # payload — which this release does — would raise NameError on
+        # every non-triggering cycle, i.e. almost all of them.
+        got_meteonomiqs = False
+        risk_values: list[int] = []
 
         decision = model_b.evaluate_cross_model_trigger(
             previous_probability=self._previous_probability,
@@ -1298,10 +2002,25 @@ class ModelBCoordinator(DataUpdateCoordinator):
                 await self._meteoblue_coordinator.async_request_bonus_call()
                 got_meteonomiqs = await self._meteonomiqs_coordinator.async_request_bonus_call()
                 if got_meteonomiqs and self._meteonomiqs_coordinator.last_nowcast:
+                    # v0.1.24 fix (P1-12): restrict to intervals that
+                    # actually overlap the near-term window this score
+                    # claims to describe. Previously every interval the
+                    # nowcast returned was folded into max(risk_values)
+                    # regardless of how far out it was, so a high-risk
+                    # interval hours away could raise a score presented
+                    # as "storm within ~30 minutes".
+                    #
+                    # An OVERLAP test, not "starts after now": an
+                    # interval that began slightly before now and is
+                    # still running is the single most relevant one, and
+                    # a start-time filter would exclude exactly that.
+                    target_cutoff = now + METEONOMIQS_NOWCAST_TARGET_WINDOW
                     risk_values = [
                         item.precip_risk_value
                         for item in self._meteonomiqs_coordinator.last_nowcast.items
                         if item.precip_risk_value is not None
+                        and item.to_ts > now
+                        and item.from_ts < target_cutoff
                     ]
                     if risk_values:
                         probability = model_b.refine_with_meteonomiqs(
@@ -1324,19 +2043,327 @@ class ModelBCoordinator(DataUpdateCoordinator):
         # after refinement, and stores both values explicitly so the
         # refinement's effect (when it fires) stays visible in history
         # rather than being silently overwritten.
+        # v0.1.24 fix (P2-05): the persisted feature blob captured only 2
+        # of the 9 tendency deltas, and reduced each radar point to
+        # {label: value} — no timestamp, no quality. That is not enough
+        # to reconstruct what score_v0_graduated actually saw for a
+        # historical prediction, which is the table's only stated
+        # purpose: it is the training set for Model B v1. A training
+        # example you cannot reproduce the inputs for is not a training
+        # example.
         await self.hass.async_add_executor_job(
             self._db.insert_storm_prediction,
-            datetime.now(timezone.utc).isoformat(),
+            now.isoformat(),
             probability,
             {
+                "delta_pressure_10min": features.delta_pressure_10min,
                 "delta_pressure_30min": features.delta_pressure_30min,
+                "delta_pressure_60min": features.delta_pressure_60min,
+                "delta_humidity_10min": features.delta_humidity_10min,
                 "delta_humidity_30min": features.delta_humidity_30min,
-                "radar_points": {p.label: p.precip_rate_mmh for p in radar_points},
+                "delta_humidity_60min": features.delta_humidity_60min,
+                "delta_temperature_10min": features.delta_temperature_10min,
+                "delta_temperature_30min": features.delta_temperature_30min,
+                "delta_temperature_60min": features.delta_temperature_60min,
+                "radar_points": [
+                    {
+                        "label": p.label,
+                        "precip_accum_mm_1h": p.precip_accum_mm_1h,
+                        "valid_at": p.valid_at.isoformat() if p.valid_at else None,
+                        "quality": p.quality,
+                    }
+                    for p in radar_points
+                ],
+                "station_sample_count": len(samples),
+                "got_meteonomiqs": got_meteonomiqs,
+                "meteonomiqs_risk_values": risk_values,
                 "base_probability": base_probability,
                 "refined_probability": probability,
             },
         )
 
-        self._previous_probability = probability
+        # v0.1.24 fix (P0-02), CRITICAL: the CROSSING STATE is the
+        # unrefined base probability; the DISPLAYED value stays refined.
+        #
+        # These used to be the same variable. _previous_probability was
+        # set to the post-refinement value, but evaluate_cross_model_trigger
+        # always compares it against the NEXT cycle's unrefined base
+        # score. refine_with_meteonomiqs is a plain average that can pull
+        # a value below threshold while the base signal stays genuinely
+        # elevated — so the next cycle's fresh base score read as a newly
+        # crossing above a stale, refined previous value, and the trigger
+        # fired again. And again.
+        #
+        # This is not an edge case. With V0_TRIGGER_PROBABILITY = 0.65, a
+        # 0.5 threshold, and refinement averaging against risk/9, ANY
+        # Meteonomiqs risk value of 0-3 (ordinary weather) drops the
+        # stored value to 0.33-0.49 — below threshold — guaranteeing a
+        # spurious re-trigger on the next cycle, every 5 minutes, for the
+        # whole duration of any sustained signal. Quota survived on the
+        # daily bonus caps; storm_predictions filled with duplicate
+        # pseudo-events for a single storm, which is precisely the data
+        # Model B v1 is meant to learn from.
+        #
+        # current_probability stays refined for display and history, for
+        # the reason the original v0.1.15 fix gave: the same storm event
+        # should not show two different numbers depending on whether you
+        # look at the live sensor or the stored history.
+        self._previous_probability = base_probability
         self.current_probability = probability
+        # v0.1.23 fix (L-09): persist immediately, not just in memory —
+        # this is what lets the load above survive a restart happening
+        # at any point, not just neatly between scoring cycles.
+        await self.hass.async_add_executor_job(
+            self._db.set_model_b_previous_probability, base_probability
+        )
         return probability
+
+
+class RetentionCoordinator(DataUpdateCoordinator):
+    """v0.1.23 fix (L-10): the only caller of SwissWeatherDB.purge_older_than().
+
+    purge_older_than() itself was already correctly implemented — the
+    external ICS audit's finding was that nothing in production ever
+    called it, so the configured purge_days retention setting had no
+    operational effect at all and high-volume tables (forecast_snapshots
+    especially) could grow without bound.
+
+    Runs on its own slow schedule (RETENTION_CHECK_INTERVAL, default
+    24h) independent of every other coordinator's polling cadence —
+    retention is a housekeeping concern, not a data-freshness one, so
+    there's no reason to tie it to any provider's poll interval.
+    purge_days = 0 means "keep forever" (per const.py's CONF_PURGE_DAYS
+    docstring); this coordinator simply no-ops in that case rather than
+    computing a meaningless cutoff.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        db: SwissWeatherDB,
+        *,
+        purge_days: int,
+        retention_lock: Optional[asyncio.Lock] = None,
+        diagnostics: Any = None,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="swissweather_fusion_retention",
+            update_interval=RETENTION_CHECK_INTERVAL,
+        )
+        self._db = db
+        self._purge_days = purge_days
+        self._diagnostics = diagnostics
+        # v0.1.24 fix (P2-03 / P2-04): ONE lock, shared with the other
+        # coordinator that writes the same tables.
+        #
+        # Every SwissWeatherDB method takes self._lock individually, but
+        # reconciliation's logical read-modify-write spans several
+        # separate locked calls, and RetentionCoordinator can delete rows
+        # in between them. Per-statement locking does not make a
+        # multi-step read snapshot-consistent. A shared object rather
+        # than two independent locks is the whole point — two
+        # uncoordinated locks would serialize nothing against each other.
+        #
+        # Falls back to a private lock when none is injected, so each
+        # coordinator remains independently constructible in tests.
+        self._retention_lock = retention_lock or asyncio.Lock()
+
+    async def _async_update_data(self) -> Optional[dict[str, int]]:
+        if self._purge_days <= 0:
+            return None
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=self._purge_days)).isoformat()
+        # v0.1.24 (P2-04): held for the whole purge so deletions cannot
+        # land in the middle of a reconciliation batch's reads.
+        async with self._retention_lock:
+            deleted = await self.hass.async_add_executor_job(
+                self._db.purge_older_than, cutoff
+            )
+        total_deleted = sum(deleted.values())
+        if total_deleted > 0:
+            _LOGGER.info(
+                "Retention purge (cutoff %d days): deleted %s",
+                self._purge_days,
+                ", ".join(f"{table}={count}" for table, count in deleted.items() if count > 0),
+            )
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="retention", event_type="purge",
+                detail=f"{total_deleted} rows deleted across high-volume tables",
+                extra=deleted,
+            )
+        return deleted
+
+
+class StormEventReconciliationCoordinator(DataUpdateCoordinator):
+    """Confirms or rejects past storm predictions against what actually happened.
+
+    **v0.1.24 fix (P2-08).** This is the first production caller of
+    SwissWeatherDB.insert_storm_event(), which until now had none at all
+    — verified by grep across the whole package. storm_events is the
+    ground-truth table the entire Model B v0 -> v1 plan depends on, and
+    nothing could ever put a row in it. The v1 upgrade path documented in
+    DEVELOPER.md was therefore unreachable by construction, not merely
+    "not done yet".
+
+    **How a prediction is confirmed.** For any storm_predictions row
+    whose follow-up window has fully elapsed, and whose probability was
+    high enough to have actually made a claim, the real station and radar
+    observations across that window are fetched and checked against Model
+    B's OWN existing v0 thresholds — V0_PRESSURE_DROP_HPA_THRESHOLD and
+    RADAR_PRECIP_ACCUM_MM_THRESHOLD.
+
+    Reusing the live scorer's thresholds is deliberate. Inventing a
+    second, independent definition of "a storm signature" here would mean
+    the training labels described a different phenomenon from the one the
+    model is trying to predict, which is a subtle way to produce a v1
+    model that is confidently wrong. The honest caveat, carried in
+    DEVELOPER.md: these thresholds are themselves an unvalidated v0
+    heuristic, so what this table records is "the v0 signature was
+    observed", not "a meteorologist would call this a storm". That is
+    still enormously more useful than an empty table, and it is worth
+    revisiting once real events accumulate.
+
+    A confirmed prediction is promoted to a storm_events row with the
+    ACTUALLY OBSERVED peak values, not the predicted ones — storing the
+    prediction back as if it were ground truth would make the training
+    set circular.
+
+    Every checked prediction is marked reconciled whether or not it was
+    confirmed, so nothing is ever re-checked. An unconfirmed prediction
+    is a negative training example, not an unfinished job.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        db: SwissWeatherDB,
+        *,
+        diagnostics: Any = None,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="swissweather_fusion_storm_reconciliation",
+            update_interval=STORM_RECONCILIATION_INTERVAL,
+        )
+        self._db = db
+        self._diagnostics = diagnostics
+        self.last_confirmed_count: int = 0
+        self.last_checked_count: int = 0
+
+    async def _async_update_data(self) -> dict[str, int]:
+        async with asyncio.timeout(120):
+            return await self.hass.async_add_executor_job(self._reconcile_storm_events)
+
+    def _reconcile_storm_events(self) -> dict[str, int]:
+        """Synchronous — only ever called via the executor job above."""
+        now = datetime.now(timezone.utc)
+        # Only predictions whose outcome has had time to play out fully.
+        cutoff = (now - STORM_FOLLOW_UP_WINDOW).isoformat()
+        predictions = self._db.get_unreconciled_storm_predictions(
+            cutoff, STORM_RECONCILIATION_MIN_PROBABILITY
+        )
+        if not predictions:
+            self.last_checked_count = 0
+            self.last_confirmed_count = 0
+            return {"checked": 0, "confirmed": 0}
+
+        checked_ids: list[int] = []
+        confirmed = 0
+
+        for prediction in predictions:
+            try:
+                predicted_at = datetime.fromisoformat(prediction["ts"])
+            except (TypeError, ValueError):
+                # Unparseable timestamp: mark it checked so it does not
+                # jam the queue forever, but never promote it.
+                checked_ids.append(prediction["id"])
+                continue
+            if predicted_at.tzinfo is None:
+                predicted_at = predicted_at.replace(tzinfo=timezone.utc)
+            window_end = predicted_at + STORM_FOLLOW_UP_WINDOW
+
+            evidence = self._collect_evidence(predicted_at, window_end)
+            checked_ids.append(prediction["id"])
+
+            if evidence is None:
+                continue
+
+            peak_pressure_drop, peak_precip = evidence
+            pressure_confirms = (
+                peak_pressure_drop is not None
+                and peak_pressure_drop >= V0_PRESSURE_DROP_HPA_THRESHOLD
+            )
+            radar_confirms = (
+                peak_precip is not None
+                and peak_precip >= RADAR_PRECIP_ACCUM_MM_THRESHOLD
+            )
+            if not (pressure_confirms or radar_confirms):
+                continue
+
+            self._db.insert_storm_event(
+                predicted_at.isoformat(),
+                window_end.isoformat(),
+                peak_pressure_drop if peak_pressure_drop is not None else 0.0,
+                0.0,
+                peak_precip if peak_precip is not None else 0.0,
+            )
+            confirmed += 1
+
+        self._db.mark_storm_predictions_reconciled(checked_ids)
+        self.last_checked_count = len(checked_ids)
+        self.last_confirmed_count = confirmed
+
+        if self._diagnostics is not None and checked_ids:
+            self._diagnostics.record(
+                source="model_b", event_type="storm_reconciliation",
+                detail=f"checked {len(checked_ids)}, confirmed {confirmed}",
+            )
+        _LOGGER.debug(
+            "Storm reconciliation: checked %d prediction(s), confirmed %d",
+            len(checked_ids),
+            confirmed,
+        )
+        return {"checked": len(checked_ids), "confirmed": confirmed}
+
+    def _collect_evidence(
+        self, start: datetime, end: datetime
+    ) -> Optional[tuple[Optional[float], Optional[float]]]:
+        """Peak observed pressure drop (hPa) and peak radar accumulation (mm).
+
+        Returns None when there is no usable observation at all across the
+        window — an absence of evidence is not evidence of absence, and
+        marking such a prediction "did not verify" would teach a future
+        model that a real storm was a false alarm.
+        """
+        station_rows = self._db.get_station_observations_between(
+            start.isoformat(), end.isoformat()
+        )
+        radar_rows = self._db.get_radar_observations_between(
+            start.isoformat(), end.isoformat()
+        )
+        if not station_rows and not radar_rows:
+            return None
+
+        pressures = [r["pressure"] for r in station_rows if r["pressure"] is not None]
+        peak_drop: Optional[float] = None
+        if len(pressures) >= 2:
+            # Largest fall from any earlier reading to any later one —
+            # a running maximum, matching how the live scorer looks at a
+            # drop across a window rather than only at its endpoints.
+            running_max = pressures[0]
+            peak_drop = 0.0
+            for value in pressures[1:]:
+                running_max = max(running_max, value)
+                peak_drop = max(peak_drop, running_max - value)
+
+        precips = [
+            r["precip_accum_mm_1h"]
+            for r in radar_rows
+            if r["precip_accum_mm_1h"] is not None
+        ]
+        peak_precip = max(precips) if precips else None
+
+        return peak_drop, peak_precip

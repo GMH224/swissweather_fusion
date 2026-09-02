@@ -31,6 +31,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .device import build_device_info
+from .models import model_a
 
 
 async def async_setup_entry(
@@ -83,14 +84,22 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
 
     @property
     def condition(self) -> Optional[str]:
-        # A precipitation-derived condition is a reasonable v0.1 default;
-        # richer condition mapping (cloud cover, weather codes per source)
-        # is a natural future enhancement once real accuracy data suggests
-        # where the current blend is weakest.
-        precip = self._current.get("precip")
-        if precip is None:
-            return None
-        return "rainy" if precip > 0.1 else "sunny"
+        # v0.1.24 fix (P2-10): this used to be
+        # `"rainy" if precip > 0.1 else "sunny"`, which collapsed snow,
+        # cloud, overcast and fog all into "sunny" — the weather card
+        # showed a sun during a snowstorm. Four separate call sites had
+        # the same two-branch logic; all four now share
+        # model_a.derive_condition.
+        #
+        # This site keeps its own 0.1 mm threshold and its own
+        # explicit-None behaviour, both deliberately preserved rather
+        # than unified with the daily aggregation sites (which use 0.5 mm
+        # and treat None as zero) — see derive_condition's docstring.
+        return model_a.derive_condition(
+            self._current.get("precip"),
+            self._current.get("temperature"),
+            self._current.get("humidity"),
+        )
 
     async def async_forecast_hourly(self) -> list[Forecast]:
         data = self.coordinator.data

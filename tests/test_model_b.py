@@ -51,18 +51,18 @@ def test_insufficient_history_does_not_raise():
 
 def test_graduated_score_radar_far_point():
     radar = (
-        model_b.RadarPointReading(label="local", precip_rate_mmh=0.0),
-        model_b.RadarPointReading(label="near", precip_rate_mmh=0.0),
-        model_b.RadarPointReading(label="mid", precip_rate_mmh=0.0),
-        model_b.RadarPointReading(label="far", precip_rate_mmh=3.5),
+        model_b.RadarPointReading(label="local", precip_accum_mm_1h=0.0),
+        model_b.RadarPointReading(label="near", precip_accum_mm_1h=0.0),
+        model_b.RadarPointReading(label="mid", precip_accum_mm_1h=0.0),
+        model_b.RadarPointReading(label="far", precip_accum_mm_1h=3.5),
     )
     features = model_b.compute_tendency_features(samples=_calm_samples(), now_epoch_seconds=NOW, radar_points=radar)
     assert model_b.score_v0_graduated(features) == 0.30
 
 
 def test_graduated_score_near_point_beats_far_point():
-    near_radar = (model_b.RadarPointReading(label="near", precip_rate_mmh=2.0),)
-    far_radar = (model_b.RadarPointReading(label="far", precip_rate_mmh=2.0),)
+    near_radar = (model_b.RadarPointReading(label="near", precip_accum_mm_1h=2.0),)
+    far_radar = (model_b.RadarPointReading(label="far", precip_accum_mm_1h=2.0),)
     features_near = model_b.compute_tendency_features(
         samples=_calm_samples(), now_epoch_seconds=NOW, radar_points=near_radar
     )
@@ -73,13 +73,13 @@ def test_graduated_score_near_point_beats_far_point():
 
 
 def test_graduated_score_local_precip_is_highest():
-    local_radar = (model_b.RadarPointReading(label="local", precip_rate_mmh=5.0),)
+    local_radar = (model_b.RadarPointReading(label="local", precip_accum_mm_1h=5.0),)
     features = model_b.compute_tendency_features(samples=_calm_samples(), now_epoch_seconds=NOW, radar_points=local_radar)
     assert model_b.score_v0_graduated(features) == 0.90
 
 
 def test_graduated_score_takes_max_not_sum():
-    radar = (model_b.RadarPointReading(label="near", precip_rate_mmh=2.0),)
+    radar = (model_b.RadarPointReading(label="near", precip_accum_mm_1h=2.0),)
     features = model_b.compute_tendency_features(samples=_storm_like_samples(), now_epoch_seconds=NOW, radar_points=radar)
     combined = model_b.score_v0_graduated(features)
     assert combined == max(model_b.score_v0(features), 0.75)

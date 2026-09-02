@@ -166,6 +166,32 @@ class AnnualCallBudget:
     def calls_remaining_this_year(self) -> int:
         return max(0, self._annual_budget - self._calls_used_this_year)
 
+    def to_state(self) -> dict:
+        """v0.1.23 fix (L-07): serializes year + calls-used so the
+        coordinator can persist it via
+        SwissWeatherDB.set_annual_call_budget_state(). Previously this
+        state existed only as plain instance attributes, reset to zero on
+        every Home Assistant restart/reload — meaning repeated restarts
+        could silently bypass the intended annual call protection,
+        eventually exceeding the real 1000-calls/year vendor quota without
+        the integration's own tracking ever reflecting it."""
+        return {
+            "year": self._current_year,
+            "calls_used": self._calls_used_this_year,
+        }
+
+    def load_state(self, state: Optional[dict]) -> None:
+        """Inverse of to_state(), applied in place (the coordinator
+        constructs the budget first, then loads persisted state into it,
+        since annual_budget itself comes from a constant, not from
+        storage). A missing/empty state behaves exactly like the old
+        always-zero default — this only adds durability, it doesn't change
+        first-run behavior."""
+        if not state:
+            return
+        self._current_year = state.get("year")
+        self._calls_used_this_year = state.get("calls_used", 0)
+
 
 def needs_keepalive_call(
     *, last_successful_call_date: Optional[date], today: date, max_days_between_calls: int

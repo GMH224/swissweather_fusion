@@ -11,9 +11,10 @@ v0 here is a hand-crafted, graduated heuristic — not a binary rule, and not
 yet a trained model. It combines two independent signal families:
   1. Station tendency (pressure/humidity/temperature rate-of-change) —
      the original v0 signal.
-  2. CombiPrecip's 4-point upwind radar sampling (local + ~20/35/60min
-     upwind) — added after the realization that "is there a precipitation
-     cell approaching, and how far out" is a much stronger direct signal
+  2. CombiPrecip's 4-point upwind radar sampling (local + three
+     progressively more distant upwind points) — added after the
+     realization that "is there a precipitation cell approaching, and
+     roughly how far away" is a much stronger direct signal
      than tendency alone, and costs nothing extra to compute once the
      radar grid is already downloaded for the local point (see
      DEVELOPER.md, "Upwind radar sampling").
@@ -34,11 +35,14 @@ directly unit-testable (see tests/test_model_b.py).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from ..const import (
     LOCAL_POINT_PROBABILITY,
-    RADAR_PRECIP_DETECTION_MMH_THRESHOLD,
+    RADAR_FRESHNESS_LIMIT,
+    RADAR_PRECIP_ACCUM_MM_THRESHOLD,
+    RADAR_QUALITY_MINIMUM_CODE,
     UPWIND_POINT_PROBABILITY,
     V0_HUMIDITY_RISE_PCT_THRESHOLD,
     V0_PRESSURE_DROP_HPA_THRESHOLD,
@@ -58,10 +62,33 @@ class StationSample:
 
 @dataclass(frozen=True)
 class RadarPointReading:
-    """One CombiPrecip sampling point's current precipitation rate."""
+    """One CombiPrecip sampling point's reading.
+
+    **v0.1.24 (P1-14)**: the value field was named ``precip_rate_mmh``
+    and treated as an instantaneous rain rate. It is not. MeteoSwiss
+    documents the CombiPrecip product this project fetches (CPC) as
+    "Combiprecip 60-minute total", unit mm, aggregation "precipitation
+    accumulation over 1 hour" — as distinct from RZC/PRECIP, which IS an
+    instantaneous mm/h rate. Renamed to say what it holds.
+
+    **v0.1.24 (P1-13)**: ``valid_at`` was captured from the HDF5 file's
+    own scan-time metadata into RadarPixelValue and then dropped at the
+    coordinator's construction site, leaving no way to tell a fresh
+    reading from one Home Assistant had been re-serving for hours after
+    the feed stalled. Now threaded through. None means "freshness
+    unknown", which is treated as stale — see _radar_signal_probability.
+
+    **v0.1.24 (P1-16)**: ``quality`` is MeteoSwiss's own radar quality
+    code (0-9, 9 best), read from the CPC filename. None means the code
+    could not be determined, which is NOT treated as bad — see
+    _radar_signal_probability for why the two unknowns are handled
+    asymmetrically.
+    """
 
     label: str  # 'local' | 'near' | 'mid' | 'far'
-    precip_rate_mmh: Optional[float]
+    precip_accum_mm_1h: Optional[float]
+    valid_at: Optional[datetime] = None
+    quality: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +126,50 @@ def _nearest_sample_at_or_before(
     return candidate
 
 
+def _latest_with_value(
+    samples: Sequence[StationSample], attr: str
+) -> Optional[StationSample]:
+    """Most recent sample that actually carries a value for `attr`.
+
+    **v0.1.24 fix (IND-02)**. compute_tendency_features used to take
+    ``latest = samples[-1]`` wholesale, and every delta returned None
+    when that row's value was None. StationCoordinator wrote a row every
+    5 minutes unconditionally, including when a sensor was `unavailable`
+    or its value was rejected — so a single 5-minute dropout on any one
+    of the three station sensors blanked ALL NINE tendency features and
+    dropped score_v0 to 0.0, discarding the other 55 minutes of good
+    data. That happened during exactly the conditions in which sensor
+    dropouts are most likely, and presented as an unexplained score
+    collapse rather than an outage, because the radar half of
+    score_v0_graduated kept contributing normally.
+
+    Resolving the endpoint per measurement instead of per row means one
+    sensor going quiet no longer silences the other two.
+    """
+    for s in reversed(samples):
+        if getattr(s, attr) is not None:
+            return s
+    return None
+
+
+def _nearest_with_value_at_or_before(
+    samples: Sequence[StationSample], target_epoch: float, attr: str
+) -> Optional[StationSample]:
+    """Window endpoint counterpart to _latest_with_value (IND-02).
+
+    Same reasoning: an all-None row landing exactly at the window edge
+    should not void the window when usable data sits just behind it.
+    """
+    candidate = None
+    for s in samples:
+        if s.ts_epoch_seconds <= target_epoch:
+            if getattr(s, attr) is not None:
+                candidate = s
+        else:
+            break
+    return candidate
+
+
 def compute_tendency_features(
     *,
     samples: Sequence[StationSample],
@@ -111,19 +182,18 @@ def compute_tendency_features(
     samples should be the station's recent history, sorted ascending by
     timestamp, covering at least the last 60 minutes for full features.
     """
-    latest = samples[-1] if samples else None
-
     def delta(minutes: int, attr: str) -> Optional[float]:
+        # v0.1.24 (IND-02): both endpoints are resolved per measurement,
+        # so an all-None row at either end no longer voids the window.
+        latest = _latest_with_value(samples, attr)
         if latest is None:
             return None
-        past = _nearest_sample_at_or_before(samples, now_epoch_seconds - minutes * 60)
+        past = _nearest_with_value_at_or_before(
+            samples, now_epoch_seconds - minutes * 60, attr
+        )
         if past is None:
             return None
-        latest_val = getattr(latest, attr)
-        past_val = getattr(past, attr)
-        if latest_val is None or past_val is None:
-            return None
-        return latest_val - past_val
+        return getattr(latest, attr) - getattr(past, attr)
 
     return TendencyFeatures(
         delta_pressure_10min=delta(10, "pressure"),
@@ -162,35 +232,87 @@ def score_v0(features: TendencyFeatures) -> float:
     return 0.0
 
 
-def _radar_signal_probability(radar_points: tuple[RadarPointReading, ...]) -> float:
-    """Highest probability implied by any point currently showing
+def _radar_point_is_usable(
+    point: RadarPointReading, now: Optional[datetime]
+) -> bool:
+    """Whether a radar point may contribute to the score at all.
+
+    Two independent gates, deliberately asymmetric in how they treat
+    "unknown" — this asymmetry is the whole design and is not an
+    oversight:
+
+    **Freshness (P1-13), where unknown means EXCLUDE.** Home Assistant's
+    DataUpdateCoordinator keeps serving its last successful .data
+    indefinitely across repeated failed refreshes, so without this check
+    a stalled CombiPrecip feed influences the storm score forever. A
+    reading whose age cannot be established gives no evidence that it is
+    current, and the cost of wrongly trusting a stale radar echo (a
+    false storm warning, blinds closing on a clear day) is higher than
+    the cost of ignoring one reading.
+
+    **Quality (P1-16), where unknown means INCLUDE.** MeteoSwiss encodes
+    a quality code in the CPC filename, but this project has never
+    verified a real downloaded file, so it is entirely possible the code
+    cannot be parsed in practice. Treating unknown quality as bad would
+    then silently disable the entire radar signal — a much worse failure
+    than occasionally scoring on a low-quality scan. Only a CONFIRMED
+    low code excludes.
+    """
+    if now is not None:
+        if point.valid_at is None:
+            return False
+        valid_at = point.valid_at
+        if valid_at.tzinfo is None:
+            valid_at = valid_at.replace(tzinfo=timezone.utc)
+        if now - valid_at > RADAR_FRESHNESS_LIMIT:
+            return False
+
+    if point.quality is not None and point.quality < RADAR_QUALITY_MINIMUM_CODE:
+        return False
+
+    return True
+
+
+def _radar_signal_probability(
+    radar_points: tuple[RadarPointReading, ...],
+    now: Optional[datetime] = None,
+) -> float:
+    """Highest probability implied by any usable point currently showing
     significant precipitation — "local" (already raining here) dominates;
     otherwise the nearest upwind point with a detection wins, since it
-    implies the shortest lead time.
+    implies the shortest distance and therefore the most imminent signal.
 
-    Point order in UPWIND_POINT_PROBABILITY matters here: "near" (~20min)
-    should win over "mid" (~35min) if both show precipitation, since the
-    near point represents the more imminent, more certain signal.
+    `now` is injectable so the freshness gate is testable without
+    patching the clock. Passing None disables the freshness gate
+    entirely, which is what the pure-tendency unit tests want; production
+    callers always pass a real timestamp.
+
+    **v0.1.24 (P1-14)**: the threshold compares against millimetres
+    accumulated over the preceding hour, not an instantaneous rate. See
+    RADAR_PRECIP_ACCUM_MM_THRESHOLD in const.py.
     """
-    by_label = {p.label: p for p in radar_points}
+    usable = [p for p in radar_points if _radar_point_is_usable(p, now)]
+    by_label = {p.label: p for p in usable}
 
     local = by_label.get("local")
-    if local and local.precip_rate_mmh is not None:
-        if local.precip_rate_mmh >= RADAR_PRECIP_DETECTION_MMH_THRESHOLD:
+    if local and local.precip_accum_mm_1h is not None:
+        if local.precip_accum_mm_1h >= RADAR_PRECIP_ACCUM_MM_THRESHOLD:
             return LOCAL_POINT_PROBABILITY
 
-    # Check nearest-to-farthest so the closest (soonest) detection wins.
+    # Check nearest-to-farthest so the closest detection wins.
     for label in ("near", "mid", "far"):
         point = by_label.get(label)
-        if point is None or point.precip_rate_mmh is None:
+        if point is None or point.precip_accum_mm_1h is None:
             continue
-        if point.precip_rate_mmh >= RADAR_PRECIP_DETECTION_MMH_THRESHOLD:
+        if point.precip_accum_mm_1h >= RADAR_PRECIP_ACCUM_MM_THRESHOLD:
             return UPWIND_POINT_PROBABILITY[label]
 
     return 0.0
 
 
-def score_v0_graduated(features: TendencyFeatures) -> float:
+def score_v0_graduated(
+    features: TendencyFeatures, now: Optional[datetime] = None
+) -> float:
     """Combined v0 heuristic: the higher of the tendency-based signal and
     the radar-distance-based signal, not a strict sum — these are two
     independent ways of detecting the same underlying event, and a
@@ -204,7 +326,7 @@ def score_v0_graduated(features: TendencyFeatures) -> float:
     reasoning and the v1 upgrade path once real training data exists.
     """
     tendency_score = score_v0(features)
-    radar_score = _radar_signal_probability(features.radar_points)
+    radar_score = _radar_signal_probability(features.radar_points, now)
     return max(tendency_score, radar_score)
 
 
@@ -219,6 +341,27 @@ def refine_with_meteonomiqs(
     Blends rather than overrides: an independent source agreeing raises
     confidence, disagreeing pulls it back toward the midpoint rather than
     fully overriding our own signals with a single external opinion.
+
+    **On the 50/50 weighting (v0.1.24, P2-07)**: there is no statistical
+    basis for weighting the two sources equally. It is not a tuned
+    parameter and was never validated against outcomes; it reflects
+    only that there is no MEASURED reason to trust either source more
+    than the other, which is a different and much weaker claim than the
+    arithmetic implies.
+
+    Worth noting for the v1 upgrade path: Model A's EMA-learned
+    per-source weights are the closest thing this project has to an
+    actually-calibrated source-combination mechanism, and that mechanism
+    does not currently extend to Model B at all. Extending it is the
+    natural successor to this function — see DEVELOPER.md.
+
+    **On the caller's use of the result (v0.1.24, P0-02)**: the refined
+    value returned here is for display and history only. It must NOT be
+    stored as the crossing-detection state variable, because crossing
+    detection compares against the next cycle's UNREFINED base score;
+    mixing the two scales produced a spurious "upward crossing" on
+    essentially every cycle of any sustained signal. See
+    ModelBCoordinator._async_update_data_inner.
     """
     if meteonomiqs_risk_value is None:
         return base_probability

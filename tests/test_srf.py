@@ -446,3 +446,154 @@ def test_parse_srf_error_detail_handles_partial_shape():
     # message-only (no code) — still useful, still surfaced.
     detail = srf.parse_srf_error_detail('{"message": "Something went wrong"}')
     assert detail == "Something went wrong"
+
+
+# -- v0.1.23: async client-level tests (L-11, L-12) --------------------------
+#
+# No async client-level tests existed before this — everything above tests
+# pure functions (parsing, URL building) only. The 401-retry and
+# permanent-error-classification behaviors below are genuinely new
+# integration-level logic that only exists at the async request layer, so
+# they need a fake aiohttp session/response to exercise for real.
+
+import asyncio
+import json as _json
+
+
+class _FakeResponse:
+    def __init__(self, *, status: int, json_body: dict, text_body: str = None):
+        self.status = status
+        self._json_body = json_body
+        self._text_body = text_body if text_body is not None else _json.dumps(json_body)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self):
+        return self._json_body
+
+    async def text(self):
+        return self._text_body
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+
+class _FakeSession:
+    """Replays a scripted sequence of responses per HTTP method, in the
+    order they're requested — enough to drive SrfClient's real request
+    code without a real network."""
+
+    def __init__(self, *, post_responses=None, get_responses=None):
+        self._post_responses = list(post_responses or [])
+        self._get_responses = list(get_responses or [])
+        self.get_calls = []
+
+    def post(self, url, **kwargs):
+        return self._post_responses.pop(0)
+
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        return self._get_responses.pop(0)
+
+
+def _token_response():
+    return _FakeResponse(status=200, json_body={"access_token": "TOKEN1", "expires_in": 604800})
+
+
+def _geolocation_response():
+    return _FakeResponse(status=200, json_body=[{"geolocationId": "12345"}])
+
+
+def test_srf_client_retries_once_on_401_then_succeeds():
+    """v0.1.23 direct regression test for L-12: a cached-but-rejected
+    token (401) must be cleared and refreshed exactly once, with the
+    original request retried and succeeding — not left permanently
+    broken until local token expiry."""
+    session = _FakeSession(
+        post_responses=[_token_response(), _token_response()],  # initial + one forced refresh
+        get_responses=[
+            _FakeResponse(status=401, json_body={}, text_body="Unauthorized"),
+            _geolocation_response(),
+        ],
+    )
+    client = srf.SrfClient(session, "key", "secret")
+
+    async def run():
+        return await client._async_ensure_geolocation_id(46.9, 7.4)
+
+    geolocation_id = asyncio.run(run())
+    assert geolocation_id == "12345"
+    # Confirms a refresh really happened: two POSTs (token) consumed.
+    assert session._post_responses == []
+
+
+def test_srf_client_does_not_loop_forever_on_persistent_401():
+    """A 401 that persists even after one refresh-and-retry must surface
+    as an error, not retry indefinitely."""
+    session = _FakeSession(
+        post_responses=[_token_response(), _token_response()],
+        get_responses=[
+            _FakeResponse(status=401, json_body={}, text_body="Unauthorized"),
+            _FakeResponse(status=401, json_body={}, text_body="Unauthorized"),
+        ],
+    )
+    client = srf.SrfClient(session, "key", "secret")
+
+    async def run():
+        return await client._async_ensure_geolocation_id(46.9, 7.4)
+
+    with pytest.raises(srf.SrfPermanentError) as exc_info:
+        asyncio.run(run())
+    assert exc_info.value.status == 401
+
+
+def test_srf_client_raises_permanent_error_for_400_without_retry_loop():
+    """v0.1.23 direct regression test for L-11: a 400 (e.g. the confirmed
+    real 'exceeded your location limit' free-plan restriction) must raise
+    SrfPermanentError, distinguishable from a transient failure, and must
+    NOT trigger a token refresh (a bad request has nothing to do with the
+    token being invalid)."""
+    session = _FakeSession(
+        post_responses=[_token_response()],
+        get_responses=[
+            _FakeResponse(
+                status=400,
+                json_body={},
+                text_body=_json.dumps({"detail": "you have exceeded your location limit"}),
+            ),
+        ],
+    )
+    client = srf.SrfClient(session, "key", "secret")
+
+    async def run():
+        return await client._async_ensure_geolocation_id(46.9, 7.4)
+
+    with pytest.raises(srf.SrfPermanentError) as exc_info:
+        asyncio.run(run())
+    assert exc_info.value.status == 400
+    assert "location limit" in str(exc_info.value)
+    # Only ONE token POST — no refresh attempted for a non-401 error.
+    assert session._post_responses == []
+
+
+def test_srf_client_5xx_raises_plain_runtime_error_not_permanent_error():
+    """A 5xx must remain a plain (fallback-eligible) error, not
+    SrfPermanentError — 5xx is the transient case the coordinator's
+    existing fallback-to-daily-endpoint behavior is meant to catch."""
+    session = _FakeSession(
+        post_responses=[_token_response()],
+        get_responses=[_FakeResponse(status=503, json_body={}, text_body="Service Unavailable")],
+    )
+    client = srf.SrfClient(session, "key", "secret")
+
+    async def run():
+        return await client._async_ensure_geolocation_id(46.9, 7.4)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(run())
+    assert not isinstance(exc_info.value, srf.SrfPermanentError)

@@ -70,6 +70,54 @@ def test_update_bucket_ema_cold_start():
     )
     assert result.sample_count == 1
     assert result.ema_bias == 2.0  # forecast - actual, no prior to blend with
+    # v0.1.23 fix (L-03): ema_abs_error on the very first sample must be
+    # the RAW error (no prior bias to debias against yet), not zero. The
+    # old buggy ordering computed new_bias = raw_error on cold start, then
+    # measured the residual against that SAME new_bias — which is
+    # mathematically guaranteed to be exactly zero every single time
+    # (forecast_value - new_bias == actual_value by construction), making
+    # ema_weight artificially maximal from the very first sample. This is
+    # the most dramatic single illustration of L-03's impact.
+    assert result.ema_abs_error == 2.0
+
+
+def test_update_bucket_ema_judges_second_sample_against_bias_before_this_update():
+    """v0.1.23 direct regression test for L-03 (external ICS audit): the
+    second observation's error must be judged against the bias as it
+    stood BEFORE this sample updates it, not after. Constructs a case
+    where the two orderings give different, distinguishable numeric
+    results, and checks the residual matches predict-then-update, not
+    update-then-grade-yourself-against-the-update.
+    """
+    first = model_a.update_bucket_ema(
+        previous_bias=0.0, previous_abs_error=0.0, previous_sample_count=0,
+        forecast_value=20.0, actual_value=18.0, lead_time_bucket="short",
+    )
+    assert first.ema_bias == 2.0  # bias after sample 1
+
+    second = model_a.update_bucket_ema(
+        previous_bias=first.ema_bias, previous_abs_error=first.ema_abs_error,
+        previous_sample_count=first.sample_count,
+        forecast_value=20.0, actual_value=15.0, lead_time_bucket="short",
+    )
+    # Correct (fixed): residual judged against the OLD bias (2.0), i.e.
+    # debiased_forecast = 20.0 - 2.0 = 18.0, abs error vs actual (15.0) = 3.0.
+    # alpha for "short" lead time; sample_count=1 so blended with previous_abs_error (0.0).
+    alpha = model_a.EMA_ALPHA_BY_LEAD_TIME["short"]
+    expected_abs_error = alpha * 3.0 + (1 - alpha) * first.ema_abs_error
+    assert abs(second.ema_abs_error - expected_abs_error) < 1e-9
+
+    # The old (buggy) ordering would instead compute new_bias first
+    # (alpha*raw_error + (1-alpha)*previous_bias, raw_error = 20-15 = 5.0),
+    # then measure the residual against THAT — a smaller, self-fitted
+    # number. Confirm the fixed result is NOT equal to that old formula,
+    # i.e. this test would have caught the regression.
+    raw_error = 20.0 - 15.0
+    buggy_new_bias = alpha * raw_error + (1 - alpha) * first.ema_bias
+    buggy_debiased_forecast = 20.0 - buggy_new_bias
+    buggy_residual = abs(buggy_debiased_forecast - 15.0)
+    buggy_expected_abs_error = alpha * buggy_residual + (1 - alpha) * first.ema_abs_error
+    assert abs(second.ema_abs_error - buggy_expected_abs_error) > 1e-9
 
 
 def test_update_bucket_ema_moves_toward_new_observation():
@@ -93,9 +141,20 @@ def test_blend_debiases_before_weighting():
         model_a.SourceContribution(source="ch2", raw_value=22.0, ema_bias=0.0, ema_weight=1.0, sample_count=2),
     ]
     blended = model_a.blend(contributions)
-    # ch2 is below MIN_SAMPLES_TO_TRUST_BUCKET -> raw value, neutral weight 1.0
-    expected = (18.0 * 5.0 + 22.0 * 1.0) / (5.0 + 1.0)
+    # ch2 is below MIN_SAMPLES_TO_TRUST_BUCKET -> raw value.
+    #
+    # v0.1.24 (IND-01): its weight is no longer a hard-coded 1.0. The
+    # cold-start weight is now the median learned weight among the
+    # trusted contributors of THIS blend -- here just ch1's 5.0 -- so
+    # that the two weights sit on one comparable scale instead of the
+    # untrusted source being handed a number from a different one. What
+    # this test was actually written to verify, that ch1 contributes its
+    # DEBIASED 18.0 rather than its raw 20.0, is unchanged.
+    expected = (18.0 * 5.0 + 22.0 * 5.0) / (5.0 + 5.0)
     assert abs(blended - expected) < 1e-9
+    # Guard the original intent explicitly: without debiasing the answer
+    # would be 21.0 rather than 20.0.
+    assert abs(blended - 21.0) > 0.5
 
 
 def test_blend_empty_returns_none():

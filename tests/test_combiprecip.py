@@ -46,14 +46,32 @@ def test_build_sampling_points():
 
 
 def test_parse_stac_items_response_sorts_newest_first():
+    """v0.1.24 (IND-13): this test previously used invented filenames
+    ("old.h5" / "new.h5") and asserted that sorting by the STAC feature's
+    properties.datetime picked the newer one. Both halves of that were
+    wrong, which is precisely why the bug survived: MeteoSwiss items are
+    per CALENDAR DATE, so properties.datetime is a date and every asset
+    in an item shares it, and real filenames follow a documented
+    convention that carries the actual product time. Rewritten against
+    that convention.
+    """
     payload = {
         "features": [
-            {"properties": {"datetime": "2026-07-25T12:00:00Z"}, "assets": {"data": {"href": "https://example.com/old.h5"}}},
-            {"properties": {"datetime": "2026-07-25T12:05:00Z"}, "assets": {"data": {"href": "https://example.com/new.h5"}}},
+            {
+                "collection": cp.STAC_COLLECTION,
+                "properties": {"datetime": "2026-07-25T00:00:00Z"},
+                "assets": {
+                    "old": {"href": "https://example.com/CPC2620612009_00060.801.h5"},
+                    "new": {"href": "https://example.com/CPC2620612059_00060.801.h5"},
+                },
+            }
         ]
     }
     assets = cp.parse_stac_items_response(payload)
-    assert assets[0].href == "https://example.com/new.h5"
+    assert assets[0].href.endswith("CPC2620612059_00060.801.h5")
+    # Product time comes from the filename, not from properties.datetime.
+    assert assets[0].valid_at.hour == 12 and assets[0].valid_at.minute == 5
+    assert assets[0].quality == 9
 
 
 @pytest.fixture
@@ -100,7 +118,7 @@ def test_extract_values_at_points_finds_marker_cell(synthetic_odim_file):
 
     results = cp.extract_values_at_points(hdf5_path=synthetic_odim_file, points=[point])
 
-    assert results[0].precip_rate_mmh == 42.0
+    assert results[0].precip_accum_mm_1h == 42.0
     assert results[0].valid_at.year == 2026
     assert results[0].valid_at.hour == 12
 
@@ -132,7 +150,7 @@ def test_write_temp_and_extract_handles_bytes_end_to_end(synthetic_odim_file):
     results = client.write_temp_and_extract(raw_bytes)
 
     local_result = next(r for r in results if r.label == "local")
-    assert local_result.precip_rate_mmh == 42.0
+    assert local_result.precip_accum_mm_1h == 42.0
 
 
 def test_extract_values_at_points_nodata_sentinel():
@@ -162,6 +180,82 @@ def test_extract_values_at_points_nodata_sentinel():
         easting, northing = cp.wgs84_to_lv95(latitude=47.4, longitude=7.1)
         point = cp.SamplingPoint(label="nd", latitude=47.4, longitude=7.1, easting=easting, northing=northing)
         results = cp.extract_values_at_points(hdf5_path=path, points=[point])
-        assert results[0].precip_rate_mmh is None
+        assert results[0].precip_accum_mm_1h is None
     finally:
         os.remove(path)
+
+
+# ---------------------------------------------------------------------------
+# v0.1.24 additions
+# ---------------------------------------------------------------------------
+def test_extract_values_at_points_returns_none_for_out_of_grid_point(
+    synthetic_odim_file,
+):
+    """v0.1.24 fix (P1-18). _pixel_indices used to CLAMP an out-of-range
+    (row, col) into the valid array bounds, so a sampling point genuinely
+    outside the radar's coverage silently returned an unrelated EDGE
+    pixel's value — indistinguishable downstream from a real reading at
+    the intended location, and entirely plausible for the farthest
+    (70 km) upwind point near the border.
+
+    Reported now with the same shape already used for the file's own
+    missing-data sentinel, so no downstream consumer needs a new path.
+    """
+    far_outside = cp.SamplingPoint(
+        label="far", latitude=0.0, longitude=0.0,
+        easting=-5_000_000.0, northing=-5_000_000.0,
+    )
+    values = cp.extract_values_at_points(
+        hdf5_path=synthetic_odim_file, points=[far_outside]
+    )
+    assert len(values) == 1
+    assert values[0].precip_accum_mm_1h is None
+
+
+def test_extract_values_at_points_in_grid_point_still_works(synthetic_odim_file):
+    """Sanity check alongside the boundary change above: an in-bounds
+    corner point must still resolve, which is what would catch an
+    off-by-one introduced by the new bounds test."""
+    import h5py as _h5py
+
+    with _h5py.File(synthetic_odim_file, "r") as f:
+        where = f["where"].attrs
+        ll_e, ll_n = cp.wgs84_to_lv95(
+            latitude=float(where["LL_lat"]) + 0.01,
+            longitude=float(where["LL_lon"]) + 0.01,
+        )
+    corner = cp.SamplingPoint(
+        label="local", latitude=0.0, longitude=0.0, easting=ll_e, northing=ll_n
+    )
+    values = cp.extract_values_at_points(
+        hdf5_path=synthetic_odim_file, points=[corner]
+    )
+    assert values[0].precip_accum_mm_1h is not None
+
+
+def test_extract_values_at_points_stamps_the_quality_code(synthetic_odim_file):
+    """v0.1.24 (P1-16): the quality code comes from the CPC FILENAME,
+    which is always present, rather than from the optional ODIM
+    quality1/data1 sub-group, which is optional even within the spec and
+    may never be populated in practice."""
+    point = cp.SamplingPoint(
+        label="local", latitude=0.0, longitude=0.0,
+        easting=2_600_000.0, northing=1_200_000.0,
+    )
+    values = cp.extract_values_at_points(
+        hdf5_path=synthetic_odim_file, points=[point], quality=7
+    )
+    assert values[0].quality == 7
+
+
+def test_extract_values_at_points_quality_is_none_when_not_supplied(
+    synthetic_odim_file,
+):
+    point = cp.SamplingPoint(
+        label="local", latitude=0.0, longitude=0.0,
+        easting=2_600_000.0, northing=1_200_000.0,
+    )
+    values = cp.extract_values_at_points(
+        hdf5_path=synthetic_odim_file, points=[point]
+    )
+    assert values[0].quality is None

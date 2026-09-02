@@ -50,6 +50,11 @@ def _install_homeassistant_stubs() -> None:
     const.Platform = type("Platform", (), {"WEATHER": "weather", "SENSOR": "sensor", "BINARY_SENSOR": "binary_sensor"})
     const.UnitOfPressure = type("UnitOfPressure", (), {"HPA": "hPa"})
     const.UnitOfTemperature = type("UnitOfTemperature", (), {"CELSIUS": "°C"})
+    const.UnitOfPrecipitationDepth = type(
+        "UnitOfPrecipitationDepth", (), {"MILLIMETERS": "mm"}
+    )
+    const.UnitOfSpeed = type("UnitOfSpeed", (), {"METERS_PER_SECOND": "m/s"})
+    const.PERCENTAGE = "%"
 
     data_entry_flow = _module("homeassistant.data_entry_flow")
     data_entry_flow.FlowResult = dict
@@ -83,6 +88,27 @@ def _install_homeassistant_stubs() -> None:
     from datetime import datetime as _datetime, timezone as _timezone
     dt_util.now = lambda: _datetime.now(_timezone.utc)
 
+    # v0.1.24 fix (INFRA-01): homeassistant.exceptions was missing from
+    # this stub set entirely. ConfigEntryAuthFailed is what actually
+    # drives Home Assistant's reauth flow, and the v0.1.24 auth-
+    # propagation fixes (P1-01, P2-12) import it in coordinator.py and
+    # __init__.py — without these stubs, importing either module fails at
+    # collection time and the whole suite errors out.
+    exceptions = _module("homeassistant.exceptions")
+    exceptions.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
+    exceptions.ConfigEntryAuthFailed = type(
+        "ConfigEntryAuthFailed", (exceptions.HomeAssistantError,), {}
+    )
+    exceptions.ConfigEntryNotReady = type(
+        "ConfigEntryNotReady", (exceptions.HomeAssistantError,), {}
+    )
+
+    entity_registry = _module("homeassistant.helpers.entity")
+    entity_registry.DeviceInfo = dict
+    entity_registry.EntityCategory = type(
+        "EntityCategory", (), {"DIAGNOSTIC": "diagnostic", "CONFIG": "config"}
+    )
+
     entity_platform = _module("homeassistant.helpers.entity_platform")
     entity_platform.AddEntitiesCallback = object
 
@@ -93,14 +119,64 @@ def _install_homeassistant_stubs() -> None:
     weather_component.WeatherEntityFeature = type("WeatherEntityFeature", (), {"FORECAST_HOURLY": 1})
     sensor_component = _module("homeassistant.components.sensor")
     sensor_component.SensorEntity = type("SensorEntity", (), {})
+    # v0.1.24 (IND-08): the entity-metadata fixes reference these enums by
+    # attribute, so the stub needs the specific members sensor.py uses.
+    sensor_component.SensorDeviceClass = type(
+        "SensorDeviceClass",
+        (),
+        {"TIMESTAMP": "timestamp", "DURATION": "duration",
+         "TEMPERATURE": "temperature", "ATMOSPHERIC_PRESSURE": "atmospheric_pressure"},
+    )
+    sensor_component.SensorStateClass = type(
+        "SensorStateClass",
+        (),
+        {"MEASUREMENT": "measurement", "TOTAL_INCREASING": "total_increasing"},
+    )
     binary_sensor_component = _module("homeassistant.components.binary_sensor")
     binary_sensor_component.BinarySensorEntity = type("BinarySensorEntity", (), {})
+    binary_sensor_component.BinarySensorDeviceClass = type(
+        "BinarySensorDeviceClass", (), {"PROBLEM": "problem"}
+    )
 
-    voluptuous = _module("voluptuous")
-    voluptuous.Schema = lambda *a, **kw: None
-    voluptuous.Required = lambda *a, **kw: None
-    voluptuous.Optional = lambda *a, **kw: None
-    voluptuous.Coerce = lambda *a, **kw: None
+    _install_voluptuous_stub_only_if_really_missing()
+
+
+def _install_voluptuous_stub_only_if_really_missing() -> None:
+    """v0.1.24 fix (INFRA-02): this stub used to be installed
+    unconditionally, shadowing the real, independently-installed
+    voluptuous package.
+
+    voluptuous is an ordinary PyPI dependency with ZERO Home Assistant
+    dependency of its own — unlike every other module stubbed above,
+    which genuinely cannot be imported without installing Home Assistant.
+    The stub only ever provided Schema/Required/Optional/Coerce, all as
+    no-op lambdas returning None, so every validator built with vol.All /
+    vol.Range / vol.Invalid (the v0.1.24 config-flow validation fixes)
+    would have silently evaluated to None under test while working
+    correctly in production — tests passing against validators that were
+    never actually executed.
+
+    Fixed by trying the real import first and falling back to the minimal
+    stub only if that genuinely fails, matching the exact pattern already
+    used correctly for `homeassistant` itself at the top of
+    _install_homeassistant_stubs().
+    """
+    try:
+        import voluptuous  # noqa: F401
+        return
+    except ImportError:
+        pass
+
+    mod = types.ModuleType("voluptuous")
+    sys.modules["voluptuous"] = mod
+    mod.Schema = lambda *a, **kw: None
+    mod.Required = lambda *a, **kw: None
+    mod.Optional = lambda *a, **kw: None
+    mod.Coerce = lambda *a, **kw: None
+    mod.All = lambda *a, **kw: None
+    mod.Range = lambda *a, **kw: None
+    mod.In = lambda *a, **kw: None
+    mod.Invalid = type("Invalid", (Exception,), {})
 
 
 _install_homeassistant_stubs()

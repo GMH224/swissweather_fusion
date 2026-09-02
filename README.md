@@ -13,15 +13,49 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.1.1.** The core architecture is built and the business logic
-(bias correction, storm scoring, radar sampling) is unit-tested. The first
-real deployment against a live Home Assistant instance found four bugs
-(wrong Open-Meteo model names, an SRF response-shape crash, a setup
-sequencing issue that let one failing source block the whole integration,
-and an overly-narrow pressure sensor filter) — all fixed, see
-[DEVELOPER.md](DEVELOPER.md) for the full account. Continued real-world
-testing is still the priority; this is one deployment cycle in, not a
-mature, battle-tested release.
+**Status: v0.1.24.** The core architecture is built and the business
+logic (bias correction, storm scoring, radar sampling) is extensively
+unit-tested — 352 tests, pyflakes clean. v0.1.24 is a large remediation
+release closing 62 defects found across two external audits and one
+independent audit: see
+[swissweather_fusion_v0.1.24_remediation_audit.md](swissweather_fusion_v0.1.24_remediation_audit.md)
+for the full account, including the five places the external audits were
+themselves wrong.
+
+Continued real-world testing remains the priority. This is a
+carefully-reviewed codebase, not a battle-tested one.
+
+> **Upgrading from v0.1.23?** This release rebuilds the learning
+> database (schema v3). Learned bias statistics, radar observations and
+> storm predictions are discarded and relearned, because three fixes
+> changed what those stored values *mean*. Raw forecasts and station
+> observations are preserved. You will also be asked, once, whether your
+> pressure sensor reports sea-level or station-level pressure — see
+> below.
+
+
+## Which pressure sensor to choose
+
+This matters more than it looks. Netatmo — and several other stations —
+publish **two** pressure values:
+
+| Entity | What it is |
+| --- | --- |
+| `sensor.<station>_pressure` | Normalised to **mean sea level** using the altitude captured during setup |
+| `sensor.<station>_absolute_pressure` | The **raw** pressure measured at your station's altitude |
+
+Home Assistant gives both the same `atmospheric_pressure` device class,
+so the integration cannot tell them apart — you have to say which one you
+picked. During setup there is a checkbox, **"My pressure sensor already
+reports sea-level pressure"**:
+
+- Using **absolute pressure**? Leave it **off** (the default). The
+  integration reduces the reading to sea level itself.
+- Using the normalised **pressure** entity? Turn it **on**.
+
+Getting this wrong introduces a constant error of roughly 60 hPa at 500 m
+altitude, which Model A would otherwise faithfully learn as forecast
+"bias". You can change the answer later under **Configure**.
 
 ## What this does
 

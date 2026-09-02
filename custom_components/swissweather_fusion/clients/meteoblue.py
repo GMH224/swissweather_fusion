@@ -31,12 +31,27 @@ from ..const import (
     METEOBLUE_SUMMER_MONTHS,
     METEOBLUE_WINTER_HOURS_LOCAL,
 )
+from ..fingerprint import fingerprint_points
 
 BASE_URL = "https://my.meteoblue.com/packages/basic-1h_basic-day"
 
 
 def build_forecast_url(*, latitude: float, longitude: float, api_key: str) -> str:
-    return f"{BASE_URL}?lat={latitude}&lon={longitude}&apikey={api_key}"
+    # v0.1.23 fix (own-review finding, not in the external ICS audit):
+    # explicit &tz=UTC. Per meteoblue's own API documentation (data
+    # packages and images doc, §3.6-3.7): if the &tz= parameter is
+    # omitted, the API looks up a timezone from the request coordinates
+    # and returns human-readable timestamps (the "Y-M-D hh:mm" style this
+    # client parses from data_1h.time) in THAT LOCAL ZONE, not UTC — only
+    # the separate numeric-epoch time formats are UTC "by definition".
+    # This client's parse_forecast_response() was tagging every parsed
+    # timestamp with tzinfo=timezone.utc regardless, silently mislabeling
+    # what was actually Europe/Zurich local time as UTC for a Swiss
+    # deployment. meteoblue's own docs recommend exactly this fix
+    # verbatim: "For autonomous systems we recommend to use UTC" for the
+    # tz parameter. Matches the explicit &timezone=UTC Open-Meteo's client
+    # already sends for the identical reason (see open_meteo.py).
+    return f"{BASE_URL}?lat={latitude}&lon={longitude}&apikey={api_key}&tz=UTC"
 
 
 def scheduled_hours_for_month(month: int) -> tuple[int, ...]:
@@ -161,6 +176,31 @@ class BonusCallTracker:
             d: c for d, c in self._calls_used_by_date.items() if d >= keep_since
         }
 
+    def to_state(self) -> dict:
+        """v0.1.23 fix (L-08): serializes this tracker's usage-by-date map
+        so the coordinator can persist it via
+        SwissWeatherDB.set_bonus_call_tracker_state(). Previously this
+        state existed only as a plain instance attribute, reset to empty
+        on every Home Assistant restart/reload — meaning a restart could
+        forget same-day bonus usage already spent, letting the daily
+        allowance be exceeded across a reload."""
+        return {d.isoformat(): c for d, c in self._calls_used_by_date.items()}
+
+    @classmethod
+    def from_state(
+        cls, state: Optional[dict], *, max_calls_per_day: int = METEOBLUE_MAX_BONUS_CALLS_PER_EVENT
+    ) -> "BonusCallTracker":
+        """Inverse of to_state(). A missing/empty state (e.g. first-ever
+        start, or nothing persisted yet) behaves exactly like the old
+        always-empty default — this only adds durability, it doesn't
+        change first-run behavior."""
+        tracker = cls(max_calls_per_day=max_calls_per_day)
+        if state:
+            tracker._calls_used_by_date = {
+                date.fromisoformat(d): c for d, c in state.items()
+            }
+        return tracker
+
 
 # Fields confirmed present via a live test call during planning:
 # relativehumidity, sealevelpressure, temperature, precipitation, windspeed,
@@ -187,15 +227,59 @@ class ParsedMeteoblueForecast:
     grid_elevation_m: Optional[float]
     points: list[MeteoblueForecastPoint]
     predictability: Optional[list[float]]  # confidence score, hourly — bonus field
+    # v0.1.23 fix (L-05): content fingerprint of `points` (see
+    # fingerprint.py), letting the coordinator recognize and skip an
+    # unchanged upstream model run instead of unconditionally inserting a
+    # fresh set of forecast_snapshots rows on every scheduled/bonus poll —
+    # meteoblue previously had no dedup mechanism at all, unlike
+    # Open-Meteo (L-06, fixed alongside this).
+    run_fingerprint: Optional[str] = None
+    # v0.1.24 fix (P1-24): names of any value arrays whose length did not
+    # match the "time" axis. Mirrors ParsedForecast.array_length_mismatches
+    # in open_meteo.py, added there by the v0.1.19 fix. Empty tuple is the
+    # normal case.
+    array_length_mismatches: tuple[str, ...] = ()
+
+
+def _parse_utc(value: str, naive_format: str | None = None) -> datetime:
+    """Parse a provider timestamp to an aware UTC datetime.
+
+    **v0.1.24 fix (P1-25)**: both this client and open_meteo.py used
+
+        datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+
+    which is correct ONLY for naive input. On already-aware input,
+    .replace() overwrites the tzinfo label without converting the
+    underlying instant, so "14:00+02:00" silently becomes "14:00+00:00"
+    — the same wall-clock reading, two hours off the actual moment.
+
+    Not believed to be actively wrong today, since both clients now
+    explicitly request UTC output (&tz=UTC / &timezone=UTC) and
+    meteoblue's hourly times use a naive "%Y-%m-%d %H:%M" format that
+    cannot carry an offset. But a provider adding an offset to its
+    output would corrupt every stored valid_at with no error, and the
+    correct form costs one branch.
+    """
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        if naive_format is None:
+            raise
+        parsed = datetime.strptime(value, naive_format)
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc)
+    return parsed.replace(tzinfo=timezone.utc)
 
 
 def parse_forecast_response(payload: dict[str, Any]) -> ParsedMeteoblueForecast:
     metadata = payload.get("metadata", {})
     issued_at_str = metadata.get("modelrun_updatetime_utc")
+    # v0.1.24 fix (P1-10): whether the provider gave us a REAL model-run
+    # identifier, as opposed to us falling back to "now", determines
+    # whether the fingerprint below can use run identity at all.
+    has_real_run_identity = bool(issued_at_str)
     issued_at = (
-        datetime.fromisoformat(issued_at_str).replace(tzinfo=timezone.utc)
-        if issued_at_str
-        else datetime.now(timezone.utc)
+        _parse_utc(issued_at_str) if issued_at_str else datetime.now(timezone.utc)
     )
     grid_elevation_m = metadata.get("height")
 
@@ -203,21 +287,55 @@ def parse_forecast_response(payload: dict[str, Any]) -> ParsedMeteoblueForecast:
     times = data_1h.get("time", [])
 
     points: list[MeteoblueForecastPoint] = []
+    mismatches: list[str] = []
     for mb_key, internal_name in _FIELD_MAP.items():
         values = data_1h.get(mb_key)
         if values is None:
             continue
+        # v0.1.24 fix (P1-24): zip() silently truncates to the shorter
+        # sequence, so a response whose value array did not match the
+        # "time" axis lost the tail with no trace at all. Open-Meteo has
+        # tracked this since the v0.1.19 fix; meteoblue had no
+        # equivalent. Recorded rather than raised — a partial forecast is
+        # still worth storing, but the caller needs to know it happened.
+        if len(values) != len(times):
+            mismatches.append(
+                f"{mb_key}: {len(values)} values vs {len(times)} times"
+            )
         for t_str, value in zip(times, values):
-            valid_at = datetime.strptime(t_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            valid_at = _parse_utc(t_str, naive_format="%Y-%m-%d %H:%M")
             points.append(
                 MeteoblueForecastPoint(variable=internal_name, valid_at=valid_at, value=value)
             )
+
+    # v0.1.24 fix (P1-10): fingerprint_points() hashes only the sorted
+    # (variable, valid_at, value) tuples. That is robust to metadata
+    # noise, which is why v0.1.23 chose it — but it also means a
+    # genuinely NEW model run that happens to produce identical values to
+    # the previous one (entirely plausible during a stable weather
+    # pattern) collides with it and is discarded as a duplicate, silently
+    # losing a real, independent training sample.
+    #
+    # When the provider gave us a real run identifier, that becomes the
+    # PRIMARY discriminator and the content hash is layered on as a
+    # secondary integrity check. When it did not, issued_at is just
+    # datetime.now() — which changes on every single call and would
+    # defeat deduplication entirely if embedded — so we fall back to
+    # content-hash-only, exactly as before.
+    content_hash = fingerprint_points(points)
+    run_fingerprint = (
+        f"{issued_at.isoformat()}|{content_hash}"
+        if has_real_run_identity
+        else content_hash
+    )
 
     return ParsedMeteoblueForecast(
         issued_at=issued_at,
         grid_elevation_m=grid_elevation_m,
         points=points,
         predictability=data_1h.get("predictability"),
+        run_fingerprint=run_fingerprint,
+        array_length_mismatches=tuple(mismatches),
     )
 
 

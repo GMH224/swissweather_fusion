@@ -214,13 +214,34 @@ async def async_get_config_entry_diagnostics(
     # one directly — see tests/test_diagnostics.py's new
     # test_async_get_config_entry_diagnostics_smoke for why that gap is
     # now closed.
-    secrets = [
-        entry.data.get(CONF_SRF_CONSUMER_KEY),
-        entry.data.get(CONF_SRF_CONSUMER_SECRET),
-        entry.data.get(CONF_METEOBLUE_API_KEY),
-        entry.data.get(CONF_METEONOMIQS_API_KEY),
-        entry.data.get(CONF_OPEN_METEO_API_KEY),
-    ]
+    # v0.1.24 fix (P1-04): collect BOTH the options-stored and
+    # data-stored value for every credential, not just entry.data.
+    #
+    # Runtime resolution throughout this integration is options-first —
+    # options.get(KEY, data[KEY]) — so a credential changed through the
+    # options flow has its ACTIVE value in options and only a stale copy
+    # in data. Building the redaction set from data alone meant the
+    # currently-in-use secret was the one value not scrubbed, while the
+    # obsolete one was. This compounds with P1-03:
+    # DiagnosticsRecorder.record() deliberately stores raw text and
+    # relies entirely on redaction at export time, so a leaked key in an
+    # exception string would have survived into the downloadable file.
+    #
+    # Over-redacting rather than under-redacting is this project's own
+    # stated philosophy (see redaction.py's module docstring), and it is
+    # the right call here: a buffered diagnostics event can still
+    # reference a since-changed value, so both copies genuinely need
+    # scrubbing.
+    secrets = []
+    for key in (
+        CONF_SRF_CONSUMER_KEY,
+        CONF_SRF_CONSUMER_SECRET,
+        CONF_METEOBLUE_API_KEY,
+        CONF_METEONOMIQS_API_KEY,
+        CONF_OPEN_METEO_API_KEY,
+    ):
+        secrets.append(entry.options.get(key))
+        secrets.append(entry.data.get(key))
 
     # Config entry data/options redacted the same way as everything else
     # in this project — credentials, coordinates, and elevation all match

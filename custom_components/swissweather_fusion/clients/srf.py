@@ -29,6 +29,31 @@ import aiohttp
 
 _LOGGER = logging.getLogger(__name__)
 
+
+class SrfPermanentError(RuntimeError):
+    """v0.1.23 fix (L-11): raised for SRF responses that should NOT
+    trigger the v2/forecastpoint -> daily-fallback attempt — a permanent
+    4xx (bad request, account/API-plan restriction, revoked/invalid
+    auth), not a transient network/5xx condition. Previously
+    async_fetch_forecastpoint raised a plain RuntimeError for the
+    parseable-SRF-detail case, which the coordinator's `except Exception`
+    treated identically to a genuine transient failure — meaning a
+    permanent rejection (e.g. the confirmed real "exceeded your location
+    limit" free-plan restriction) triggered the exact same fallback
+    request, and then repeated that same wasted primary+fallback pair on
+    every subsequent poll forever, with the root cause hidden behind
+    continuously-degraded-but-not-loudly-failing operation.
+
+    Carries the HTTP status so health.classify_exception (which checks
+    `getattr(err, "status", None)`) still correctly buckets 401/403 as an
+    auth error distinct from other permanent 4xx data errors.
+    """
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 # v0.1.6: none of this client's three HTTP calls (token exchange,
 # geolocation lookup, forecast fetch) had an explicit timeout. Found after
 # SRF's polling appeared to silently stop entirely for several hours in
@@ -551,8 +576,8 @@ class SrfClient:
             extra={"raw_response": redacted},
         )
 
-    async def _async_ensure_token(self) -> str:
-        if self._token is None or self._token.is_expired():
+    async def _async_ensure_token(self, *, force_refresh: bool = False) -> str:
+        if force_refresh or self._token is None or self._token.is_expired():
             headers = {
                 "Authorization": build_basic_auth_header(
                     self._consumer_key, self._consumer_secret
@@ -570,6 +595,91 @@ class SrfClient:
             )
         return self._token.access_token
 
+    async def _async_get_with_token_retry(self, url: str, *, params: Optional[dict] = None):
+        """v0.1.23 fix (L-12): performs an authenticated GET, and on a 401
+        (the cached token was rejected — revoked, invalidated server-side,
+        or otherwise no longer valid despite not yet being locally
+        expired) clears the cache, refreshes the token exactly once, and
+        retries the same request exactly once.
+
+        Previously the only trigger for a token refresh was local expiry
+        (CachedToken.is_expired()) — a token invalidated for any other
+        reason (revocation, a key rotation on SRF's side, etc.) would
+        stay cached and keep being sent as-is until its local expiry
+        arrived on its own, causing repeated auth failures on every poll
+        in between instead of self-healing after one clean refresh.
+
+        Returns the awaited response body as parsed JSON, matching what
+        each call site previously did inline — callers no longer manage
+        the `async with` block or the token header themselves.
+        """
+        token = await self._async_ensure_token()
+        resp_json, status, body_text = await self._async_get_raw(url, token=token, params=params)
+        if status == 401:
+            _LOGGER.warning(
+                "SRF request returned 401 with a cached token that wasn't "
+                "locally expired — clearing it and refreshing once before "
+                "retrying this request."
+            )
+            token = await self._async_ensure_token(force_refresh=True)
+            resp_json, status, body_text = await self._async_get_raw(url, token=token, params=params)
+        if status != 200:
+            self._raise_for_status(status=status, body_text=body_text)
+        return resp_json
+
+    async def _async_get_raw(
+        self, url: str, *, token: str, params: Optional[dict] = None
+    ) -> tuple[Any, int, str]:
+        """Single GET attempt — reads the body regardless of status (SRF
+        returns structured error detail in the body on 4xx, see
+        parse_srf_error_detail), returning (parsed_json_or_None, status,
+        raw_body_text) rather than raising, so callers (the 401-retry
+        wrapper above) can decide what to do before committing to an
+        error."""
+        headers = {"Authorization": f"Bearer {token}"}
+        async with self._session.get(
+            url, headers=headers, params=params, timeout=_client_timeout()
+        ) as resp:
+            status = resp.status
+            body_text = await resp.text()
+        parsed = None
+        if status == 200:
+            try:
+                parsed = json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                parsed = None
+        return parsed, status, body_text
+
+    def _raise_for_status(self, *, status: int, body_text: str) -> None:
+        """v0.1.23 fix (L-11): classifies a non-200 response instead of
+        always raising a plain, unclassified error. 4xx is treated as
+        permanent (raises SrfPermanentError, carrying the status so
+        health.py's classify_exception still buckets 401/403 as 'auth'
+        distinctly) — the caller must NOT attempt the daily-fallback
+        endpoint for these, since a permanent rejection of the primary
+        endpoint has no reason to succeed against the fallback either,
+        and retrying it every poll just wastes a call and hides the real
+        cause. 5xx (or anything else) raises a plain RuntimeError, which
+        the coordinator's existing broad `except Exception` still treats
+        as fallback-eligible, matching the pre-fix behavior for genuinely
+        transient failures.
+        """
+        srf_detail = parse_srf_error_detail(body_text)
+        if 400 <= status < 500:
+            detail_suffix = f": {srf_detail}" if srf_detail else ""
+            raise SrfPermanentError(
+                f"SRF request rejected (HTTP {status}){detail_suffix}. This "
+                f"is very likely a permanent SRG-SSR account/API-plan "
+                f"restriction or an authentication problem (e.g. the free "
+                f"plan's one-registered-location limit — confirmed as the "
+                f"real cause once before), not a transient network issue — "
+                f"not retrying via the fallback endpoint. Check the app's "
+                f"registered locations at https://developer.srgssr.ch or "
+                f"contact meteo.api@srgssr.ch.",
+                status=status,
+            )
+        raise RuntimeError(f"SRF request failed with HTTP {status}: {body_text[:500]}")
+
     async def _async_ensure_geolocation_id(self, latitude: float, longitude: float) -> str:
         # Cache by coordinates — only re-resolve if the configured location
         # actually changes, not on every poll.
@@ -579,14 +689,8 @@ class SrfClient:
         ):
             return self._geolocation_id
 
-        token = await self._async_ensure_token()
-        headers = {"Authorization": f"Bearer {token}"}
         params = {"latitude": latitude, "longitude": longitude}
-        async with self._session.get(
-            GEOLOCATION_URL, headers=headers, params=params, timeout=_client_timeout()
-        ) as resp:
-            resp.raise_for_status()
-            payload = await resp.json()
+        payload = await self._async_get_with_token_retry(GEOLOCATION_URL, params=params)
         geolocation_id = parse_geolocation_response(payload)
         if geolocation_id is None:
             # v0.1.4: log what was actually received rather than just
@@ -630,15 +734,12 @@ class SrfClient:
     async def async_fetch_forecast(
         self, *, latitude: float, longitude: float
     ) -> list[SrfForecastPoint]:
-        token = await self._async_ensure_token()
         geolocation_id = await self._async_ensure_geolocation_id(latitude, longitude)
-        headers = {"Authorization": f"Bearer {token}"}
         url = build_forecast_url(geolocation_id)
-        async with self._session.get(
-            url, headers=headers, timeout=_client_timeout()
-        ) as resp:
-            resp.raise_for_status()
-            payload = await resp.json()
+        # v0.1.23 fix (L-12): _async_get_with_token_retry replaces the
+        # previous inline token+GET, adding the 401-clear-and-refresh-once
+        # behavior uniformly to every SRF request, not just this one.
+        payload = await self._async_get_with_token_retry(url)
         points = parse_forecast_response(payload)
         if not points:
             # v0.1.4: same reasoning as the geolocation lookup above —
@@ -685,42 +786,19 @@ class SrfClient:
         API has surprised this project enough times that a graceful
         fallback is worth having), the caller falls back to
         async_fetch_forecast — daily-only data is better than none.
+
+        v0.1.23 fix (L-11/L-12): now goes through
+        _async_get_with_token_retry, which (a) clears and refreshes a
+        rejected cached token once before giving up (L-12), and (b)
+        raises SrfPermanentError specifically for 4xx responses (L-11) —
+        the caller (SrfCoordinator._async_update_data) must NOT treat
+        that as fallback-eligible the way it treats a genuine transient
+        failure, since a permanent rejection of this endpoint has no
+        reason to succeed against the fallback either.
         """
-        token = await self._async_ensure_token()
         geolocation_id = await self._async_ensure_geolocation_id(latitude, longitude)
-        headers = {"Authorization": f"Bearer {token}"}
         url = build_forecastpoint_url(geolocation_id)
-        async with self._session.get(
-            url, headers=headers, timeout=_client_timeout()
-        ) as resp:
-            if resp.status != 200:
-                # v0.1.21 fix: previously just resp.raise_for_status(),
-                # which raises before the body is read — meaning SRF's
-                # own structured error detail (e.g. the confirmed real
-                # "you have exceeded your location limit" free-plan
-                # restriction) never reached the log or diagnostics,
-                # only a generic "400, message='Bad Request', url=...".
-                # Reading the body first (still valid on the open
-                # response within this `async with` block, regardless of
-                # status) lets us surface SRF's actual explanation when
-                # there is one, and falls back to the normal
-                # raise_for_status() behavior otherwise.
-                body_text = await resp.text()
-                srf_detail = parse_srf_error_detail(body_text)
-                if srf_detail is not None:
-                    raise RuntimeError(
-                        f"SRF v2/forecastpoint rejected the request "
-                        f"(HTTP {resp.status}): {srf_detail}. This is very "
-                        f"likely an SRG-SSR account/API-plan restriction "
-                        f"(e.g. the free plan's one-registered-location "
-                        f"limit — confirmed as the real cause once before), "
-                        f"not a bug in this integration. Check the app's "
-                        f"registered locations at "
-                        f"https://developer.srgssr.ch or contact "
-                        f"meteo.api@srgssr.ch."
-                    )
-                resp.raise_for_status()
-            payload = await resp.json()
+        payload = await self._async_get_with_token_retry(url)
         points = parse_forecastpoint_response(payload)
         if not points:
             _LOGGER.warning(

@@ -245,3 +245,35 @@ def test_parse_forecast_response():
     temps = [p for p in parsed.points if p.variable == "temperature"]
     assert temps[0].value == 16.0
     assert parsed.predictability == [71, 71]
+
+
+# -- v0.1.23: BonusCallTracker persistence (L-08) ----------------------------
+
+
+def test_bonus_call_tracker_to_state_and_from_state_round_trip():
+    tracker = mb.BonusCallTracker(max_calls_per_day=3)
+    today = date(2026, 7, 25)
+    tracker.record_bonus_call_used(today=today)
+    tracker.record_bonus_call_used(today=today)
+
+    state = tracker.to_state()
+    assert state == {"2026-07-25": 2}
+
+    restored = mb.BonusCallTracker.from_state(state, max_calls_per_day=3)
+    # The restored tracker must actually enforce the already-used count —
+    # not just hold the number, but behave correctly from it.
+    assert restored.can_use_bonus_call(today=today) is True  # 2 used, cap 3
+    restored.record_bonus_call_used(today=today)
+    assert restored.can_use_bonus_call(today=today) is False  # now 3 used, cap 3
+
+
+def test_bonus_call_tracker_from_state_with_none_behaves_like_fresh_tracker():
+    """A missing/empty persisted state (e.g. first-ever start after
+    upgrading to v0.1.23) must behave exactly like the old always-empty
+    default — restart-safety must not change first-run behavior."""
+    restored = mb.BonusCallTracker.from_state(None, max_calls_per_day=2)
+    today = date(2026, 7, 25)
+    assert restored.can_use_bonus_call(today=today) is True
+    assert restored.try_use_bonus_call(today=today) is True
+    assert restored.try_use_bonus_call(today=today) is True
+    assert restored.try_use_bonus_call(today=today) is False  # cap reached

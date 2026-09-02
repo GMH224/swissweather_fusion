@@ -18,6 +18,7 @@ from typing import Any, Optional
 from datetime import datetime, timedelta, timezone
 
 from ..const import (
+    CONDITION_CLOUDY_HUMIDITY_THRESHOLD,
     EMA_ALPHA_BY_LEAD_TIME,
     EMA_WEIGHT_EPSILON,
     LAPSE_RATE_C_PER_1000M,
@@ -100,23 +101,42 @@ def update_bucket_ema(
     alpha (responsiveness) varies by lead_time_bucket: short buckets adapt
     fast since recent regime changes matter there; long buckets smooth
     heavily since their data is sparser and noisier per bucket.
+
+    v0.1.23 fix (L-03, external ICS audit): ema_abs_error MUST be computed
+    using previous_bias, before this observation updates the bias — not
+    after. The old code computed new_bias first (folding this very
+    observation's raw error into it) and only then measured the "debiased"
+    residual against that already-updated bias, so the current sample
+    partially fit itself before it ever contributed to ema_abs_error. That
+    made the error statistic systematically optimistic — worst for new/
+    low-sample-count buckets, where alpha is largest — and, since
+    ema_weight = 1 / (ema_abs_error + epsilon), a learned source weight
+    could end up too large. Evaluating the residual against previous_bias
+    first (the bias as it stood *before* this sample) fixes that: the
+    sample is judged on how well the *existing* model predicted it, then
+    folded into both statistics for next time. This is standard online
+    least-squares/EMA practice — predict-then-update, never update-then-
+    grade-yourself-against-the-update.
     """
     alpha = EMA_ALPHA_BY_LEAD_TIME[lead_time_bucket]
 
     raw_error = forecast_value - actual_value
+
+    # Judge this observation against the bias as it stood BEFORE this
+    # sample updates it — see the fix note above. On the very first sample
+    # for a bucket there is no previous bias to debias against yet, so the
+    # raw (undebiased) forecast is the only honest baseline.
+    debiased_forecast = forecast_value - previous_bias
+    abs_error_before_bias_update = abs(debiased_forecast - actual_value)
+    if previous_sample_count == 0:
+        new_abs_error = abs_error_before_bias_update
+    else:
+        new_abs_error = alpha * abs_error_before_bias_update + (1 - alpha) * previous_abs_error
+
     if previous_sample_count == 0:
         new_bias = raw_error
     else:
         new_bias = alpha * raw_error + (1 - alpha) * previous_bias
-
-    # Absolute error of the *debiased* forecast against actual — this is
-    # what should drive the weight, not the raw error.
-    debiased_forecast = forecast_value - new_bias
-    abs_error_after_debias = abs(debiased_forecast - actual_value)
-    if previous_sample_count == 0:
-        new_abs_error = abs_error_after_debias
-    else:
-        new_abs_error = alpha * abs_error_after_debias + (1 - alpha) * previous_abs_error
 
     new_weight = 1.0 / (new_abs_error + EMA_WEIGHT_EPSILON)
 
@@ -137,6 +157,64 @@ class SourceContribution:
     sample_count: int
 
 
+# v0.1.24 (IND-01): the two helpers below exist to put cold-start and
+# learned weights on one comparable, dimensionless scale.
+#
+# MAX_LEARNED_WEIGHT_RATIO bounds how far a single well-performing source
+# can dominate the others within one blend. Without it, a bucket whose
+# ema_abs_error happens to approach zero reaches 1/EMA_WEIGHT_EPSILON =
+# 100 and effectively becomes the only contributor — which is not a
+# statement the data supports, since ema_abs_error is itself an EMA over
+# a modest number of samples and can be transiently tiny by luck. 8:1 is
+# wide enough to let a genuinely better source lead decisively while
+# keeping the others audible.
+MAX_LEARNED_WEIGHT_RATIO = 8.0
+
+
+def _reference_weight(contributions: list[SourceContribution]) -> float:
+    """The weight scale for THIS blend, in this measurement's units.
+
+    Returns the median learned weight among trusted contributors, which
+    is the natural "neutral" point for the set: a cold-start source is
+    neither better nor worse than a typical learned source, which is
+    exactly the claim the cold-start guard wants to make.
+
+    When no contributor is trusted yet (the genuine cold-start case,
+    every source below MIN_SAMPLES_TO_TRUST_BUCKET), every source gets
+    this same value, so the blend degenerates to a plain average of raw
+    values — identical to the pre-v0.1.24 behaviour for that case, which
+    was always correct.
+    """
+    trusted = [
+        c.ema_weight
+        for c in contributions
+        if c.sample_count >= MIN_SAMPLES_TO_TRUST_BUCKET
+        and c.ema_weight is not None
+        and c.ema_weight > 0
+    ]
+    if not trusted:
+        return 1.0
+    ordered = sorted(trusted)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def _clamp_learned_weight(weight: float | None, reference: float) -> float:
+    """Bound a learned weight to a sane multiple of the reference scale.
+
+    Also guards against a None or non-positive weight, which would
+    otherwise silently remove a source from the blend or, worse, make
+    weight_total zero.
+    """
+    if weight is None or weight <= 0:
+        return reference
+    ceiling = reference * MAX_LEARNED_WEIGHT_RATIO
+    floor = reference / MAX_LEARNED_WEIGHT_RATIO
+    return max(floor, min(ceiling, weight))
+
+
 def blend(contributions: list[SourceContribution]) -> float | None:
     """Debias each source, then weight-blend the debiased values.
 
@@ -145,11 +223,36 @@ def blend(contributions: list[SourceContribution]) -> float | None:
     looks fine but isn't for the right reason. See plan doc §3.
 
     Sources with sample_count below MIN_SAMPLES_TO_TRUST_BUCKET contribute
-    their raw (uncorrected) value with a neutral weight of 1.0, rather than
-    a partially-learned correction — this is the cold-start guard. If every
-    contributing source is below the trust threshold, the blend still
-    proceeds using raw values; there's no untrusted-everything fallback
-    beyond that, by design (some answer is better than none).
+    their raw (uncorrected) value rather than a partially-learned
+    correction — this is the cold-start guard. If every contributing
+    source is below the trust threshold, the blend still proceeds using
+    raw values; there's no untrusted-everything fallback beyond that, by
+    design (some answer is better than none).
+
+    **v0.1.24 fix (IND-01)**: the cold-start weight used to be a
+    hard-coded 1.0 while a trusted source's weight was
+    1 / (ema_abs_error + EMA_WEIGHT_EPSILON). Those two numbers are not
+    on the same scale, and the learned one carries the measurement's own
+    units, so the blend behaved differently — and wrongly — per
+    measurement:
+
+        humidity, trusted source with MAE 5%      -> weight 0.20
+        pressure, trusted source with MAE 0.3 hPa -> weight 3.23
+
+    against a cold-start weight of exactly 1.0 in both cases. For
+    humidity and precipitation, where absolute errors are numerically
+    large, every well-characterised source was therefore weighted BELOW
+    every unvalidated one: a source with 200 validated samples was
+    outvoted roughly 5:1 by a source with one. Learning made the blend
+    worse. There was also no upper bound — EMA_WEIGHT_EPSILON caps the
+    raw weight at 100, so one bucket with a near-zero error could
+    dominate 100:1.
+
+    Both are fixed by making the weights dimensionless relative to the
+    contributing set: see _reference_weight() and
+    _clamp_learned_weight(). This changes blend output for existing
+    installations, which is why it lands with a schema rebuild rather
+    than as a silent in-place behaviour change.
 
     **v0.1.7 fix**: a source can legitimately return `null` for a given
     hour/measurement (any of Open-Meteo/SRF/meteoblue can do this), which
@@ -169,17 +272,25 @@ def blend(contributions: list[SourceContribution]) -> float | None:
     if not contributions:
         return None
 
+    usable = [c for c in contributions if c.raw_value is not None]
+    if not usable:
+        return None
+
+    reference = _reference_weight(usable)
+
     weighted_sum = 0.0
     weight_total = 0.0
-    for c in contributions:
-        if c.raw_value is None:
-            continue
+    for c in usable:
         if c.sample_count < MIN_SAMPLES_TO_TRUST_BUCKET:
             debiased = c.raw_value
-            weight = 1.0
+            # v0.1.24 fix (IND-01): the cold-start weight is now drawn
+            # from the same scale as the learned weights in this blend,
+            # instead of the hard-coded 1.0 that made the two
+            # incomparable. See _reference_weight below.
+            weight = reference
         else:
             debiased = c.raw_value - c.ema_bias
-            weight = c.ema_weight
+            weight = _clamp_learned_weight(c.ema_weight, reference)
         weighted_sum += debiased * weight
         weight_total += weight
 
@@ -281,13 +392,25 @@ def aggregate_daily_forecast(
             e["native_precipitation"] for e in entries if e["native_precipitation"] is not None
         ]
         total_precip = sum(precips) if precips else None
+        # v0.1.24 (P2-10): needed by derive_condition's "cloudy" branch.
+        humidities = [e.get("humidity") for e in entries if e.get("humidity") is not None]
         results.append(
             {
                 "datetime": datetime.combine(day, datetime.min.time(), tzinfo=local_tz).isoformat(),
                 "native_temperature": max(temps) if temps else None,
                 "native_templow": min(temps) if temps else None,
                 "native_precipitation": total_precip,
-                "condition": "rainy" if (total_precip or 0) > 0.5 else "sunny",
+                # v0.1.24 (P2-10): 0.5 mm passed explicitly — a DAILY
+                # total is not the same quantity as an hourly amount and
+                # must not silently inherit the hourly site's threshold.
+                # `total_precip or 0` preserves this site's own
+                # pre-existing None-as-zero behaviour.
+                "condition": derive_condition(
+                    total_precip or 0,
+                    max(temps) if temps else None,
+                    max(humidities) if humidities else None,
+                    precip_threshold=0.5,
+                ),
             }
         )
     return results
@@ -309,6 +432,17 @@ def aggregate_twice_daily_forecast(
 
     **v0.1.15 fix**: same timezone bug and fix as aggregate_daily_forecast
     above — `local_tz` defaults to UTC for backward compatibility.
+
+    **v0.1.23 fix (own-review finding, not in the external ICS audit)**:
+    the night period's representative temperature now uses min(temps)
+    ("overnight low"), not max(temps). It previously used max() for both
+    day AND night periods — meaning a night entry reported the warmest
+    point of the night (typically right after sunset) rather than the
+    overnight low, the opposite of what "night temperature" conventionally
+    means and inconsistent with aggregate_daily_forecast's own separate
+    native_temperature (high) / native_templow (low) split just above.
+    This was silent: the shipped unit tests asserted the max()-for-night
+    behavior as if it were correct, so nothing caught it.
     """
     by_period: dict[tuple[Any, bool], list[dict[str, Any]]] = {}
     for entry in hourly_forecast:
@@ -334,6 +468,8 @@ def aggregate_twice_daily_forecast(
             e["native_precipitation"] for e in entries if e["native_precipitation"] is not None
         ]
         total_precip = sum(precips) if precips else None
+        # v0.1.24 (P2-10): needed by derive_condition's "cloudy" branch.
+        humidities = [e.get("humidity") for e in entries if e.get("humidity") is not None]
         period_start_hour = TWICE_DAILY_DAY_START_HOUR if is_daytime else TWICE_DAILY_DAY_END_HOUR
         results.append(
             {
@@ -341,9 +477,75 @@ def aggregate_twice_daily_forecast(
                     day, datetime.min.time(), tzinfo=local_tz
                 ).replace(hour=period_start_hour).isoformat(),
                 "is_daytime": is_daytime,
-                "native_temperature": max(temps) if temps else None,
+                "native_temperature": (
+                    (max(temps) if is_daytime else min(temps)) if temps else None
+                ),
                 "native_precipitation": total_precip,
-                "condition": "rainy" if (total_precip or 0) > 0.5 else "sunny",
+                # v0.1.24 (P2-10): see the daily aggregation above.
+                "condition": derive_condition(
+                    total_precip or 0,
+                    (max(temps) if is_daytime else min(temps)) if temps else None,
+                    max(humidities) if humidities else None,
+                    precip_threshold=0.5,
+                ),
             }
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# Weather condition mapping (v0.1.24, P2-10)
+# ---------------------------------------------------------------------------
+def derive_condition(
+    precip: float | None,
+    temperature: float | None,
+    humidity: float | None,
+    precip_threshold: float = 0.1,
+) -> str | None:
+    """Map blended values to a Home Assistant weather condition string.
+
+    **Why this function exists.** Four separate call sites — weather.py's
+    current condition, coordinator.py's hourly forecast, and both of this
+    module's daily/twice-daily aggregations — independently used
+
+        "rainy" if precip > threshold else "sunny"
+
+    which collapsed snow, cloud, overcast and fog all into "sunny". The
+    weather card showed a sun during a snowstorm.
+
+    **Two pre-existing behaviours are deliberately preserved rather than
+    unified**, because both were intentional and unifying them would
+    silently change one of the call sites:
+
+    1. ``precip_threshold`` defaults to 0.1 (the hourly sites' value) but
+       the daily/twice-daily aggregation sites pass 0.5 explicitly. A
+       daily total and an hourly amount are not the same quantity and
+       should not share a threshold.
+    2. None handling. This returns None only when ``precip`` itself is
+       None. The daily/twice-daily callers pass ``total_precip or 0``,
+       matching their prior None-as-zero behaviour; weather.py and the
+       hourly forecast pass raw precip, matching their prior
+       explicit-None behaviour.
+
+    **The "cloudy" branch is an honest v0 heuristic.** High relative
+    humidity with no significant precipitation often but not always
+    means overcast. None of the five providers is queried for cloud
+    cover today, so this is a plausible proxy, not a measurement — see
+    CONDITION_CLOUDY_HUMIDITY_THRESHOLD in const.py and the caveat in
+    DEVELOPER.md.
+    """
+    if precip is None:
+        return None
+
+    if precip > precip_threshold:
+        # Temperature unknown resolves to rain rather than snow: rain is
+        # far more common across the year at Swiss valley altitudes, and
+        # a wrong "snowy" is the more conspicuous error.
+        if temperature is not None and temperature <= 0.0:
+            return "snowy"
+        return "rainy"
+
+    if humidity is not None and humidity >= CONDITION_CLOUDY_HUMIDITY_THRESHOLD:
+        return "cloudy"
+
+    return "sunny"

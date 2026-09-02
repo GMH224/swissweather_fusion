@@ -22,6 +22,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from ..fingerprint import compute_content_fingerprint
+
 FREE_HOST = "api.open-meteo.com"
 # Confirmed from Open-Meteo's own docs: using an apikey requires this
 # customer- prefixed hostname, not just adding the parameter to the
@@ -156,16 +158,32 @@ def _compute_run_fingerprint(hourly: dict[str, Any]) -> str:
     project actually maps (_VARIABLE_NAME_MAP), sorted deterministically,
     so it isn't sensitive to unrelated response fields (e.g. irrelevant
     metadata) or to Open-Meteo's own key ordering.
-    """
-    import hashlib
-    import json
 
+    v0.1.23: now a thin wrapper around the shared fingerprint.py helper
+    (also used by Meteoblue and SRF, see fingerprint.py's module
+    docstring) instead of a locally-duplicated hash routine. The actual
+    hash inputs/algorithm are unchanged, so existing persisted
+    fingerprints from before this refactor remain valid.
+    """
     fingerprint_source = {"time": hourly.get("time", [])}
     for open_meteo_key in _VARIABLE_NAME_MAP:
         if open_meteo_key in hourly:
             fingerprint_source[open_meteo_key] = hourly[open_meteo_key]
-    serialized = json.dumps(fingerprint_source, sort_keys=True, default=str)
-    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return compute_content_fingerprint(fingerprint_source)
+
+
+def _parse_utc(value: str) -> datetime:
+    """Parse a provider timestamp to an aware UTC datetime.
+
+    v0.1.24 fix (P1-25) — see the same helper in clients/meteoblue.py for
+    the full reasoning. Short version: fromisoformat(s).replace(tzinfo=utc)
+    is correct only for naive input; on aware input it changes the
+    instant the value represents.
+    """
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(timezone.utc)
+    return parsed.replace(tzinfo=timezone.utc)
 
 
 def parse_forecast_response(payload: dict[str, Any]) -> ParsedForecast:
@@ -213,7 +231,10 @@ def parse_forecast_response(payload: dict[str, Any]) -> ParsedForecast:
         if len(values) != len(times):
             mismatches.append(internal_name)
         for t_str, value in zip(times, values):
-            valid_at = datetime.fromisoformat(t_str).replace(tzinfo=timezone.utc)
+            # v0.1.24 fix (P1-25): .replace(tzinfo=...) relabels without
+            # converting, so an already-aware timestamp would be shifted
+            # by its offset rather than converted. See _parse_utc.
+            valid_at = _parse_utc(t_str)
             points.append(
                 ForecastPoint(variable=internal_name, valid_at=valid_at, value=value)
             )

@@ -16,7 +16,11 @@
         "data": {
           "station_temp_entity": "Temperature sensor",
           "station_humidity_entity": "Humidity sensor",
-          "station_pressure_entity": "Pressure sensor"
+          "station_pressure_entity": "Pressure sensor",
+          "station_pressure_is_sea_level": "My pressure sensor already reports sea-level pressure"
+        },
+        "data_description": {
+          "station_pressure_is_sea_level": "Leave this OFF if your sensor reports the raw pressure measured at your altitude (for example Netatmo's \"Absolute pressure\"). Turn it ON only if the value is already normalised to sea level (Netatmo's plain \"Pressure\"). Home Assistant cannot tell these apart automatically — both use the same device class — and getting it wrong introduces a constant error of roughly 60 hPa at 500 m."
         }
       },
       "credentials": {
@@ -27,7 +31,8 @@
           "srf_consumer_secret": "SRF (SRG SSR) consumer secret",
           "meteoblue_api_key": "meteoblue API key",
           "meteonomiqs_api_key": "Meteonomiqs API key",
-          "open_meteo_api_key": "Open-Meteo API key (optional, paid tier only)"
+          "open_meteo_api_key": "Open-Meteo API key (optional, paid tier only)",
+          "purge_days": "Keep history for (days, 0 = forever)"
         }
       },
       "reauth_confirm": {
@@ -37,6 +42,15 @@
           "srf_consumer_key": "SRF (SRG SSR) consumer key",
           "srf_consumer_secret": "SRF (SRG SSR) consumer secret"
         }
+      },
+      "reconfigure": {
+        "title": "Change location",
+        "description": "Update the coordinates and elevation for this installation. Learned history is preserved.",
+        "data": {
+          "latitude": "Latitude",
+          "longitude": "Longitude",
+          "elevation_override": "Elevation override (metres, optional)"
+        }
       }
     },
     "error": {
@@ -44,7 +58,9 @@
       "unknown": "Unexpected error — please try again."
     },
     "abort": {
-      "reauth_successful": "Credentials updated successfully."
+      "reauth_successful": "Credentials updated successfully.",
+      "already_configured": "This location is already configured.",
+      "reconfigure_successful": "Location updated successfully."
     }
   },
   "options": {
@@ -64,7 +80,9 @@
           "purge_days": "Database purge window (days, 0 = keep forever)",
           "diagnostic_logging_enabled": "Enable detailed diagnostic logging (off by default — turn on to capture detailed events for the Download Diagnostics button, then download and share when done)",
           "elevation_override": "Elevation override (m) — set the number to change it, or check the box below to clear it and revert to automatic lookup",
-          "clear_elevation_override": "Clear elevation override (revert to automatic lookup)"
+          "clear_elevation_override": "Clear elevation override (revert to automatic lookup)",
+          "clear_open_meteo_api_key": "Clear the Open-Meteo API key (return to the free tier)",
+          "station_pressure_is_sea_level": "My pressure sensor already reports sea-level pressure"
         }
       }
     }

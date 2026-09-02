@@ -26,7 +26,8 @@ guessing further.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+import re
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 STAC_COLLECTION = "ch.meteoschweiz.ogd-radar-precip"
@@ -124,44 +125,175 @@ def build_sampling_points(
 
 @dataclass(frozen=True)
 class StacAsset:
+    """A selected CombiPrecip file.
+
+    ``valid_at`` is the product time parsed from the FILENAME, not the
+    STAC feature's properties.datetime — see parse_stac_items_response
+    for why the latter is a calendar date here and therefore useless as
+    a scan timestamp. ``quality`` is MeteoSwiss's own quality code
+    (0-9, 9 best), also from the filename.
+    """
+
     href: str
     valid_at: datetime
+    quality: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# CombiPrecip file-naming contract (v0.1.24, IND-13 / P1-16 / P1-17)
+# ---------------------------------------------------------------------------
+# MeteoSwiss documents the radar file naming convention as:
+#
+#     CPCyyjjjHHMMQ_nnnnn.XYZ.h5
+#      |  | |  |  | |
+#      |  | |  |  | +-- accumulation time in minutes, 5 digits (00060 = 1h)
+#      |  | |  |  +---- quality code, single digit, 0-9 (9 = best)
+#      |  | |  +------- HHMM, product time UTC
+#      |  | +---------- jjj, day of year
+#      |  +------------ yy, two-digit year
+#      +--------------- product code
+#
+# Three facts about the collection make suffix-based selection unsafe,
+# and all three are why this function was rewritten:
+#
+# 1. ch.meteoschweiz.ogd-radar-precip carries SEVERAL products side by
+#    side. RZC (PRECIP, instantaneous mm/h), TZC (PRECIP-SV, also mm/h)
+#    and CPC (CombiPrecip, 1-hour accumulation in mm) are all .h5 files
+#    in the same collection. Accepting any href ending in .h5 meant this
+#    client could and probably did download a product it was not written
+#    to interpret.
+#
+# 2. STAC items here are per CALENDAR DATE, not per scan. Every asset
+#    within one item shares the same properties.datetime, so sorting
+#    assets by that field degenerates to "some arbitrary file from the
+#    newest day" rather than "the latest scan". The real product time is
+#    in the filename and nowhere else.
+#
+# 3. MeteoSwiss states that if the quality flag changes, the file name
+#    changes and a SECOND file is produced rather than the first being
+#    overwritten. Multiple valid files for one product time is therefore
+#    the documented normal case — which is exactly why this function
+#    must NOT treat "more than one .h5 asset" as an ambiguity error, as
+#    was at one point proposed. That would convert a silent
+#    wrong-product bug into a permanent hard outage of the radar source.
+CPC_PRODUCT_CODE = "CPC"
+CPC_ACCUMULATION_SEGMENT = "_00060"  # 60-minute accumulation
+_CPC_FILENAME_RE = re.compile(
+    r"^CPC(?P<yy>\d{2})(?P<jjj>\d{3})(?P<hhmm>\d{4})(?P<quality>\d)"
+    r"_(?P<accum>\d{5})\."
+)
+
+
+def parse_cpc_filename(href: str) -> Optional[tuple[datetime, int, str]]:
+    """Extract (product_time_utc, quality_code, accumulation) from a CPC href.
+
+    Returns None for anything that is not a CombiPrecip file matching the
+    documented convention — including RZC/TZC assets from the same
+    collection, which is the point.
+    """
+    basename = href.rsplit("/", 1)[-1]
+    match = _CPC_FILENAME_RE.match(basename)
+    if match is None:
+        return None
+    try:
+        year = 2000 + int(match.group("yy"))
+        day_of_year = int(match.group("jjj"))
+        hhmm = match.group("hhmm")
+        hour = int(hhmm[:2])
+        minute = int(hhmm[2:])
+        if not (1 <= day_of_year <= 366) or hour > 23 or minute > 59:
+            return None
+        product_time = datetime(year, 1, 1, hour, minute, tzinfo=timezone.utc) + timedelta(
+            days=day_of_year - 1
+        )
+    except (ValueError, TypeError):
+        return None
+    return product_time, int(match.group("quality")), match.group("accum")
 
 
 def parse_stac_items_response(payload: dict[str, Any]) -> list[StacAsset]:
-    """Parse the STAC /items listing to find the most recent asset href.
+    """Parse the STAC /items listing into candidate CombiPrecip assets.
 
-    Returns items sorted newest-first; caller takes [0] for "latest".
+    Returns only genuine CPC 60-minute-accumulation files, sorted by the
+    product time parsed from the FILENAME (newest first), with the
+    highest quality code winning any tie at the same product time. The
+    caller takes [0] for "latest".
+
+    Assets that are not CPC, are a different accumulation window, or do
+    not match the documented naming convention are skipped rather than
+    raising — an unrecognised file alongside the ones we want is not an
+    error, it is just not ours.
     """
     features = payload.get("features", [])
     assets: list[StacAsset] = []
+
     for feature in features:
-        properties = feature.get("properties", {})
-        datetime_str = properties.get("datetime")
-        if not datetime_str:
+        # Collection filter, when the feature declares one. Belt and
+        # braces alongside the filename contract below.
+        collection = feature.get("collection")
+        if collection and collection != STAC_COLLECTION:
             continue
-        valid_at = datetime.fromisoformat(datetime_str.replace("Z", "+00:00"))
-        feature_assets = feature.get("assets", {})
-        for asset in feature_assets.values():
+
+        for asset in feature.get("assets", {}).values():
             href = asset.get("href")
-            if href and href.endswith(".h5"):
-                assets.append(StacAsset(href=href, valid_at=valid_at))
-    assets.sort(key=lambda a: a.valid_at, reverse=True)
+            if not href or not href.endswith(".h5"):
+                continue
+            parsed = parse_cpc_filename(href)
+            if parsed is None:
+                continue
+            product_time, quality, accumulation = parsed
+            if accumulation != CPC_ACCUMULATION_SEGMENT.lstrip("_"):
+                continue
+            assets.append(
+                StacAsset(href=href, valid_at=product_time, quality=quality)
+            )
+
+    # Newest product time first; better quality first within a tie.
+    assets.sort(key=lambda a: (a.valid_at, a.quality if a.quality is not None else -1), reverse=True)
     return assets
 
 
 @dataclass(frozen=True)
 class RadarPixelValue:
+    """One sampled pixel.
+
+    **v0.1.24 (P1-14)**: ``precip_rate_mmh`` renamed to
+    ``precip_accum_mm_1h``. MeteoSwiss documents CPC as "Combiprecip
+    60-minute total", unit mm, temporal aggregation "precipitation
+    accumulation over 1 hour" — explicitly distinct from RZC/PRECIP,
+    which is the instantaneous mm/h rate. The old name asserted a
+    physical quantity this product does not report, and the detection
+    threshold applied to it was chosen as if it were a rate.
+
+    ``quality`` is MeteoSwiss's radar quality code for the file this
+    pixel came from (0-9, 9 best), passed down from the filename by the
+    caller. None means it could not be determined.
+    """
+
     label: str
-    precip_rate_mmh: Optional[float]
+    precip_accum_mm_1h: Optional[float]
     valid_at: datetime
+    quality: Optional[int] = None
 
 
 def _pixel_indices(
     *, where_attrs: Any, easting: float, northing: float
-) -> tuple[int, int, int, int]:
+) -> tuple[Optional[int], Optional[int], int, int]:
     """Shared row/col math, factored out so extract_values_at_points doesn't
     repeat the corner-reading/conversion for every point.
+
+    **v0.1.24 fix (P1-18)**: this used to CLAMP an out-of-range (row, col)
+    into the valid array bounds:
+
+        col = max(0, min(xsize - 1, col))
+        row = max(0, min(ysize - 1, row))
+
+    which silently returned an unrelated edge pixel's value for a point
+    genuinely outside the radar's coverage — entirely plausible for the
+    farthest (70 km) upwind sampling point near the border, and
+    indistinguishable downstream from a real reading at the intended
+    location. Now returns (None, None, ...) so the caller can represent
+    it honestly as "no data here".
     """
     xsize = int(where_attrs["xsize"])
     ysize = int(where_attrs["ysize"])
@@ -175,13 +307,13 @@ def _pixel_indices(
 
     col = int((easting - ll_easting) / (ur_easting - ll_easting) * xsize)
     row = int((ur_northing - northing) / (ur_northing - ll_northing) * ysize)
-    col = max(0, min(xsize - 1, col))
-    row = max(0, min(ysize - 1, row))
+    if not (0 <= col < xsize) or not (0 <= row < ysize):
+        return None, None, xsize, ysize
     return row, col, xsize, ysize
 
 
 def extract_values_at_points(
-    *, hdf5_path: str, points: list[SamplingPoint]
+    *, hdf5_path: str, points: list[SamplingPoint], quality: Optional[int] = None
 ) -> list[RadarPixelValue]:
     """Extract one pixel per sampling point from a single opened file.
 
@@ -226,22 +358,36 @@ def extract_values_at_points(
             row, col, _, _ = _pixel_indices(
                 where_attrs=where, easting=point.easting, northing=point.northing
             )
+            if row is None or col is None:
+                # v0.1.24 (P1-18): genuinely outside the radar grid.
+                # Reported with the same shape already used for the
+                # file's own missing-data sentinel, so no downstream
+                # consumer needs a new code path.
+                results.append(
+                    RadarPixelValue(
+                        label=point.label,
+                        precip_accum_mm_1h=None,
+                        valid_at=valid_at,
+                        quality=quality,
+                    )
+                )
+                continue
             raw_value = data[row, col]
 
             if nodata is not None and raw_value == nodata:
                 results.append(
-                    RadarPixelValue(label=point.label, precip_rate_mmh=None, valid_at=valid_at)
+                    RadarPixelValue(label=point.label, precip_accum_mm_1h=None, valid_at=valid_at, quality=quality)
                 )
                 continue
             if undetect is not None and raw_value == undetect:
                 results.append(
-                    RadarPixelValue(label=point.label, precip_rate_mmh=0.0, valid_at=valid_at)
+                    RadarPixelValue(label=point.label, precip_accum_mm_1h=0.0, valid_at=valid_at, quality=quality)
                 )
                 continue
 
             value = float(raw_value) * gain + offset
             results.append(
-                RadarPixelValue(label=point.label, precip_rate_mmh=value, valid_at=valid_at)
+                RadarPixelValue(label=point.label, precip_accum_mm_1h=value, valid_at=valid_at, quality=quality)
             )
         return results
 
@@ -274,6 +420,7 @@ class CombiPrecipClient:
         labels: tuple[str, ...],
     ) -> None:
         self._session = session
+        self._last_asset_quality: Optional[int] = None
         self._points = build_sampling_points(
             latitude=latitude,
             longitude=longitude,
@@ -282,7 +429,7 @@ class CombiPrecipClient:
             labels=labels,
         )
 
-    async def async_fetch_latest_bytes(self) -> bytes:
+    async def async_fetch_latest_bytes(self) -> bytes:  # noqa: D401
         """Async-only: STAC query + HTTP download. No file I/O here at
         all — that's handled separately by write_temp_and_extract, which
         must be called via an executor job, not awaited directly.
@@ -310,6 +457,12 @@ class CombiPrecipClient:
         if not assets:
             raise ValueError("No CombiPrecip assets found in STAC response")
         latest = assets[0]
+        # v0.1.24 (P1-16): remember the quality code parsed from the
+        # selected filename so write_temp_and_extract can stamp it onto
+        # every pixel it produces. Instance state rather than a return
+        # value because the async fetch and the blocking parse are
+        # deliberately split across an executor-job boundary.
+        self._last_asset_quality = latest.quality
 
         async with self._session.get(
             latest.href, timeout=aiohttp.ClientTimeout(total=60)
@@ -330,4 +483,8 @@ class CombiPrecipClient:
             local_path = os.path.join(tmp_dir, "combiprecip_latest.h5")
             with open(local_path, "wb") as f:
                 f.write(data)
-            return extract_values_at_points(hdf5_path=local_path, points=self._points)
+            return extract_values_at_points(
+                hdf5_path=local_path,
+                points=self._points,
+                quality=self._last_asset_quality,
+            )

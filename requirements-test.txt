@@ -4,3 +4,17 @@ h5py>=3.10.0
 numpy>=1.26.0
 pyproj>=3.6.0
 aiohttp>=3.9.0
+# v0.1.24 (INFRA-02): voluptuous is a REAL test dependency, not something
+# tests/conftest.py should stub. It has no Home Assistant dependency of
+# its own — unlike every other module that conftest fakes, which
+# genuinely cannot be imported without installing HA — and the stub only
+# ever provided Schema/Required/Optional/Coerce as no-op lambdas.
+#
+# The consequence, which is why this line exists: every validator built
+# with vol.All / vol.Range / vol.Invalid silently evaluated to None under
+# test while working correctly in production. The config-flow validation
+# fixes (P1-27, P1-28, P1-30) would have shipped with tests that passed
+# against code that never ran. conftest.py now imports the real package
+# first and falls back to the stub only if it is genuinely absent, but
+# the fallback should never actually be needed in CI.
+voluptuous>=0.13.0

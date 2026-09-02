@@ -108,3 +108,39 @@ def test_needs_keepalive_call():
     assert mq.needs_keepalive_call(
         last_successful_call_date=date(2026, 6, 1), today=today, max_days_between_calls=30
     )
+
+
+# -- v0.1.23: AnnualCallBudget persistence (L-07) ----------------------------
+
+
+def test_annual_call_budget_to_state_and_load_state_round_trip():
+    budget = mq.AnnualCallBudget(annual_budget=1000)
+    today = date(2026, 7, 25)
+    budget.record_call(today=today)
+    budget.record_call(today=today)
+    budget.record_call(today=today)
+
+    state = budget.to_state()
+    assert state == {"year": 2026, "calls_used": 3}
+
+    restored = mq.AnnualCallBudget(annual_budget=1000)
+    restored.load_state(state)
+    assert restored.calls_remaining_this_year == 997
+
+    # And it must still correctly roll over on a new calendar year even
+    # after being restored from persisted state — restart-safety must not
+    # accidentally freeze the year-rollover logic.
+    next_year = date(2027, 1, 1)
+    assert restored.can_call(today=next_year) is True
+    assert restored.calls_remaining_this_year == 1000  # rolled over
+
+
+def test_annual_call_budget_load_state_with_none_behaves_like_fresh_budget():
+    """A missing/empty persisted state (e.g. first-ever start after
+    upgrading to v0.1.23) must behave exactly like the old always-zero
+    default — restart-safety must not change first-run behavior."""
+    budget = mq.AnnualCallBudget(annual_budget=5)
+    budget.load_state(None)
+    today = date(2026, 7, 25)
+    assert budget.calls_remaining_this_year == 5
+    assert budget.can_call(today=today) is True
