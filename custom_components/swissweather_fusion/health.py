@@ -14,7 +14,7 @@ re-entering credentials instead.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -57,6 +57,11 @@ class SourceHealth:
     last_auth_error: Optional[str] = None
     last_auth_error_time: Optional[datetime] = None
     consecutive_failures: int = 0
+    # v0.2.1 (SWF-P2-008): when this health record was created, i.e. when
+    # the integration started tracking the source. Used to distinguish
+    # "has not run yet" from "is not working" for sources that poll far
+    # less often than every cycle.
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def record_success(self, *, duration_ms: float) -> None:
         self.last_success_time = datetime.now(timezone.utc)

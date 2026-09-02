@@ -54,7 +54,13 @@ from .storage.db import SCHEMA_VERSION, SwissWeatherDB
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS = [Platform.WEATHER, Platform.SENSOR, Platform.BINARY_SENSOR]
+PLATFORMS = [
+    Platform.WEATHER,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    # v0.2.1: hosts the diagnostic "Reset learning" recovery control.
+    Platform.BUTTON,
+]
 
 
 def _integration_version(hass: HomeAssistant) -> str:

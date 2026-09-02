@@ -13,12 +13,12 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.2.0.** The core architecture is built and the business
+**Status: v0.2.1.** The core architecture is built and the business
 logic (bias correction, storm scoring, radar sampling) is extensively
-unit-tested — 507 tests, pyflakes clean. v0.1.24–v0.1.28 is a large remediation
+unit-tested — 538 tests, pyflakes clean. v0.1.24–v0.1.28 is a large remediation
 release closing 62 defects found across two external audits and one
 independent audit: see
-[swissweather_fusion_v0.2.0_release_audit.md](swissweather_fusion_v0.2.0_release_audit.md)
+[swissweather_fusion_v0.2.1_release_audit.md](swissweather_fusion_v0.2.1_release_audit.md)
 for the full account, including the five places the external audits were
 themselves wrong.
 

@@ -67,13 +67,21 @@ def db():
 
 def test_retention_coordinator_noops_when_purge_days_is_zero(db):
     """purge_days=0 means 'keep forever' per const.py's own documented
-    meaning — the coordinator must not touch the database at all, not
-    even compute a cutoff."""
+    meaning — the coordinator must not PURGE anything.
+
+    v0.2.1: it does now read storage statistics first, for the database
+    size sensor (review AR-02). Reporting how large the database is
+    remains useful — arguably most useful — when retention is disabled,
+    so that read is deliberately outside the purge_days gate. What the
+    test guards is unchanged: no rows are deleted.
+    """
     db.insert_forecast_snapshot(
         "ch1", "2020-01-01T00:00:00+00:00", "2020-01-01T00:00:00+00:00", "temperature", 10.0
     )
     retention = object.__new__(coord.RetentionCoordinator)
     retention.hass = FakeHass()
+    retention._retention_lock = asyncio.Lock()
+    retention.storage_stats = None
     retention._db = db
     retention._purge_days = 0
     retention._diagnostics = None

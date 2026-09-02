@@ -47,7 +47,7 @@ def _install_homeassistant_stubs() -> None:
     config_entries.OptionsFlow = type("OptionsFlow", (), {})
 
     const = _module("homeassistant.const")
-    const.Platform = type("Platform", (), {"WEATHER": "weather", "SENSOR": "sensor", "BINARY_SENSOR": "binary_sensor"})
+    const.Platform = type("Platform", (), {"WEATHER": "weather", "SENSOR": "sensor", "BINARY_SENSOR": "binary_sensor", "BUTTON": "button"})
     const.UnitOfPressure = type("UnitOfPressure", (), {"HPA": "hPa"})
     const.UnitOfTemperature = type("UnitOfTemperature", (), {"CELSIUS": "°C"})
     const.UnitOfPrecipitationDepth = type(
@@ -55,6 +55,10 @@ def _install_homeassistant_stubs() -> None:
     )
     const.UnitOfSpeed = type("UnitOfSpeed", (), {"METERS_PER_SECOND": "m/s"})
     const.PERCENTAGE = "%"
+    const.UnitOfLength = type(
+        "UnitOfLength", (), {"METERS": "m", "KILOMETERS": "km"}
+    )
+    const.UnitOfPressure = type("UnitOfPressure", (), {"HPA": "hPa"})
 
     data_entry_flow = _module("homeassistant.data_entry_flow")
     data_entry_flow.FlowResult = dict
@@ -141,6 +145,20 @@ def _install_homeassistant_stubs() -> None:
     weather_component = _module("homeassistant.components.weather")
     weather_component.WeatherEntity = type("WeatherEntity", (), {})
     weather_component.WeatherEntityFeature = type("WeatherEntityFeature", (), {"FORECAST_HOURLY": 1})
+    # v0.2.1 (INFRA-04): weather was never stubbed, so weather.py could
+    # not be imported by any test — which is why the missing
+    # current-condition properties (SWF-P2-007) went unnoticed through
+    # two releases. Same gap, same cause, as the constructor bugs in
+    # v0.1.25: a module no test can import is a module no test covers.
+    weather_component = _module("homeassistant.components.weather")
+    weather_component.WeatherEntity = type("WeatherEntity", (), {})
+    weather_component.Forecast = dict
+    weather_component.WeatherEntityFeature = type(
+        "WeatherEntityFeature",
+        (),
+        {"FORECAST_DAILY": 1, "FORECAST_HOURLY": 2, "FORECAST_TWICE_DAILY": 4},
+    )
+
     sensor_component = _module("homeassistant.components.sensor")
     sensor_component.SensorEntity = type("SensorEntity", (), {})
     # v0.1.24 (IND-08): the entity-metadata fixes reference these enums by
@@ -156,6 +174,10 @@ def _install_homeassistant_stubs() -> None:
         (),
         {"MEASUREMENT": "measurement", "TOTAL_INCREASING": "total_increasing"},
     )
+    # v0.2.1: the button platform hosts the learning-reset control.
+    button_component = _module("homeassistant.components.button")
+    button_component.ButtonEntity = type("ButtonEntity", (), {})
+
     binary_sensor_component = _module("homeassistant.components.binary_sensor")
     binary_sensor_component.BinarySensorEntity = type("BinarySensorEntity", (), {})
     binary_sensor_component.BinarySensorDeviceClass = type(

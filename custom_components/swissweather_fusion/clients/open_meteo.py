@@ -80,6 +80,21 @@ HOURLY_VARIABLES = (
     "weather_code",
 )
 
+# v0.2.1: uv_index is requested SEPARATELY from the set above.
+#
+# It is a documented /v1/forecast hourly variable, but it is a derived
+# product rather than a raw model field, and this client restricts each
+# request to a single model with &models=. Whether every model accepts it
+# is unverified against the live API — and the whole variable list goes in
+# one URL, so a rejection would fail the request for that model entirely.
+# Three sources dying at once to gain one nice-to-have is a bad trade.
+#
+# So it is opt-out: requested by default, and OpenMeteoCoordinator retries
+# once without the optional set if a request fails permanently. Same
+# reasoning as the v0.1.28 CombiPrecip lesson — do not let an unverified
+# assumption about a provider take out a working path.
+OPTIONAL_HOURLY_VARIABLES = ("uv_index",)
+
 
 def _base_url(path: str, api_key: Optional[str]) -> str:
     host = CUSTOMER_HOST if api_key else FREE_HOST
@@ -87,12 +102,19 @@ def _base_url(path: str, api_key: Optional[str]) -> str:
 
 
 def build_forecast_url(
-    *, source: str, latitude: float, longitude: float, api_key: Optional[str] = None
+    *,
+    source: str,
+    latitude: float,
+    longitude: float,
+    api_key: Optional[str] = None,
+    include_optional: bool = True,
 ) -> str:
     """Build the forecast request URL for one of ch1/ch2/icon_d2."""
     if source not in MODEL_PARAM:
         raise ValueError(f"Unknown Open-Meteo source: {source!r}")
-    variables = ",".join(HOURLY_VARIABLES)
+    variables = ",".join(
+        HOURLY_VARIABLES + (OPTIONAL_HOURLY_VARIABLES if include_optional else ())
+    )
     url = (
         f"{_base_url('/v1/forecast', api_key)}?latitude={latitude}&longitude={longitude}"
         f"&hourly={variables}&models={MODEL_PARAM[source]}&timeformat=iso8601"
@@ -175,6 +197,7 @@ _VARIABLE_NAME_MAP = {
     "cloud_cover": "cloud_coverage",
     "visibility": "visibility",
     "weather_code": "weather_code",
+    "uv_index": "uv_index",
     "relative_humidity_2m": "humidity",
     # v0.1.2 fix: was surface_pressure (pressure at the source's own grid
     # elevation), which doesn't match what SRF/meteoblue/the local station

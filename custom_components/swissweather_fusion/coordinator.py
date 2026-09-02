@@ -35,6 +35,8 @@ from .clients.open_meteo import OpenMeteoClient
 from .clients.srf import SrfClient
 from .health import SourceHealth, classify_exception
 from .const import (
+    PRESSURE_PLAUSIBLE_MAX_HPA,
+    PRESSURE_PLAUSIBLE_MIN_HPA,
     METEOBLUE_ANNUAL_CALL_BUDGET,
     METEOBLUE_SCHEDULED_RETRY_COOLDOWN,
     METEONOMIQS_NOWCAST_TARGET_WINDOW,
@@ -116,6 +118,10 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         # so exception text can be scrubbed of it before it reaches a log
         # or a diagnostics record.
         self._api_key = api_key
+        # v0.2.1: uv_index is requested opt-out. If a source rejects the
+        # optional variable set we stop asking that source for it, rather
+        # than letting one nice-to-have variable take the source offline.
+        self._include_optional_variables = True
         self._client = OpenMeteoClient(async_get_clientsession(hass), api_key=api_key)
         self._last_issued_at: dict[str, datetime] = {}
         # v0.1.19 fix (DEF-02): issued_at alone couldn't detect an
@@ -987,10 +993,56 @@ class StationCoordinator(DataUpdateCoordinator):
         # station here, publishes BOTH a sea-level-normalised "Pressure"
         # and a raw "AbsolutePressure", and Home Assistant gives both the
         # same device class. See CONF_STATION_PRESSURE_IS_SEA_LEVEL.
+        raw_pressure = pressure
         if pressure is not None and not self._pressure_is_sea_level:
             pressure = unit_conversion.reduce_station_pressure_to_sea_level(
                 pressure, self._elevation_m, temperature
             )
+
+        # v0.2.1 fix (SWF-P1-009): sanity-check the result, because the
+        # setting that drives it is invisible in its consequences.
+        #
+        # A real installation configured Netatmo's normalised "Pressure"
+        # entity while telling the integration it reported station-level
+        # pressure. The reading was therefore reduced to sea level a
+        # SECOND time: 1024.2 hPa became 1089.8, a fabricated +65.6 hPa.
+        # Model A then dutifully learned that as a -66.8 hPa forecast
+        # bias and began dragging the blended pressure upward. Nothing
+        # complained, because every individual step was working exactly
+        # as designed.
+        #
+        # The situation is self-diagnosing and nothing was looking: the
+        # station's own value disagreed with every provider's MSL
+        # forecast by 66 hPa. A checkbox whose consequences are invisible
+        # needs a check with visible consequences.
+        if pressure is not None and not (
+            PRESSURE_PLAUSIBLE_MIN_HPA <= pressure <= PRESSURE_PLAUSIBLE_MAX_HPA
+        ):
+            _LOGGER.warning(
+                "Station pressure of %.1f hPa is outside the plausible range "
+                "%.0f-%.0f hPa after processing (raw reading %.1f hPa, "
+                "sea-level setting: %s). The most likely cause is that the "
+                "'pressure sensor already reports sea-level pressure' option "
+                "is set incorrectly — check it under Configure. Discarding "
+                "this reading rather than letting Model A learn from it.",
+                pressure,
+                PRESSURE_PLAUSIBLE_MIN_HPA,
+                PRESSURE_PLAUSIBLE_MAX_HPA,
+                raw_pressure if raw_pressure is not None else float("nan"),
+                "on" if self._pressure_is_sea_level else "off",
+            )
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="station", event_type="data_quality",
+                    detail=(
+                        f"implausible pressure {pressure:.1f} hPa discarded; "
+                        "check the sea-level pressure setting"
+                    ),
+                )
+            # Discarded, not stored. A single implausible sample
+            # permanently distorts an EMA bucket, and there is no
+            # mechanism for an EMA to forget one.
+            pressure = None
 
         # v0.1.24 fix (IND-02): do not write a row when every value is
         # missing. compute_tendency_features used to take samples[-1]
@@ -1557,6 +1609,35 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 )
         return model_a.blend(contributions)
 
+    def _blend_by_class(
+        self,
+        measurement: str,
+        target_hour: datetime,
+        *,
+        latest_forecast: dict,
+        bucket_lookup: dict,
+    ) -> Optional[float]:
+        """Dispatch a measurement to the right combination strategy.
+
+        v0.2.1 (SWF-P1-008). The single entry point for combining a
+        measurement across sources, so a new parameter cannot silently
+        inherit the wrong path by falling through.
+
+        - Class A -> _blend_at(), the learned bias-corrected blend
+        - Class B -> _fuse_class_b(), per-parameter strategy, no learning
+        - Class C -> _resolve_categorical(), majority, never averaged
+        """
+        if measurement in self.LEARNED_MEASUREMENTS:
+            return self._blend_at(
+                measurement, target_hour,
+                latest_forecast=latest_forecast, bucket_lookup=bucket_lookup,
+            )
+        if measurement in self.CATEGORICAL_MEASUREMENTS:
+            return self._resolve_categorical(
+                measurement, target_hour, latest_forecast
+            )
+        return self._fuse_class_b(measurement, target_hour, latest_forecast)
+
     def _fuse_class_b(
         self, measurement: str, target_hour: datetime, latest_forecast: dict
     ) -> Optional[float]:
@@ -1648,8 +1729,31 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 last_updated=row["last_updated"],
             )
 
+        # v0.2.1 fix (SWF-P1-008), CRITICAL: route each measurement by its
+        # parameter class.
+        #
+        # v0.2.0 added _fuse_class_b() and _resolve_categorical() and then
+        # never called them — every measurement still went through
+        # _blend_at(), the learned-bias path. For Class B parameters no
+        # bucket_stats exist, so each source fell into the cold-start
+        # branch (ema_bias 0.0, weight = reference) and the result was a
+        # plain arithmetic MEAN.
+        #
+        # So the entire AR-03 fix was inert: precipitation was still being
+        # averaged (mean of [0, 0, 8] = 2.67 mm of drizzle no model
+        # forecast), gusts were still means of peaks, and wind bearing was
+        # still linearly averaged — 350 deg and 10 deg giving 180 deg,
+        # exactly backwards.
+        #
+        # The v0.2.0 tests exercised the strategies directly and passed,
+        # which is the same failure shape recorded in the remediation
+        # audit's section 9.8: the test's notion of success was
+        # satisfiable without the code being reachable. There is now an
+        # integration test that asserts the routing itself.
         current = {
-            m: self._blend_at(m, now, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
+            m: self._blend_by_class(
+                m, now, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup
+            )
             for m in self.MEASUREMENTS
         }
 
@@ -1675,42 +1779,65 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         hourly_forecast: list[dict[str, Any]] = []
         for i in range(self.FORECAST_HOURS_AHEAD):
             target = now + timedelta(hours=i)
-            temperature = self._blend_at("temperature", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
-            humidity = self._blend_at("humidity", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
-            pressure = self._blend_at("pressure", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
-            precip = self._blend_at("precip", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
-            wind_speed = self._blend_at("wind_speed", target, latest_forecast=latest_forecast, bucket_lookup=bucket_lookup)
+
+            # v0.2.1 (SWF-P1-008): every measurement now goes through the
+            # class dispatch, so Class B parameters get their own fusion
+            # strategy here too. Previously this loop called _blend_at()
+            # directly for each of five hard-coded names, which meant the
+            # hourly forecast could never carry the twelve parameters
+            # v0.2.0 added.
+            def blend(measurement: str, _t=target):
+                return self._blend_by_class(
+                    measurement, _t,
+                    latest_forecast=latest_forecast, bucket_lookup=bucket_lookup,
+                )
+
+            values = {m: blend(m) for m in self.MEASUREMENTS}
             # Skip hours with literally nothing from any source — no
             # point showing an all-None row, and sources with shorter
-            # horizons (CH1's ~33-45h) will naturally taper off within
-            # this 48h window rather than every hour having full coverage.
-            if all(v is None for v in (temperature, humidity, pressure, precip, wind_speed)):
+            # horizons (CH1's ~33-45h) will naturally taper off rather
+            # than every hour having full coverage.
+            if all(v is None for v in values.values()):
                 continue
+
+            is_daytime = self._is_daytime_at(target)
+            entry: dict[str, Any] = {
+                "datetime": target.isoformat(),
+                "native_temperature": values.get("temperature"),
+                "humidity": values.get("humidity"),
+                "native_pressure": values.get("pressure"),
+                "native_precipitation": values.get("precip"),
+                "native_wind_speed": values.get("wind_speed"),
+                # v0.2.1: the standard Home Assistant Forecast fields that
+                # v0.2.0 started fusing but never published. Every one of
+                # these is a documented member of HA's Forecast TypedDict,
+                # so they reach any card through the normal contract — no
+                # custom fields, no sensor entities needed (review AR-04).
+                "native_dew_point": values.get("dew_point"),
+                "native_apparent_temperature": values.get("apparent_temperature"),
+                "native_wind_gust_speed": values.get("wind_gust_speed"),
+                "wind_bearing": values.get("wind_bearing"),
+                "cloud_coverage": values.get("cloud_coverage"),
+                "uv_index": values.get("uv_index"),
+                # v0.2.1: resolve_condition prefers the provider's own WMO
+                # code and explicit snowfall over inference — see
+                # models/model_a.resolve_condition.
+                "condition": model_a.resolve_condition(
+                    weather_code=values.get("weather_code"),
+                    precip=values.get("precip"),
+                    snowfall=values.get("snowfall"),
+                    temperature=values.get("temperature"),
+                    humidity=values.get("humidity"),
+                    cloud_coverage=values.get("cloud_coverage"),
+                    is_daytime=is_daytime,
+                ),
+            }
+            precip_probability = values.get("precip_probability")
+            if precip_probability is not None:
+                # HA types this one as int.
+                entry["precipitation_probability"] = int(round(precip_probability))
             hourly_forecast.append(
-                {
-                    "datetime": target.isoformat(),
-                    "native_temperature": temperature,
-                    "humidity": humidity,
-                    "native_pressure": pressure,
-                    "native_precipitation": precip,
-                    "native_wind_speed": wind_speed,
-                    # v0.1.24 (P2-10): shared mapping. Raw precip and the
-                    # hourly 0.1 mm threshold, matching this site's own
-                    # pre-existing behaviour.
-                    #
-                    # v0.1.28 (SWF-P2-005): day/night is evaluated PER
-                    # FORECAST HOUR, not from "now" — this is the site
-                    # where the sun icon at 02:00 was actually visible.
-                    # A fixed hour cutoff would be wrong for Switzerland,
-                    # where sunset moves about three hours between June
-                    # and December, so real solar elevation is used.
-                    "condition": model_a.derive_condition(
-                        precip,
-                        temperature,
-                        humidity,
-                        is_daytime=self._is_daytime_at(target),
-                    ),
-                }
+                {k: v for k, v in entry.items() if v is not None or k == "datetime"}
             )
 
         return {
@@ -2391,8 +2518,19 @@ class RetentionCoordinator(DataUpdateCoordinator):
         # Falls back to a private lock when none is injected, so each
         # coordinator remains independently constructible in tests.
         self._retention_lock = retention_lock or asyncio.Lock()
+        # v0.2.1 (AR-02): cached for StorageSizeSensor. get_storage_stats()
+        # has existed since v0.1.24 and nothing ever surfaced it, so
+        # database growth was invisible until a disk filled. Computed here
+        # because this coordinator already runs hourly in an executor job
+        # and already owns the retention concern.
+        self.storage_stats: Optional[dict[str, Any]] = None
 
     async def _async_update_data(self) -> Optional[dict[str, int]]:
+        async with self._retention_lock:
+            self.storage_stats = await self.hass.async_add_executor_job(
+                self._db.get_storage_stats
+            )
+
         if self._purge_days <= 0:
             return None
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self._purge_days)).isoformat()

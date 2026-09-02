@@ -43,6 +43,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+from ..const import PRESSURE_PLAUSIBLE_MAX_HPA, PRESSURE_PLAUSIBLE_MIN_HPA
+
 _LOGGER = logging.getLogger(__name__)
 
 # v0.1.23 fix (L-01/L-02, audit finding): schema version bumped 1 -> 2 for
@@ -1205,6 +1207,100 @@ class SwissWeatherDB:
             self._conn.commit()
 
     # -- database size telemetry (v0.1.24, IND-06) -----------------------------
+
+    def reset_all_learning(self) -> dict[str, int]:
+        """Discard all learned state and rebuild it from preserved forecasts.
+
+        **v0.2.1 (SWF-P1-009 remediation).** Correcting a misconfigured
+        pressure datum stops new bad data arriving; it does not undo what
+        has already been learned. An EMA has no mechanism for forgetting
+        a sample it has absorbed, and long-lead buckets use alpha = 0.04,
+        so a large fabricated bias stays visible for weeks.
+
+        **Why this resets everything rather than one measurement.** A
+        per-measurement reset was built first and rejected: it leaves the
+        learned state at mixed vintages — pressure starting from zero
+        while temperature and humidity carry history from before the
+        problem was understood. Comparing bucket confidence across
+        measurements then means comparing things learned under different
+        conditions, which is a subtler and longer-lived problem than
+        simply relearning. Consistency of the learned state is worth more
+        than a few hours of samples.
+
+        Three steps, and the third is what makes this cheap:
+
+        1. Every ``bucket_stats`` row is deleted.
+        2. Implausible values in ``station_observations`` are set to
+           NULL — without this the bad observations are still inside the
+           reconciliation window and would re-teach the same bias. Only
+           values outside each measurement's physical bounds are
+           touched, so a legitimate reading can never be destroyed.
+        3. Recent ``forecast_snapshots`` are re-opened as 'pending', so
+           the learning loop rebuilds from forecasts this project already
+           has rather than waiting for new ones. Same mechanism and same
+           window the v3 schema migration uses.
+
+        Raw forecasts and raw observations are facts and are preserved;
+        only the derived interpretation is discarded.
+
+        Returns counts, for logging and for the button's own feedback.
+        """
+        from ..forecast_parameters import PARAMETERS
+
+        # station_observations holds pressure already reduced to sea
+        # level, so the tighter plausibility bounds apply there rather
+        # than the wide storage bounds used for raw provider values.
+        bounds = {
+            "temperature": (
+                PARAMETERS["temperature"].minimum, PARAMETERS["temperature"].maximum
+            ),
+            "humidity": (
+                PARAMETERS["humidity"].minimum, PARAMETERS["humidity"].maximum
+            ),
+            "pressure": (PRESSURE_PLAUSIBLE_MIN_HPA, PRESSURE_PLAUSIBLE_MAX_HPA),
+        }
+        cutoff = (datetime.now(timezone.utc) - MIGRATION_REOPEN_WINDOW).isoformat()
+
+        with self._lock:
+            try:
+                cur = self._conn.execute("DELETE FROM bucket_stats")
+                buckets_cleared = cur.rowcount or 0
+
+                observations_cleared = 0
+                for column, (low, high) in bounds.items():
+                    cur = self._conn.execute(
+                        f"UPDATE station_observations SET {column} = NULL "
+                        f"WHERE {column} IS NOT NULL "
+                        f"AND ({column} < ? OR {column} > ?)",
+                        (low, high),
+                    )
+                    observations_cleared += cur.rowcount or 0
+
+                cur = self._conn.execute(
+                    "UPDATE forecast_snapshots SET reconciliation_status = 'pending' "
+                    "WHERE valid_at >= ?",
+                    (cutoff,),
+                )
+                forecasts_reopened = cur.rowcount or 0
+
+                self._conn.commit()
+            except Exception:
+                # All or nothing: a half-reset would leave exactly the
+                # inconsistent state this method exists to prevent.
+                self._conn.rollback()
+                raise
+
+        _LOGGER.warning(
+            "Learning reset: %d bucket(s) discarded, %d implausible observation(s) "
+            "cleared, %d recent forecast(s) re-opened for reconciliation. "
+            "Relearning starts on the next cycle.",
+            buckets_cleared, observations_cleared, forecasts_reopened,
+        )
+        return {
+            "buckets_cleared": buckets_cleared,
+            "observations_cleared": observations_cleared,
+            "forecasts_reopened": forecasts_reopened,
+        }
 
     def get_storage_stats(self) -> dict[str, Any]:
         """Row counts per table plus the file size on disk.

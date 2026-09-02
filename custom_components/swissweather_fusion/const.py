@@ -428,3 +428,20 @@ CONDITION_CLOUDY_HUMIDITY_THRESHOLD = 90.0
 # Database
 # ---------------------------------------------------------------------------
 DB_FILENAME = "swissweather_fusion.db"
+
+
+# ---------------------------------------------------------------------------
+# Station pressure plausibility (v0.2.1, SWF-P1-009)
+# ---------------------------------------------------------------------------
+# Bounds on the value AFTER any sea-level reduction. Deliberately wide —
+# the world record range for mean sea level pressure is roughly 870 hPa
+# (typhoon Tip) to 1084 hPa (Siberia), and Swiss extremes sit comfortably
+# inside 960-1050. Anything outside this is not weather; it is a
+# configuration error, most likely the sea-level setting being inverted.
+#
+# Narrower than provider_validation's 800-1100 storage bounds on purpose:
+# that range must accommodate raw STATION pressure at altitude (a sensor
+# at 2000 m legitimately reads ~795 hPa), whereas by this point the value
+# is supposed to already be sea-level normalised.
+PRESSURE_PLAUSIBLE_MIN_HPA = 870.0
+PRESSURE_PLAUSIBLE_MAX_HPA = 1085.0

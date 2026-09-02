@@ -20,6 +20,7 @@ from typing import Any, Optional
 from homeassistant.components.weather import Forecast, WeatherEntity, WeatherEntityFeature
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
+    UnitOfLength,
     UnitOfPrecipitationDepth,
     UnitOfPressure,
     UnitOfSpeed,
@@ -71,6 +72,9 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
     _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_native_pressure_unit = UnitOfPressure.HPA
     _attr_native_wind_speed_unit = UnitOfSpeed.METERS_PER_SECOND
+    # v0.2.1: required for native_visibility to be interpreted correctly.
+    # Open-Meteo reports visibility in metres.
+    _attr_native_visibility_unit = UnitOfLength.METERS
     _attr_native_precipitation_unit = UnitOfPrecipitationDepth.MILLIMETERS
     _attr_supported_features = (
         WeatherEntityFeature.FORECAST_HOURLY
@@ -101,6 +105,47 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
     @property
     def native_pressure(self) -> Optional[float]:
         return self._current.get("pressure")
+
+    # v0.2.1 fix (SWF-P2-007): five standard WeatherEntity properties that
+    # were never implemented.
+    #
+    # v0.2.0 fused dew point, apparent temperature, cloud cover,
+    # visibility and gusts into the blend, but this entity exposed only
+    # temperature, humidity, pressure and wind speed — so a card
+    # configured to show them displayed nothing, correctly, because the
+    # entity provided nothing.
+    #
+    # These are all documented members of Home Assistant's WeatherEntity
+    # contract, which means they need no custom sensor entities: they
+    # reach any card through the standard path (architecture review
+    # AR-01/AR-04).
+    @property
+    def native_dew_point(self) -> Optional[float]:
+        return self._current.get("dew_point")
+
+    @property
+    def native_apparent_temperature(self) -> Optional[float]:
+        return self._current.get("apparent_temperature")
+
+    @property
+    def cloud_coverage(self) -> Optional[float]:
+        return self._current.get("cloud_coverage")
+
+    @property
+    def native_visibility(self) -> Optional[float]:
+        return self._current.get("visibility")
+
+    @property
+    def native_wind_gust_speed(self) -> Optional[float]:
+        return self._current.get("wind_gust_speed")
+
+    @property
+    def wind_bearing(self) -> Optional[float]:
+        return self._current.get("wind_bearing")
+
+    @property
+    def uv_index(self) -> Optional[float]:
+        return self._current.get("uv_index")
 
     @property
     def native_wind_speed(self) -> Optional[float]:

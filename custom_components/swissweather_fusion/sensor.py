@@ -8,7 +8,7 @@ and forecast_accuracy below.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from homeassistant.components.sensor import (
@@ -72,6 +72,7 @@ async def async_setup_entry(
         LastLearningASensor(entry, runtime),
         LastLearningBSensor(entry, db),
         StormOnsetProbabilitySensor(entry, runtime),
+        StorageSizeSensor(entry, runtime),
     ]
     for source in ALL_FORECAST_SOURCES:
         entities.append(ExpertWeightSensor(entry, runtime, source))
@@ -89,27 +90,60 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-def is_source_healthy(health: Any) -> bool:
+# v0.2.1 (SWF-P2-008): sources that legitimately run once a day must not
+# be reported as unhealthy simply because they have not run yet.
+#
+# Meteonomiqs calls once daily and meteoblue three times daily. Under the
+# v0.1.24 rule below, both counted as unhealthy from every restart until
+# their next scheduled slot — so the integration reported "Degraded" for
+# hours at a time with nothing actually wrong, which is precisely the
+# way a health indicator becomes ignored.
+#
+# Grace periods are generous multiples of each source's real cadence:
+# long enough that a genuine outage still surfaces, short enough that it
+# surfaces the same day.
+NEVER_SUCCEEDED_GRACE = {
+    "meteonomiqs": timedelta(hours=26),   # once daily, gated on local noon
+    "meteoblue": timedelta(hours=26),     # three scheduled slots per day
+    "combiprecip": timedelta(minutes=30),
+    "srf": timedelta(hours=3),
+}
+DEFAULT_NEVER_SUCCEEDED_GRACE = timedelta(hours=1)
+
+
+def is_source_healthy(health: Any, source: Optional[str] = None) -> bool:
     """Whether a source is genuinely working, as opposed to untried.
 
     **v0.1.24 fix (P2-11 / IND-03).** Health was derived from
-    `consecutive_failures == 0` alone — which is equally true of a source
-    that has never been polled at all, since zero is the attribute's own
-    initial value. A cold start therefore reported every source as active
-    and the integration as "Active" before a single successful fetch.
+    `consecutive_failures == 0` alone — equally true of a source that has
+    never been polled, since zero is the attribute's initial value. A
+    cold start therefore reported every source active before a single
+    successful fetch.
 
-    The audit flagged this only on ActiveSourcesSensor. The identical
-    test appeared in StatusSensor and in DegradedBinarySensor, which are
-    the two entities users and automations actually watch — so fixing
-    only where the audit pointed would have left the visible symptom
-    entirely intact. All three now route through this one helper.
+    **v0.2.1 refinement (SWF-P2-008).** Requiring `last_success_time` was
+    right for a source polling every five minutes and wrong for one that
+    runs daily by design. A never-succeeded source is now treated as
+    *pending* rather than failed until its grace period elapses; after
+    that it is unhealthy, so a genuinely dead source still surfaces.
 
-    last_success_time is the discriminator because it is set in exactly
-    one place: SourceHealth.record_success().
+    `source` is optional so existing callers keep working; without it the
+    default grace applies.
     """
     if health is None:
         return False
-    return health.consecutive_failures == 0 and health.last_success_time is not None
+    if health.consecutive_failures > 0:
+        return False
+    if health.last_success_time is not None:
+        return True
+
+    # Never succeeded: healthy only while still within its grace window.
+    started = getattr(health, "created_at", None)
+    if started is None:
+        # No start time recorded — fall back to the strict v0.1.24 rule
+        # rather than assuming health we cannot evidence.
+        return False
+    grace = NEVER_SUCCEEDED_GRACE.get(source or "", DEFAULT_NEVER_SUCCEEDED_GRACE)
+    return (datetime.now(timezone.utc) - started) < grace
 
 
 class _BaseSensor(SensorEntity):
@@ -135,12 +169,11 @@ class StatusSensor(_BaseSensor):
     def native_value(self) -> str:
         # v0.1.24 (IND-03): "no failures yet" is not the same as
         # "working" — see is_source_healthy.
-        healths = [
-            _get_health(self._runtime, source)
-            for source in ALL_TELEMETRY_SOURCES
-            if _get_health(self._runtime, source) is not None
+        failure_counts = [
+            0 if is_source_healthy(_get_health(self._runtime, src), src) else 1
+            for src in ALL_TELEMETRY_SOURCES
+            if _get_health(self._runtime, src) is not None
         ]
-        failure_counts = [0 if is_source_healthy(h) else 1 for h in healths]
         if not failure_counts:
             return "Active"
         if all(count > 0 for count in failure_counts):
@@ -237,7 +270,7 @@ class ActiveSourcesSensor(_BaseSensor):
         for source in ALL_TELEMETRY_SOURCES:
             # v0.1.24 fix (P2-11): a source that has never succeeded is
             # not active. See is_source_healthy.
-            if is_source_healthy(_get_health(self._runtime, source)):
+            if is_source_healthy(_get_health(self._runtime, source), source):
                 active += 1
         return active
 
@@ -500,3 +533,45 @@ class ConsecutiveFailuresSensor(_BaseSensor):
     def native_value(self) -> int:
         health = _get_health(self._runtime, self._source)
         return health.consecutive_failures if health else 0
+
+
+class StorageSizeSensor(_BaseSensor):
+    """Size of the learning database on disk.
+
+    **v0.2.1 (architecture review AR-02).** `get_storage_stats()` has
+    existed in the storage layer since v0.1.24 and nothing ever exposed
+    it, so database growth was invisible until a disk filled.
+
+    That mattered little at five fused variables. v0.2.0 took Open-Meteo
+    from 5 to 18 hourly variables, roughly 3.4x the rows per run, so a
+    measured 389 bytes/row puts a 90-day window near 6.5 GB. Growth is
+    also effectively one-way within a deployment: purge_older_than() does
+    not VACUUM, so SQLite reuses freed pages rather than returning them,
+    and the file size stops rising but does not fall. Watching row counts
+    alongside bytes is the only way to see a purge working.
+    """
+
+    _attr_native_unit_of_measurement = "MB"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, "storage_size", "Database size")
+        self._runtime = runtime
+
+    @property
+    def _stats(self) -> Optional[dict[str, Any]]:
+        coordinator = self._runtime.get("retention_coordinator")
+        return getattr(coordinator, "storage_stats", None) if coordinator else None
+
+    @property
+    def native_value(self) -> Optional[float]:
+        stats = self._stats
+        if not stats or stats.get("file_size_bytes") is None:
+            return None
+        return round(stats["file_size_bytes"] / 1_000_000, 1)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        stats = self._stats or {}
+        return {k: v for k, v in stats.items() if k.endswith("_rows")}
