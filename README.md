@@ -13,19 +13,19 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.1.24.** The core architecture is built and the business
+**Status: v0.1.25.** The core architecture is built and the business
 logic (bias correction, storm scoring, radar sampling) is extensively
-unit-tested — 357 tests, pyflakes clean. v0.1.24 is a large remediation
+unit-tested — 361 tests, pyflakes clean. v0.1.24/v0.1.25 is a large remediation
 release closing 62 defects found across two external audits and one
 independent audit: see
-[swissweather_fusion_v0.1.24_remediation_audit.md](swissweather_fusion_v0.1.24_remediation_audit.md)
+[swissweather_fusion_v0.1.25_remediation_audit.md](swissweather_fusion_v0.1.25_remediation_audit.md)
 for the full account, including the five places the external audits were
 themselves wrong.
 
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
-> **Upgrading from v0.1.23?** This release rebuilds the learning
+> **Upgrading from v0.1.23 or v0.1.24?** This release rebuilds the learning
 > database (schema v3). Learned bias statistics, radar observations and
 > storm predictions are discarded and relearned, because three fixes
 > changed what those stored values *mean*. Raw forecasts and station

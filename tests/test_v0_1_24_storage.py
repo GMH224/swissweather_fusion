@@ -484,3 +484,114 @@ def test_upgraded_database_is_immediately_usable(v0_1_23_database):
         )
     finally:
         database.close()
+
+
+def test_no_index_is_defined_in_the_table_creation_script():
+    """The structural guard introduced in v0.1.25.
+
+    _TABLE_SQL runs first and unconditionally, and its
+    `CREATE TABLE IF NOT EXISTS` statements are silent no-ops against
+    tables that already exist in an older shape. Any index defined
+    alongside them therefore executes against the OLD shape on every
+    upgrading installation and raises "no such column" before migration
+    can repair it — taking setup down entirely.
+
+    This bit twice: v0.1.23 with idx_forecast_pending, v0.1.24 with
+    idx_predictions_reconciled. Both times the fix was to move that one
+    index. A rule you have to remember while writing a new index is
+    evidently not sufficient, so v0.1.25 moved every index into
+    _INDEX_SQL and added this assertion — which fails at authoring time
+    rather than on a user's installation.
+    """
+    from swissweather_fusion.storage import db as db_module
+
+    assert "CREATE INDEX" not in db_module._TABLE_SQL.upper(), (
+        "an index was defined in _TABLE_SQL. It must live in _INDEX_SQL, "
+        "which is applied only after migration has run."
+    )
+    assert "CREATE INDEX" in db_module._INDEX_SQL.upper()
+
+
+def test_indexes_are_applied_after_migration_not_before():
+    """Ordering is the safety property, so it is asserted against the
+    source rather than inferred.
+
+    _ensure_schema has two branches. The fresh/already-current branch
+    creates indexes immediately, which is safe precisely because no
+    migration is pending. The migrating branch must call _migrate_to_v3()
+    BEFORE creating indexes — that is the ordering this checks.
+    """
+    import inspect
+    import textwrap
+
+    from swissweather_fusion.storage.db import SwissWeatherDB
+
+    source = inspect.getsource(SwissWeatherDB._ensure_schema)
+    # Drop the docstring: it names both scripts in prose and would
+    # otherwise dominate the positional comparison below.
+    body = source.split('"""')[-1]
+    body = textwrap.dedent(body)
+
+    assert "executescript(_TABLE_SQL)" in body
+    migrate_pos = body.index("self._migrate_to_v3()")
+    # The index creation that follows the migration call.
+    index_after_migrate = body.index("executescript(_INDEX_SQL)", migrate_pos)
+    assert index_after_migrate > migrate_pos, (
+        "indexes are created before the migration that adds their columns"
+    )
+
+
+def test_table_script_creates_every_table_the_index_script_references():
+    """Catches the inverse mistake: an index on a table that _TABLE_SQL
+    does not create, which would fail on a genuinely fresh install rather
+    than on an upgrade."""
+    import re
+
+    from swissweather_fusion.storage import db as db_module
+
+    indexed_tables = set(
+        re.findall(r"ON\s+(\w+)\s*\(", db_module._INDEX_SQL)
+    )
+    created_tables = set(
+        re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", db_module._TABLE_SQL)
+    )
+    assert indexed_tables <= created_tables, (
+        f"indexed but never created: {indexed_tables - created_tables}"
+    )
+
+
+def test_recovery_from_a_database_left_half_migrated_by_the_failed_build(
+    v0_1_23_database,
+):
+    """v0.1.25. The failed v0.1.24 build could crash after some tables had
+    been rebuilt but before the schema_version row was written — leaving a
+    database that is neither v0.1.23 nor current, and that has no version
+    row to describe itself.
+
+    This is exactly the state P2-01's shape-based detection was designed
+    for, so it should recover without intervention. Asserted rather than
+    assumed, because a user hitting the original bug may well be in it.
+    """
+    raw = sqlite3.connect(v0_1_23_database)
+    raw.execute("DROP TABLE storm_predictions")
+    raw.execute(
+        "CREATE TABLE storm_predictions ("
+        "id INTEGER PRIMARY KEY, ts TEXT NOT NULL, probability REAL NOT NULL, "
+        "features TEXT, reconciled INTEGER NOT NULL DEFAULT 0)"
+    )
+    raw.execute("DELETE FROM schema_meta WHERE key = 'schema_version'")
+    raw.commit()
+    raw.close()
+
+    database = SwissWeatherDB(v0_1_23_database)
+    try:
+        assert database._get_meta("schema_version") == str(SCHEMA_VERSION)
+        cols = {
+            r["name"]
+            for r in database._conn.execute("PRAGMA table_info(radar_observations)")
+        }
+        assert "precip_accum_mm_1h" in cols
+        # And it is usable, not merely open.
+        database.insert_storm_prediction("2026-09-01T00:00:00+00:00", 0.9, {})
+    finally:
+        database.close()

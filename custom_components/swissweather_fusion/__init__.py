@@ -5,6 +5,7 @@ classifier. See DEVELOPER.md for the full architecture rationale.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import logging
 
@@ -50,11 +51,25 @@ from .coordinator import (
     StationCoordinator,
 )
 from .diagnostics_recorder import DiagnosticsRecorder
-from .storage.db import SwissWeatherDB
+from .storage.db import SCHEMA_VERSION, SwissWeatherDB
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.WEATHER, Platform.SENSOR, Platform.BINARY_SENSOR]
+
+
+def _integration_version() -> str:
+    """Read the version from manifest.json.
+
+    Read rather than hard-coded so it can never disagree with what HACS
+    and Home Assistant report for the same installed files.
+    """
+    try:
+        manifest_path = os.path.join(os.path.dirname(__file__), "manifest.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            return str(json.load(handle).get("version", "unknown"))
+    except Exception:  # noqa: BLE001 - diagnostics must never break setup
+        return "unknown"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -73,6 +88,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     options_first = entry.options or {}
     override = options_first.get(CONF_ELEVATION_OVERRIDE, data.get(CONF_ELEVATION_OVERRIDE))
     elevation_effective = override if override is not None else data.get("elevation_looked_up")
+
+    # v0.1.25: log the loaded version at INFO on every setup.
+    #
+    # Added after a v0.1.24 upgrade failure was reported as "still
+    # broken" when the fixed files had in fact never been installed —
+    # the traceback line numbers were the only way to tell the two
+    # builds apart, which is not a reasonable diagnostic burden. Now the
+    # log says plainly which build is running, so "did the update
+    # actually land" is answerable in one line.
+    _LOGGER.info(
+        "SwissWeather Fusion %s starting up (database schema v%s)",
+        _integration_version(),
+        SCHEMA_VERSION,
+    )
 
     db_path = hass.config.path(f".storage/{DOMAIN}_{entry.entry_id}_{DB_FILENAME}")
     db = await hass.async_add_executor_job(SwissWeatherDB, db_path)
