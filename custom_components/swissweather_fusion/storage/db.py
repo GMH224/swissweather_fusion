@@ -43,7 +43,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from ..const import PRESSURE_PLAUSIBLE_MAX_HPA, PRESSURE_PLAUSIBLE_MIN_HPA
+from ..const import (
+    PRESSURE_PLAUSIBLE_MAX_HPA,
+    PRESSURE_PLAUSIBLE_MIN_HPA,
+    STATION_PRESSURE_REFERENCE_TOLERANCE_HPA,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -300,10 +304,20 @@ class SwissWeatherDB:
         # columns that do not exist, failing on exactly the recovery path
         # the branch was written to handle.
         actual = self._table_shape()
-        looks_current = (
-            "reconciliation_status" in actual.get("forecast_snapshots", set())
-            and "reconciled" in actual.get("storm_predictions", set())
-            and "precip_accum_mm_1h" in actual.get("radar_observations", set())
+        # v0.2.2 (SWF-021-008): every column any migration has added is
+        # checked, not a hand-picked trio. A sentinel set that is a
+        # subset of the real requirements will eventually declare a
+        # partially-migrated database current — the same class of silent
+        # wrongness the shape-based detection replaced metadata-trust to
+        # avoid.
+        required = {
+            "forecast_snapshots": {"reconciliation_status"},
+            "storm_predictions": {"reconciled"},
+            "radar_observations": {"precip_accum_mm_1h", "quality"},
+        }
+        looks_current = all(
+            columns <= actual.get(table, set())
+            for table, columns in required.items()
         )
         # Metadata absence is used only as a SECONDARY signal: a database
         # with no data tables and no version row is genuinely new. It can
@@ -593,6 +607,40 @@ class SwissWeatherDB:
                 rows,
             )
             self._conn.commit()
+
+    def get_reference_pressure_hpa(self, hour_prefix: str) -> Optional[float]:
+        """Median provider mean-sea-level pressure for a given hour.
+
+        **v0.2.3 (SWF-023-001).** The reference the station reading is
+        checked against. Every provider reports MSL pressure, and models
+        agree closely on it — the spread between ICON, SRF and meteoblue
+        for the same hour is typically well under 2 hPa. That makes their
+        consensus a reliable yardstick for deciding whether a station
+        reading has been processed correctly.
+
+        Median rather than mean, so one absurd provider value cannot drag
+        the reference far enough to mask a genuine station error.
+
+        `hour_prefix` is an ISO timestamp truncated to the hour
+        ("2026-09-02T12"), because forecast valid_at values sit exactly
+        on the hour while station observations arrive at arbitrary
+        minutes.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT value FROM forecast_snapshots "
+                "WHERE variable = 'pressure' AND value IS NOT NULL "
+                "AND substr(valid_at, 1, 13) = ? "
+                "ORDER BY value",
+                (hour_prefix,),
+            )
+            values = [row["value"] for row in cur.fetchall()]
+        if not values:
+            return None
+        middle = len(values) // 2
+        if len(values) % 2 == 1:
+            return values[middle]
+        return (values[middle - 1] + values[middle]) / 2.0
 
     def get_forecast_values_for_valid_at(
         self, source: str, variable: str, valid_at: str
@@ -1267,6 +1315,32 @@ class SwissWeatherDB:
                 buckets_cleared = cur.rowcount or 0
 
                 observations_cleared = 0
+
+                # v0.2.3 (SWF-023-001): clear pressure observations that
+                # DISAGREE WITH THE PROVIDERS, not merely those outside
+                # absolute bounds.
+                #
+                # Absolute bounds only catch a double-reduced reading
+                # when it happens to exceed a world record. A station at
+                # 540 m reading a normal 1010 hPa double-reduces to
+                # 1075.6 — wrong by 65 hPa and entirely "possible", so
+                # the previous reset left it in place to re-teach the
+                # same bias. Comparing against the provider consensus
+                # catches the error at any pressure level, which is what
+                # makes this detection rather than luck.
+                cur = self._conn.execute(
+                    "UPDATE station_observations SET pressure = NULL "
+                    "WHERE pressure IS NOT NULL AND EXISTS ("
+                    "  SELECT 1 FROM forecast_snapshots f"
+                    "  WHERE f.variable = 'pressure' AND f.value IS NOT NULL"
+                    "    AND substr(f.valid_at, 1, 13) = substr(station_observations.ts, 1, 13)"
+                    "  GROUP BY substr(f.valid_at, 1, 13)"
+                    "  HAVING abs(avg(f.value) - station_observations.pressure) > ?"
+                    ")",
+                    (STATION_PRESSURE_REFERENCE_TOLERANCE_HPA,),
+                )
+                observations_cleared += cur.rowcount or 0
+
                 for column, (low, high) in bounds.items():
                     cur = self._conn.execute(
                         f"UPDATE station_observations SET {column} = NULL "

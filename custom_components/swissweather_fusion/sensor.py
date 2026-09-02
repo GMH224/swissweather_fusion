@@ -73,6 +73,7 @@ async def async_setup_entry(
         LastLearningBSensor(entry, db),
         StormOnsetProbabilitySensor(entry, runtime),
         StorageSizeSensor(entry, runtime),
+        PressureReferenceDeltaSensor(entry, runtime),
     ]
     for source in ALL_FORECAST_SOURCES:
         entities.append(ExpertWeightSensor(entry, runtime, source))
@@ -575,3 +576,55 @@ class StorageSizeSensor(_BaseSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         stats = self._stats or {}
         return {k: v for k, v in stats.items() if k.endswith("_rows")}
+
+
+class PressureReferenceDeltaSensor(_BaseSensor):
+    """Station pressure minus the provider consensus.
+
+    **v0.2.3 (SWF-023-001).** A live installation ran for a day with its
+    station pressure 65 hPa above every provider, because a
+    sea-level-normalised reading was being reduced to sea level a second
+    time. Nothing surfaced the disagreement; it was only noticed when the
+    blended pressure had visibly drifted.
+
+    The relationship was self-diagnosing the whole time and nothing was
+    looking. This sensor is the looking.
+
+    Near zero means the station and the models agree, so the datum
+    configuration is right. A persistent offset of tens of hPa means the
+    'pressure sensor already reports sea-level pressure' option is set
+    incorrectly. A few hPa is normal — models are not perfect and neither
+    is a domestic barometer.
+    """
+
+    _attr_native_unit_of_measurement = "hPa"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, "pressure_reference_delta", "Pressure vs providers")
+        self._runtime = runtime
+
+    @property
+    def native_value(self) -> Optional[float]:
+        coordinator = self._runtime.get("station_coordinator")
+        return getattr(coordinator, "pressure_reference_delta", None)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        from .const import STATION_PRESSURE_REFERENCE_TOLERANCE_HPA
+
+        value = self.native_value
+        return {
+            "tolerance_hpa": STATION_PRESSURE_REFERENCE_TOLERANCE_HPA,
+            "within_tolerance": (
+                None if value is None
+                else abs(value) <= STATION_PRESSURE_REFERENCE_TOLERANCE_HPA
+            ),
+            "interpretation": (
+                "Station reading minus the median provider mean-sea-level "
+                "pressure for the same hour. A few hPa is normal. A "
+                "persistent offset of tens of hPa means the 'pressure sensor "
+                "already reports sea-level pressure' option is set wrongly."
+            ),
+        }

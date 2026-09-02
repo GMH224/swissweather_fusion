@@ -445,3 +445,26 @@ DB_FILENAME = "swissweather_fusion.db"
 # is supposed to already be sea-level normalised.
 PRESSURE_PLAUSIBLE_MIN_HPA = 870.0
 PRESSURE_PLAUSIBLE_MAX_HPA = 1085.0
+
+
+# ---------------------------------------------------------------------------
+# Station pressure cross-check against the providers (v0.2.3, SWF-023-001)
+# ---------------------------------------------------------------------------
+# How far the station's processed pressure may sit from the provider
+# consensus before it is treated as a configuration error rather than
+# weather.
+#
+# Why an absolute-bounds check was not enough: PRESSURE_PLAUSIBLE_MAX_HPA
+# is 1085, just above the 1084 hPa world record, which is correct for
+# "is this physically possible" and useless for "is this correctly
+# configured". A sea-level-normalised reading that gets reduced a second
+# time gains roughly 65 hPa at 540 m — so on a 1024 hPa day it lands at
+# 1090 and is caught, while on a 1010 hPa day it lands at 1075 and is
+# not. The error is identical; only the weather differs.
+#
+# The providers are the right reference because all of them report MSL
+# pressure and models agree closely on it — typically within about 2 hPa
+# for the same hour. 25 hPa is therefore far outside any legitimate
+# disagreement (roughly a 200 m altitude error) while still an order of
+# magnitude below the ~65 hPa signature of a double reduction.
+STATION_PRESSURE_REFERENCE_TOLERANCE_HPA = 25.0

@@ -40,13 +40,53 @@ from typing import Any, Iterable, Optional
 
 # (minimum, maximum) inclusive bounds per variable, in the canonical
 # units this project stores: °C, %, hPa, mm, m/s.
-PHYSICAL_BOUNDS: dict[str, tuple[float, float]] = {
-    "temperature": (-60.0, 60.0),
-    "humidity": (0.0, 100.0),
+# v0.2.2 fix (SWF-022-001 / SWF-021-013): bounds are DERIVED from the
+# parameter registry rather than duplicated here.
+#
+# Two defects came from the duplication. The key for total precipitation
+# was "precipitation" while the project's vocabulary — and therefore
+# every stored row — uses "precip", so precipitation was never actually
+# bounds-checked: it fell through to the unknown-variable path and got a
+# finiteness check only. And the twelve parameters added in v0.2.0
+# (snowfall, gusts, cloud cover, visibility, UV, ...) had no entry at
+# all, so none of them was validated before storage either.
+#
+# Deriving from forecast_parameters.PARAMETERS makes both impossible by
+# construction: a parameter cannot be fusable without also being
+# validated, and the names cannot drift apart because there is only one
+# set of them.
+#
+# Note the deliberate exception below for pressure, and the categorical
+# passthrough — see _bounds_for().
+from .forecast_parameters import PARAMETERS as _PARAMETERS
+
+# Raw provider pressure is mean-sea-level, but a STATION reading at
+# altitude legitimately reaches ~795 hPa at 2000 m. Storage bounds must
+# accommodate that; the tighter sea-level plausibility check belongs at
+# the station coordinator (SWF-P1-009), not here.
+_STORAGE_BOUND_OVERRIDES: dict[str, tuple[float, float]] = {
     "pressure": (800.0, 1100.0),
-    "precipitation": (0.0, 500.0),
-    "wind_speed": (0.0, 150.0),
 }
+
+# Categorical parameters carry codes, not magnitudes. Bounding them by
+# value would be meaningless; they are checked for finiteness only.
+_CATEGORICAL = {"weather_code"}
+
+
+def _build_bounds() -> dict[str, tuple[float, float]]:
+    bounds: dict[str, tuple[float, float]] = {}
+    for name, parameter in _PARAMETERS.items():
+        if name in _CATEGORICAL:
+            continue
+        if parameter.minimum is None or parameter.maximum is None:
+            continue
+        bounds[name] = _STORAGE_BOUND_OVERRIDES.get(
+            name, (parameter.minimum, parameter.maximum)
+        )
+    return bounds
+
+
+PHYSICAL_BOUNDS: dict[str, tuple[float, float]] = _build_bounds()
 
 
 def validate_forecast_value(variable: str, value: Optional[float]) -> Optional[float]:

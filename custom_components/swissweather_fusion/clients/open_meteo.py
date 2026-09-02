@@ -350,12 +350,18 @@ class OpenMeteoClient:
         self._api_key = api_key
 
     async def async_fetch_forecast(
-        self, *, source: str, latitude: float, longitude: float
+        self,
+        *,
+        source: str,
+        latitude: float,
+        longitude: float,
+        include_optional: bool = True,
     ) -> ParsedForecast:
         import aiohttp
 
         url = build_forecast_url(
-            source=source, latitude=latitude, longitude=longitude, api_key=self._api_key
+            source=source, latitude=latitude, longitude=longitude,
+            api_key=self._api_key, include_optional=include_optional,
         )
         # v0.1.14: none of this client's HTTP calls had an explicit
         # timeout — an outside code review caught this directly against

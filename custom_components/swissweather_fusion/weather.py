@@ -153,21 +153,28 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
 
     @property
     def condition(self) -> Optional[str]:
-        # v0.1.24 fix (P2-10): this used to be
-        # `"rainy" if precip > 0.1 else "sunny"`, which collapsed snow,
-        # cloud, overcast and fog all into "sunny" — the weather card
-        # showed a sun during a snowstorm. Four separate call sites had
-        # the same two-branch logic; all four now share
-        # model_a.derive_condition.
+        # v0.2.2 fix (SWF-021-001): uses resolve_condition, not the v0
+        # inference.
         #
-        # This site keeps its own 0.1 mm threshold and its own
-        # explicit-None behaviour, both deliberately preserved rather
-        # than unified with the daily aggregation sites (which use 0.5 mm
-        # and treat None as zero) — see derive_condition's docstring.
-        return model_a.derive_condition(
-            self._current.get("precip"),
-            self._current.get("temperature"),
-            self._current.get("humidity"),
+        # v0.2.0 added the resolver and wired it only into the hourly
+        # forecast, leaving this — the condition users actually see on
+        # the card — inferring from precipitation and humidity alone.
+        # The visible symptom was the entity contradicting itself:
+        # "Sunny" displayed beside a published cloud_coverage of 89%,
+        # because the humidity proxy said 39% humidity means clear while
+        # the measured cover said overcast.
+        #
+        # Now the same precedence as everywhere else: provider WMO code,
+        # then stated snowfall, then measured cloud cover, then the v0
+        # inference as a last resort. This site keeps its own 0.1 mm
+        # threshold and explicit-None behaviour.
+        return model_a.resolve_condition(
+            weather_code=self._current.get("weather_code"),
+            precip=self._current.get("precip"),
+            snowfall=self._current.get("snowfall"),
+            temperature=self._current.get("temperature"),
+            humidity=self._current.get("humidity"),
+            cloud_coverage=self._current.get("cloud_coverage"),
             is_daytime=_is_daytime_now(self.hass),
         )
 

@@ -54,10 +54,15 @@ class ResetLearningButton(ButtonEntity):
     _attr_name = "Reset learning"
     _attr_icon = "mdi:brain"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
-    # Hidden by default: a recovery control, not a routine one. An
-    # always-visible reset invites experimentation with something that
-    # costs real relearning time.
-    _attr_entity_registry_enabled_default = False
+    # v0.2.2: visible by default.
+    #
+    # v0.2.1 hid this, reasoning that an always-visible reset invites
+    # accidental presses. That was caution applied on the user's behalf
+    # to a control they had explicitly asked for, and it meant the
+    # recovery button could not be found when it was needed. Anyone
+    # placing it on a dashboard should add a confirmation to the tap
+    # action; the entity itself no longer hides.
+    _attr_entity_registry_enabled_default = True
 
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
         self._entry = entry

@@ -60,7 +60,14 @@ class DegradedBinarySensor(BinarySensorEntity):
             # healthy, so a cold start reported "not degraded" before any
             # source had ever succeeded — on the one entity most likely
             # to be wired into an automation. See sensor.is_source_healthy.
-            not is_source_healthy(health)
+            # v0.2.2 fix (SWF-021-007): pass the source name, so the
+            # per-source grace periods added in v0.2.1 apply here too.
+            # Without it this entity used the default one-hour grace for
+            # every source and still reported Degraded for hours after a
+            # restart because Meteonomiqs runs once daily — which is the
+            # exact symptom SWF-P2-008 was meant to fix, surviving on the
+            # one entity most likely to be wired into an automation.
+            not is_source_healthy(health, source)
             for source in ALL_TELEMETRY_SOURCES
             if (health := _get_health(self._runtime, source)) is not None
         )

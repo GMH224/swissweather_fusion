@@ -117,7 +117,7 @@ def test_sea_level_reduction_survives_absurd_temperature():
         ("humidity", 0.0),
         ("humidity", 100.0),
         ("pressure", 1013.0),
-        ("precipitation", 0.0),
+        ("precip", 0.0),
         ("wind_speed", 12.0),
     ],
 )
@@ -134,7 +134,11 @@ def test_validate_forecast_value_accepts_plausible_values(variable, value):
         ("humidity", -1.0),
         ("pressure", 5.0),
         ("pressure", 100000.0),
-        ("precipitation", -1.0),
+        # v0.2.2 (SWF-022-001): the key is "precip", the project's actual
+        # vocabulary. This test previously used "precipitation", which
+        # matched the old hard-coded bounds dict but no stored row — so
+        # it passed while real precipitation went unvalidated.
+        ("precip", -1.0),
         ("wind_speed", 900.0),
     ],
 )

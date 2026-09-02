@@ -499,12 +499,14 @@ def test_reset_button_reports_what_it_did(db):
     assert "preserved" in after["effect"]
 
 
-def test_reset_button_is_hidden_by_default():
+def test_reset_button_is_visible_and_diagnostic():
     """A recovery control, not a routine one — an always-visible reset
     invites experimentation with something that costs relearning time."""
     from swissweather_fusion.button import ResetLearningButton
 
-    assert ResetLearningButton._attr_entity_registry_enabled_default is False
+    # v0.2.2: now visible by default. Hiding a recovery control the user
+    # explicitly asked for meant it could not be found when needed.
+    assert ResetLearningButton._attr_entity_registry_enabled_default is True
     assert ResetLearningButton._attr_entity_category == "diagnostic"
 
 

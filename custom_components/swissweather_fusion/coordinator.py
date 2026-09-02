@@ -31,12 +31,13 @@ from homeassistant.util import dt as dt_util
 from .clients.combiprecip import CombiPrecipClient
 from .clients.meteoblue import BonusCallTracker, MeteoblueClient, should_fire_scheduled_call
 from .clients.meteonomiqs import AnnualCallBudget, MeteonomiqsClient, needs_keepalive_call
-from .clients.open_meteo import OpenMeteoClient
+from .clients.open_meteo import OPTIONAL_HOURLY_VARIABLES, OpenMeteoClient
 from .clients.srf import SrfClient
 from .health import SourceHealth, classify_exception
 from .const import (
     PRESSURE_PLAUSIBLE_MAX_HPA,
     PRESSURE_PLAUSIBLE_MIN_HPA,
+    STATION_PRESSURE_REFERENCE_TOLERANCE_HPA,
     METEOBLUE_ANNUAL_CALL_BUDGET,
     METEOBLUE_SCHEDULED_RETRY_COOLDOWN,
     METEONOMIQS_NOWCAST_TARGET_WINDOW,
@@ -186,7 +187,10 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                 # coordinators had no equivalent protection at all.
                 async with asyncio.timeout(60):
                     parsed = await self._client.async_fetch_forecast(
-                        source=source, latitude=self._latitude, longitude=self._longitude
+                        source=source,
+                        latitude=self._latitude,
+                        longitude=self._longitude,
+                        include_optional=self._include_optional_variables,
                     )
             except Exception as err:  # noqa: BLE001
                 duration_ms = (time.monotonic() - start) * 1000
@@ -208,6 +212,27 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                     )
                 if kind == "auth":
                     auth_failure = safe_err
+                # v0.2.2 fix (SWF-021-009): the fallback this flag exists
+                # for is now actually wired. v0.2.1 set
+                # _include_optional_variables and never read it, so the
+                # protection described in its own comment did not exist:
+                # if a model rejected uv_index, all three Open-Meteo
+                # sources simply failed forever.
+                #
+                # A "data" classification on a request carrying optional
+                # variables is the signature of a rejected variable name
+                # (Open-Meteo answers 400 with a message rather than a
+                # transport error). Drop the optional set once and keep
+                # the core seventeen variables working; UV is a
+                # nice-to-have and three sources are not.
+                if kind == "data" and self._include_optional_variables:
+                    _LOGGER.warning(
+                        "Open-Meteo rejected the request for %s while optional "
+                        "variables (%s) were included; retrying without them "
+                        "from now on. UV index will be unavailable.",
+                        source, ", ".join(OPTIONAL_HOURLY_VARIABLES),
+                    )
+                    self._include_optional_variables = False
                 continue
             duration_ms = (time.monotonic() - start) * 1000
             self.health[source].record_success(duration_ms=duration_ms)
@@ -231,6 +256,15 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                 and parsed.run_fingerprint == previous_fingerprint
             ):
                 # No new run since last successful fetch — nothing to store.
+                #
+                # v0.2.2 fix (SWF-021-014): the source is still REPORTED.
+                # Omitting it from `results` made the coordinator claim
+                # the source was unavailable when its data is healthy and
+                # already persisted — an inconsistent public state
+                # contract that any future entity or diagnostic reading
+                # .data would misread. Nothing new is written; only the
+                # reporting changes.
+                results[source] = parsed
                 continue
             self._last_issued_at[source] = parsed.issued_at
 
@@ -877,13 +911,8 @@ class CombiPrecipCoordinator(DataUpdateCoordinator):
                     source="combiprecip", event_type="poll_failure", detail=str(err)
                 )
             raise UpdateFailed(f"CombiPrecip fetch failed: {err}") from err
-        self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
-        if self._diagnostics is not None:
-            self._diagnostics.record(
-                source="combiprecip", event_type="poll_success",
-                detail=f"{len(values)} points extracted",
-            )
-
+        # v0.2.2 (SWF-021-006): success is recorded only after the row is
+        # durably stored — see the comment at the write below.
         # Only the "local" point goes into radar_observations (const.py
         # schema — one row per scan for the configured location); the
         # upwind points are Model B-only features and are passed straight
@@ -891,11 +920,36 @@ class CombiPrecipCoordinator(DataUpdateCoordinator):
         # since their value is in the live signal, not historical trend.
         local = next((v for v in values if v.label == "local"), None)
         if local is not None:
+            # v0.2.2 fix (SWF-021-006), CRITICAL: the attribute is
+            # precip_accum_mm_1h, renamed in v0.1.24 when P1-14
+            # established that CombiPrecip reports a one-hour
+            # ACCUMULATION rather than an instantaneous rate. This call
+            # site was missed, so every radar cycle raised
+            # AttributeError.
+            #
+            # It failed in the most misleading possible place: AFTER
+            # health.record_success() and AFTER the "N points extracted"
+            # diagnostics event. So telemetry reported CombiPrecip
+            # healthy and succeeding while radar_observations stayed
+            # empty and the coordinator's .data was never updated —
+            # meaning Model B received no radar signal at all, and the
+            # storm score had only its station-tendency half.
+            #
+            # The lesson for the ordering: success must not be recorded
+            # until the work is actually complete. record_success() has
+            # been moved below this write for that reason.
             await self.hass.async_add_executor_job(
                 self._db.insert_radar_observation,
                 local.valid_at.isoformat(),
-                local.precip_rate_mmh,
+                local.precip_accum_mm_1h,
                 None,
+                local.quality,
+            )
+        self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="combiprecip", event_type="poll_success",
+                detail=f"{len(values)} points extracted",
             )
         return values
 
@@ -930,6 +984,10 @@ class StationCoordinator(DataUpdateCoordinator):
         self._diagnostics = diagnostics
         # v0.1.24 (P1-22): see _async_update_data.
         self._pressure_is_sea_level = pressure_is_sea_level
+        # v0.2.3 (SWF-023-001): station-minus-provider pressure, exposed
+        # as a diagnostic sensor so a datum mismatch is visible rather
+        # than inferred.
+        self.pressure_reference_delta: Optional[float] = None
         self._elevation_m = elevation_m
 
     def _read_float_state(
@@ -1043,6 +1101,55 @@ class StationCoordinator(DataUpdateCoordinator):
             # permanently distorts an EMA bucket, and there is no
             # mechanism for an EMA to forget one.
             pressure = None
+
+        # v0.2.3 fix (SWF-023-001): cross-check against the providers.
+        #
+        # The absolute-bounds check above only catches a double-reduced
+        # reading when it happens to exceed a world record — so on a
+        # 1024 hPa day it fires, and on a 1010 hPa day the same 65 hPa
+        # error sails through at 1075. The error is identical; only the
+        # weather differs. That is luck, not detection.
+        #
+        # Every provider reports mean-sea-level pressure and models agree
+        # on it closely, so their consensus is a reliable yardstick. A
+        # disagreement beyond STATION_PRESSURE_REFERENCE_TOLERANCE_HPA is
+        # not weather — it is roughly a 200 m altitude error, an order of
+        # magnitude below the ~65 hPa signature of a double reduction but
+        # far outside any legitimate model spread.
+        #
+        # The delta is retained either way, so the relationship is
+        # visible on a sensor rather than having to be inferred from a
+        # number that slowly climbs.
+        self.pressure_reference_delta = None
+        if pressure is not None:
+            reference = await self.hass.async_add_executor_job(
+                self._db.get_reference_pressure_hpa,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H"),
+            )
+            if reference is not None:
+                delta = pressure - reference
+                self.pressure_reference_delta = round(delta, 1)
+                if abs(delta) > STATION_PRESSURE_REFERENCE_TOLERANCE_HPA:
+                    _LOGGER.warning(
+                        "Station pressure %.1f hPa disagrees with the provider "
+                        "consensus %.1f hPa by %.1f hPa. That is far outside any "
+                        "legitimate model spread and is almost always the "
+                        "'pressure sensor already reports sea-level pressure' "
+                        "option being set incorrectly — check it under "
+                        "Configure. Discarding this reading rather than letting "
+                        "Model A learn from it.",
+                        pressure, reference, delta,
+                    )
+                    if self._diagnostics is not None:
+                        self._diagnostics.record(
+                            source="station", event_type="data_quality",
+                            detail=(
+                                f"pressure {pressure:.1f} hPa disagrees with "
+                                f"provider consensus {reference:.1f} hPa by "
+                                f"{delta:+.1f} hPa; check the sea-level setting"
+                            ),
+                        )
+                    pressure = None
 
         # v0.1.24 fix (IND-02): do not write a row when every value is
         # missing. compute_tendency_features used to take samples[-1]
@@ -1511,6 +1618,13 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         "precip_probability", "wind_speed", "wind_gust_speed",
         "wind_bearing", "dew_point", "apparent_temperature",
         "cloud_coverage", "visibility",
+        # v0.2.2 fix (SWF-021-010 / SWF-021-011): uv_index and
+        # sunshine_duration were registered, requested, mapped and
+        # published on the entity — but omitted from this tuple, which is
+        # what the blend actually queries from storage. So both were
+        # collected, stored, and then never fused or exposed. A user
+        # looking for UV in the card found nothing.
+        "uv_index", "sunshine_duration",
     )
     CATEGORICAL_MEASUREMENTS = ("weather_code",)
     # Everything queried from storage in one pass.

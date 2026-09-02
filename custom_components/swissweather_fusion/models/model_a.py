@@ -363,6 +363,23 @@ def find_nearest_observation(
     return best_value
 
 
+def _majority(values: list) -> Optional[float]:
+    """Most frequent value, ties broken toward the more severe code.
+
+    v0.2.2 (SWF-021-002). Categorical values are never averaged — the
+    mean of WMO codes 3 and 95 is 49, which is not a weather code at all.
+    Mirrors ModelABlendCoordinator._resolve_categorical.
+    """
+    clean = [v for v in values if v is not None]
+    if not clean:
+        return None
+    counts: dict = {}
+    for value in clean:
+        counts[value] = counts.get(value, 0) + 1
+    best = max(counts.values())
+    return max(v for v, c in counts.items() if c == best)
+
+
 def aggregate_daily_forecast(
     hourly_forecast: list[dict[str, Any]], *, local_tz: timezone = timezone.utc
 ) -> list[dict[str, Any]]:
@@ -394,6 +411,10 @@ def aggregate_daily_forecast(
         total_precip = sum(precips) if precips else None
         # v0.1.24 (P2-10): needed by derive_condition's "cloudy" branch.
         humidities = [e.get("humidity") for e in entries if e.get("humidity") is not None]
+        # v0.2.2 (SWF-021-002/003): stated evidence for resolve_condition.
+        codes = [e.get("weather_code") for e in entries]
+        snows = [e.get("snowfall") for e in entries if e.get("snowfall") is not None]
+        clouds = [e.get("cloud_coverage") for e in entries if e.get("cloud_coverage") is not None]
         results.append(
             {
                 "datetime": datetime.combine(day, datetime.min.time(), tzinfo=local_tz).isoformat(),
@@ -405,10 +426,23 @@ def aggregate_daily_forecast(
                 # must not silently inherit the hourly site's threshold.
                 # `total_precip or 0` preserves this site's own
                 # pre-existing None-as-zero behaviour.
-                "condition": derive_condition(
-                    total_precip or 0,
-                    max(temps) if temps else None,
-                    max(humidities) if humidities else None,
+                # v0.2.2 fix (SWF-021-002 / SWF-021-003): the daily
+                # aggregation now uses resolve_condition, so it can see a
+                # stated WMO code and stated snowfall.
+                #
+                # Previously it inferred from precipitation and the
+                # DAILY MAXIMUM temperature — so a day with a +6 C
+                # afternoon and overnight snow was classified rain,
+                # because the maximum never went below zero. Snowfall is
+                # summed across the period: any snow in the period means
+                # the day had snow.
+                "condition": resolve_condition(
+                    weather_code=_majority(codes),
+                    precip=total_precip or 0,
+                    snowfall=sum(snows) if snows else None,
+                    temperature=min(temps) if temps else None,
+                    humidity=max(humidities) if humidities else None,
+                    cloud_coverage=max(clouds) if clouds else None,
                     precip_threshold=0.5,
                 ),
             }
@@ -470,6 +504,10 @@ def aggregate_twice_daily_forecast(
         total_precip = sum(precips) if precips else None
         # v0.1.24 (P2-10): needed by derive_condition's "cloudy" branch.
         humidities = [e.get("humidity") for e in entries if e.get("humidity") is not None]
+        # v0.2.2 (SWF-021-002/003): stated evidence for resolve_condition.
+        codes = [e.get("weather_code") for e in entries]
+        snows = [e.get("snowfall") for e in entries if e.get("snowfall") is not None]
+        clouds = [e.get("cloud_coverage") for e in entries if e.get("cloud_coverage") is not None]
         period_start_hour = TWICE_DAILY_DAY_START_HOUR if is_daytime else TWICE_DAILY_DAY_END_HOUR
         results.append(
             {
@@ -481,16 +519,21 @@ def aggregate_twice_daily_forecast(
                     (max(temps) if is_daytime else min(temps)) if temps else None
                 ),
                 "native_precipitation": total_precip,
-                # v0.1.24 (P2-10): see the daily aggregation above.
-                "condition": derive_condition(
-                    total_precip or 0,
-                    (max(temps) if is_daytime else min(temps)) if temps else None,
-                    max(humidities) if humidities else None,
+                # v0.2.2 fix (SWF-021-002 / SWF-021-003): uses the
+                # resolver, so a stated WMO code and stated snowfall are
+                # seen. The MINIMUM temperature drives the snow decision,
+                # since snow falling at any point in the period is what
+                # matters — the previous code used the daytime MAXIMUM,
+                # so a +6 C afternoon with overnight snow was reported as
+                # rain.
+                "condition": resolve_condition(
+                    weather_code=_majority(codes),
+                    precip=total_precip or 0,
+                    snowfall=sum(snows) if snows else None,
+                    temperature=min(temps) if temps else None,
+                    humidity=max(humidities) if humidities else None,
+                    cloud_coverage=max(clouds) if clouds else None,
                     precip_threshold=0.5,
-                    # v0.1.28 (SWF-P2-005): this site already knows which
-                    # half of the day it describes, so the night period
-                    # now correctly reports clear-night rather than a sun
-                    # icon at 3am.
                     is_daytime=is_daytime,
                 ),
             }
@@ -584,6 +627,12 @@ def derive_condition(
 # ---------------------------------------------------------------------------
 # Condition resolution from real provider data (v0.2.0)
 # ---------------------------------------------------------------------------
+# v0.2.2 (SWF-021-004): shared by both the code-reconciliation branch and
+# the measured-cover branch of resolve_condition, so the two can never
+# drift apart and disagree about what "cloudy" means.
+CLOUDY_COVERAGE_THRESHOLD = 85.0
+PARTLY_CLOUDY_COVERAGE_THRESHOLD = 40.0
+
 # WMO weather code -> Home Assistant condition. Open-Meteo returns the
 # standard WMO 4677 code, so this is a documented mapping rather than a
 # guess. Codes are grouped as HA's condition vocabulary is much coarser.
@@ -657,6 +706,24 @@ def resolve_condition(
     # 1. Provider classification wins outright.
     from_code = condition_from_weather_code(weather_code)
     if from_code is not None:
+        # v0.2.2 fix (SWF-021-004): reconcile a "clear" code against
+        # measured cloud cover instead of letting it win unconditionally.
+        #
+        # WMO 0/1 map to "sunny", but the codes and the cloud-cover field
+        # are separate outputs and can disagree — different models in the
+        # fused set, or a code describing significant weather while cover
+        # describes the sky. Reporting "Sunny" beside a published
+        # cloud_coverage of 89% is a single entity contradicting itself,
+        # which is worse than either value alone being imprecise.
+        #
+        # Only the clear-sky codes are reconciled. A code stating rain,
+        # fog or thunder is describing something cloud cover cannot
+        # contradict, and must not be second-guessed.
+        if from_code in ("sunny", "partlycloudy") and cloud_coverage is not None:
+            if cloud_coverage >= CLOUDY_COVERAGE_THRESHOLD:
+                return "cloudy"
+            if cloud_coverage >= PARTLY_CLOUDY_COVERAGE_THRESHOLD:
+                return "partlycloudy"
         # Night substitution still applies to the clear-sky case (P2-005).
         if from_code == "sunny" and is_daytime is False:
             return "clear-night"
@@ -673,9 +740,9 @@ def resolve_condition(
 
     # 3. Measured cloud cover beats the humidity proxy.
     if cloud_coverage is not None:
-        if cloud_coverage >= 85:
+        if cloud_coverage >= CLOUDY_COVERAGE_THRESHOLD:
             return "cloudy"
-        if cloud_coverage >= 40:
+        if cloud_coverage >= PARTLY_CLOUDY_COVERAGE_THRESHOLD:
             return "partlycloudy"
         return "clear-night" if is_daytime is False else "sunny"
 

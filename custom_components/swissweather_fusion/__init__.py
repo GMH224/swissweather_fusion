@@ -182,80 +182,94 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             DEFAULT_STATION_PRESSURE_IS_SEA_LEVEL,
         ),
     )
-    station_coordinator = StationCoordinator(
-        hass, db, temp_entity, humidity_entity, pressure_entity,
-        pressure_is_sea_level=pressure_is_sea_level,
-        elevation_m=elevation_effective,
-        diagnostics=diagnostics_recorder,
-    )
-    open_meteo_coordinator = OpenMeteoCoordinator(
-        hass, db, latitude, longitude, api_key=open_meteo_api_key,
-        diagnostics=diagnostics_recorder,
-        actual_elevation_m=elevation_effective,
-    )
-    srf_coordinator = SrfCoordinator(
-        hass,
-        db,
-        latitude,
-        longitude,
-        srf_consumer_key,
-        srf_consumer_secret,
-        diagnostics=diagnostics_recorder,
-    )
-    meteoblue_coordinator = MeteoblueCoordinator(
-        hass, db, latitude, longitude, meteoblue_api_key,
-        diagnostics=diagnostics_recorder,
-    )
-    combiprecip_coordinator = CombiPrecipCoordinator(
-        hass, db, latitude, longitude, diagnostics=diagnostics_recorder
-    )
-    meteonomiqs_coordinator = MeteonomiqsCoordinator(
-        hass, db, latitude, longitude, meteonomiqs_api_key,
-        diagnostics=diagnostics_recorder,
-    )
-    model_b_coordinator = ModelBCoordinator(
-        hass,
-        db,
-        station_coordinator,
-        combiprecip_coordinator,
-        meteoblue_coordinator,
-        meteonomiqs_coordinator,
-        diagnostics=diagnostics_recorder,
-    )
-    # v0.1.5: computes Model A's current values + hourly/daily/twice-daily
-    # forecast in one batched executor job — see coordinator.py for why
-    # this replaced logic that used to live directly in weather.py.
-    blend_coordinator = ModelABlendCoordinator(hass, db)
-    # v0.1.7: the actual learning step — without this, bucket_stats never
-    # gets populated at all, and Model A's blend is only ever an
-    # unweighted average of raw forecasts. See coordinator.py for the
-    # full story of how this gap was found.
-    # v0.1.24 fix (P2-03 / P2-04): ONE lock object, constructed here on
-    # the event loop and injected into both coordinators that write
-    # forecast_snapshots. Two independently-created locks would serialize
-    # each coordinator against itself and nothing against the other,
-    # which is precisely the race being closed. Constructed directly
-    # rather than via an executor job, unlike the database connection —
-    # asyncio.Lock must be created on the loop it will be awaited on.
-    shared_learning_lock = asyncio.Lock()
-    learning_coordinator = ModelALearningCoordinator(
-        hass, db, reconcile_lock=shared_learning_lock
-    )
-    # v0.1.23 fix (L-10): the only caller of db.purge_older_than() — see
-    # RetentionCoordinator's docstring in coordinator.py. purge_days=0
-    # (the default) makes this coordinator a permanent no-op, matching
-    # the documented "0 = forever" meaning of the setting.
-    retention_coordinator = RetentionCoordinator(
-        hass,
-        db,
-        purge_days=purge_days,
-        retention_lock=shared_learning_lock,
-        diagnostics=diagnostics_recorder,
-    )
-    # v0.1.24 (P2-08): the first-ever writer to storm_events.
-    storm_reconciliation_coordinator = StormEventReconciliationCoordinator(
-        hass, db, diagnostics=diagnostics_recorder
-    )
+    # v0.2.2 fix (SWF-021-012): coordinator CONSTRUCTION is guarded.
+    #
+    # The pre-existing cleanup path covers the FIRST-REFRESH stage. A
+    # constructor raising before that — a bad option value, a client
+    # rejecting a credential's shape, an unexpected None — propagated
+    # out of async_setup_entry with the SQLite connection still open.
+    # Home Assistant then retries setup and opens a SECOND connection
+    # to the same file, repeating on every retry until it gives up.
+    try:
+        station_coordinator = StationCoordinator(
+            hass, db, temp_entity, humidity_entity, pressure_entity,
+            pressure_is_sea_level=pressure_is_sea_level,
+            elevation_m=elevation_effective,
+            diagnostics=diagnostics_recorder,
+        )
+        open_meteo_coordinator = OpenMeteoCoordinator(
+            hass, db, latitude, longitude, api_key=open_meteo_api_key,
+            diagnostics=diagnostics_recorder,
+            actual_elevation_m=elevation_effective,
+        )
+        srf_coordinator = SrfCoordinator(
+            hass,
+            db,
+            latitude,
+            longitude,
+            srf_consumer_key,
+            srf_consumer_secret,
+            diagnostics=diagnostics_recorder,
+        )
+        meteoblue_coordinator = MeteoblueCoordinator(
+            hass, db, latitude, longitude, meteoblue_api_key,
+            diagnostics=diagnostics_recorder,
+        )
+        combiprecip_coordinator = CombiPrecipCoordinator(
+            hass, db, latitude, longitude, diagnostics=diagnostics_recorder
+        )
+        meteonomiqs_coordinator = MeteonomiqsCoordinator(
+            hass, db, latitude, longitude, meteonomiqs_api_key,
+            diagnostics=diagnostics_recorder,
+        )
+        model_b_coordinator = ModelBCoordinator(
+            hass,
+            db,
+            station_coordinator,
+            combiprecip_coordinator,
+            meteoblue_coordinator,
+            meteonomiqs_coordinator,
+            diagnostics=diagnostics_recorder,
+        )
+        # v0.1.5: computes Model A's current values + hourly/daily/twice-daily
+        # forecast in one batched executor job — see coordinator.py for why
+        # this replaced logic that used to live directly in weather.py.
+        blend_coordinator = ModelABlendCoordinator(hass, db)
+        # v0.1.7: the actual learning step — without this, bucket_stats never
+        # gets populated at all, and Model A's blend is only ever an
+        # unweighted average of raw forecasts. See coordinator.py for the
+        # full story of how this gap was found.
+        # v0.1.24 fix (P2-03 / P2-04): ONE lock object, constructed here on
+        # the event loop and injected into both coordinators that write
+        # forecast_snapshots. Two independently-created locks would serialize
+        # each coordinator against itself and nothing against the other,
+        # which is precisely the race being closed. Constructed directly
+        # rather than via an executor job, unlike the database connection —
+        # asyncio.Lock must be created on the loop it will be awaited on.
+        shared_learning_lock = asyncio.Lock()
+        learning_coordinator = ModelALearningCoordinator(
+            hass, db, reconcile_lock=shared_learning_lock
+        )
+        # v0.1.23 fix (L-10): the only caller of db.purge_older_than() — see
+        # RetentionCoordinator's docstring in coordinator.py. purge_days=0
+        # (the default) makes this coordinator a permanent no-op, matching
+        # the documented "0 = forever" meaning of the setting.
+        retention_coordinator = RetentionCoordinator(
+            hass,
+            db,
+            purge_days=purge_days,
+            retention_lock=shared_learning_lock,
+            diagnostics=diagnostics_recorder,
+        )
+        # v0.1.24 (P2-08): the first-ever writer to storm_events.
+        storm_reconciliation_coordinator = StormEventReconciliationCoordinator(
+            hass, db, diagnostics=diagnostics_recorder
+        )
+    except Exception:
+        # Nothing is registered yet at this point, so closing the
+        # connection is the whole of the required cleanup.
+        await hass.async_add_executor_job(db.close)
+        raise
 
     # First refresh for each. **Fixed in v0.1.1**: this used to be a bare
     # loop where any single coordinator raising (e.g. the SRF crash) would
@@ -461,6 +475,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         model_b_coordinator,
         learning_coordinator,
         retention_coordinator,
+        # v0.2.2 fix (SWF-021-005): the storm reconciliation coordinator
+        # was constructed, first-refreshed and shut down correctly, but
+        # omitted from this loop. DataUpdateCoordinator only schedules
+        # its recurring refresh while it has at least one listener, so
+        # its 30-minute cycle never ran after the initial refresh —
+        # storm_events could still only fill on a restart. The table
+        # that the entire Model B v1 plan depends on was, in practice,
+        # still not being populated.
+        storm_reconciliation_coordinator,
     ):
         entry.async_on_unload(coordinator.async_add_listener(_noop))
 

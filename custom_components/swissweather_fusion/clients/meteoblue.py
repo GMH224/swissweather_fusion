@@ -205,12 +205,25 @@ class BonusCallTracker:
 # Fields confirmed present via a live test call during planning:
 # relativehumidity, sealevelpressure, temperature, precipitation, windspeed,
 # felttemperature, uvindex, predictability, rainspot (format undocumented).
+# v0.2.2 (SWF-021-015): meteoblue's own hourly response carries several
+# of the parameters v0.2.0 added, and they were being discarded. These
+# are fields the existing request already returns — no additional API
+# call and no extra credit against the 8,000-per-call budget.
 _FIELD_MAP = {
     "temperature": "temperature",
     "relativehumidity": "humidity",
     "sealevelpressure": "pressure",
     "precipitation": "precip",
     "windspeed": "wind_speed",
+    # v0.2.2 (SWF-021-015): already present in the same response.
+    "snowfraction": "srf_snowfraction",
+    "precipitation_probability": "precip_probability",
+    "windgust": "wind_gust_speed",
+    "winddirection": "wind_bearing",
+    "dewpointtemperature": "dew_point",
+    "felttemperature": "apparent_temperature",
+    "totalcloudcover": "cloud_coverage",
+    "uvindex": "uv_index",
 }
 
 
