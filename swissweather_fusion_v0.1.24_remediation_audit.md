@@ -6,8 +6,12 @@ second external ICS-style audit, 13 from an independent audit performed
 during triage.
 
 **Result:** 62 defects fixed, 1 audit finding refuted and deliberately
-left unchanged. Test suite 198 → **352 passing**. pyflakes **clean**
+left unchanged. Test suite 198 → **357 passing**. pyflakes **clean**
 (the five long-standing unused-import warnings were also cleared).
+
+> **v0.1.24a.** The first v0.1.24 build failed to load on real upgrading
+> installations. See §7.1 — it is documented in full, including why this
+> release's own tests did not catch it.
 
 ---
 
@@ -15,7 +19,7 @@ left unchanged. Test suite 198 → **352 passing**. pyflakes **clean**
 
 | | v0.1.23 | v0.1.24 |
 | --- | --- | --- |
-| Tests | 198 | 352 |
+| Tests | 198 | 357 |
 | pyflakes warnings | 5 | 0 |
 | Files with executable test coverage | pure-logic modules only | + coordinator, config flow, entities, lifecycle |
 | Database schema | v2 | **v3 (rebuild — see §3)** |
@@ -237,7 +241,61 @@ Documented because silently "fixing" a non-defect is itself a defect.
 
 ---
 
-## 7. Bugs introduced during this pass and caught by its own tests
+## 7. Bugs introduced during this pass
+
+### 7.1 The one that reached a real installation
+
+The first v0.1.24 build failed at setup on every upgrading installation:
+
+```
+sqlite3.OperationalError: no such column: reconciled
+  File "custom_components/swissweather_fusion/storage/db.py", in _ensure_schema
+    self._conn.executescript(_SCHEMA_SQL)
+```
+
+**Cause.** The new index on `storm_predictions(reconciled)` was placed in
+`_SCHEMA_SQL`, which runs first and unconditionally, *before* migration
+detection. Its `CREATE TABLE IF NOT EXISTS storm_predictions` is a silent
+no-op against the existing v0.1.23 table, so the index then referenced a
+column that did not exist yet — and raised before any migration could add
+it. Setup aborted; the integration could not load at all.
+
+**This is the exact failure mode P2-01 exists to describe.** Worse, the
+v0.1.23 author had already hit it for `reconciliation_status`, split that
+one index into a separate post-migration script, and left a comment
+explaining precisely this hazard. The new index was added into
+`_SCHEMA_SQL` anyway, a few lines above that comment.
+
+**Why the test suite did not catch it.** The migration test hand-built a
+*partial* database — schema_meta, forecast_snapshots and bucket_stats
+only. With no `storm_predictions` table present, `_SCHEMA_SQL` genuinely
+created it, complete with the new column, and the index succeeded. The
+test was exercising a database shape no real installation has ever had.
+It gave the appearance of covering the upgrade path while covering
+something else entirely, which is a more dangerous state than having no
+test at all.
+
+**Fix.**
+
+1. The index moved to `_POST_MIGRATION_INDEX_SQL`, applied after
+   migration. `_PENDING_INDEX_SQL` was renamed to match its now-general
+   purpose, and its comment was rewritten from a note about one index
+   into a stated rule: *any index over a column that a migration adds
+   must live there, never in `_SCHEMA_SQL`.*
+2. `tests/test_v0_1_24_storage.py` gained a `V0_1_23_SCHEMA` fixture —
+   the **complete** prior schema, all eight tables, populated — and five
+   tests over it: that it opens at all, that every index is created, that
+   facts survive while derived tables rebuild, that a second open is
+   idempotent, and that the migrated database is immediately usable for
+   reconciliation and storm queries.
+3. All five were confirmed to **fail against the broken build** with the
+   exact production error before the fix was restored.
+
+**Lesson recorded for future migrations.** A migration test must build
+the real prior schema in full. A partial fixture tests the fresh-install
+path wearing an upgrade path's name.
+
+### 7.2 Bugs caught by the suite during development
 
 Ordinary development mistakes, listed because a suite that never catches
 anything is not evidence of quality.
@@ -281,7 +339,7 @@ carries a comment explaining why the old assertion was wrong.
 ## 9. Verification record
 
 ```
-python -m pytest tests/ -q                                   # 352 passed
+python -m pytest tests/ -q                                   # 357 passed
 python -m pyflakes custom_components/swissweather_fusion/     # clean, exit 0
 ```
 
@@ -291,9 +349,10 @@ python -m pyflakes custom_components/swissweather_fusion/     # clean, exit 0
   P1-16, P1-18, P2-08, P2-10, P2-11, IND-01, IND-02, IND-13 — the test
   asserts the specific behavioural difference, not merely that the new
   code runs.
-- The v3 migration is tested against a hand-built raw pre-migration
-  SQLite file, exercising the real upgrade path rather than only a
-  freshly-created database.
+- The v3 migration is tested against a hand-built **complete** v0.1.23
+  database — all eight tables, populated — exercising the real upgrade
+  path rather than only a freshly-created database. A partial fixture is
+  what allowed §7.1 to ship.
 - `coordinator.py`, `__init__.py`, `config_flow.py`, `sensor.py` and
   `binary_sensor.py` now have executable coverage for the first time.
 

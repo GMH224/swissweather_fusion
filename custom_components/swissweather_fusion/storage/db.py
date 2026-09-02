@@ -145,22 +145,40 @@ CREATE TABLE IF NOT EXISTS storm_predictions (
     reconciled INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_predictions_ts ON storm_predictions(ts);
-CREATE INDEX IF NOT EXISTS idx_predictions_reconciled
-    ON storm_predictions(reconciled, ts);
+-- NOTE: the index on `reconciled` is deliberately NOT here. See
+-- _POST_MIGRATION_INDEX_SQL below.
 """
 
-# Split out from _SCHEMA_SQL above and applied separately, always AFTER the
-# v1->v2 migration has run (see _ensure_schema): this partial index
-# references the reconciliation_status column, which does not exist yet on
-# a database being migrated from v1 at the point _SCHEMA_SQL's
-# `CREATE TABLE IF NOT EXISTS forecast_snapshots` is a no-op (the table
-# already exists in its old shape). Creating this index eagerly as part of
-# _SCHEMA_SQL would fail with "no such column" on exactly the upgrade path
-# it's meant to support.
-_PENDING_INDEX_SQL = """
+# ---------------------------------------------------------------------------
+# Indexes that reference columns added by a migration
+# ---------------------------------------------------------------------------
+# **THE RULE: any index over a column that a migration adds MUST live here,
+# never in _SCHEMA_SQL.**
+#
+# _SCHEMA_SQL runs FIRST, unconditionally, before migration detection. Its
+# `CREATE TABLE IF NOT EXISTS` statements are silent no-ops against tables
+# that already exist — regardless of whether those tables have the columns
+# the current schema expects. So an index in _SCHEMA_SQL that references a
+# newly-added column raises "no such column" on exactly the upgrade path it
+# exists to support, and it raises it before any migration can repair the
+# table. The integration then fails to load entirely.
+#
+# This script is applied separately, always AFTER migration has run.
+#
+# v0.1.23 established this split for idx_forecast_pending
+# (reconciliation_status). v0.1.24 initially failed to follow it: the
+# storm_predictions(reconciled) index was added straight into _SCHEMA_SQL
+# and took down setup on every real upgrading installation with
+# `sqlite3.OperationalError: no such column: reconciled`. That is the
+# reason this comment is now a stated rule rather than a note about one
+# index, and the reason tests/test_v0_1_24_storage.py builds a COMPLETE
+# v0.1.23-shaped database rather than a partial one.
+_POST_MIGRATION_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_forecast_pending
     ON forecast_snapshots(reconciliation_status, valid_at)
     WHERE reconciliation_status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_predictions_reconciled
+    ON storm_predictions(reconciled, ts);
 """
 
 
@@ -275,7 +293,7 @@ class SwissWeatherDB:
         if is_fresh or looks_current:
             # Either genuinely new (the CREATE TABLE statements above just
             # built everything at the current shape) or already current.
-            self._conn.executescript(_PENDING_INDEX_SQL)
+            self._conn.executescript(_POST_MIGRATION_INDEX_SQL)
             self._write_schema_version()
             self._conn.commit()
             return
@@ -283,7 +301,7 @@ class SwissWeatherDB:
         # Tables exist but are not at the current shape. Migrate on the
         # evidence of the shape itself, not on what the metadata claims.
         self._migrate_to_v3()
-        self._conn.executescript(_PENDING_INDEX_SQL)
+        self._conn.executescript(_POST_MIGRATION_INDEX_SQL)
         self._write_schema_version()
         self._conn.commit()
 
@@ -389,6 +407,9 @@ class SwissWeatherDB:
         self._conn.execute("DROP TABLE IF EXISTS radar_observations")
         self._conn.execute("DROP TABLE IF EXISTS storm_predictions")
         self._conn.execute("DROP TABLE IF EXISTS storm_events")
+        # Recreate the dropped tables at the current shape. Safe here
+        # because the DROP statements above mean these are genuine
+        # creations rather than no-ops.
         self._conn.executescript(_SCHEMA_SQL)
         self._conn.commit()
 

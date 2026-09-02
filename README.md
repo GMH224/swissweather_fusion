@@ -15,7 +15,7 @@ check from Meteonomiqs.
 
 **Status: v0.1.24.** The core architecture is built and the business
 logic (bias correction, storm scoring, radar sampling) is extensively
-unit-tested — 352 tests, pyflakes clean. v0.1.24 is a large remediation
+unit-tested — 357 tests, pyflakes clean. v0.1.24 is a large remediation
 release closing 62 defects found across two external audits and one
 independent audit: see
 [swissweather_fusion_v0.1.24_remediation_audit.md](swissweather_fusion_v0.1.24_remediation_audit.md)

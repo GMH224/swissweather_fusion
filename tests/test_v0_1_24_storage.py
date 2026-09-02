@@ -314,3 +314,173 @@ def test_dead_watermark_accessors_are_gone(db):
     Asserted as absence so reinstating them is deliberate."""
     assert not hasattr(db, "get_reconciliation_watermark")
     assert not hasattr(db, "set_reconciliation_watermark")
+
+
+# ---------------------------------------------------------------------------
+# Upgrade path from a COMPLETE v0.1.23 database
+# ---------------------------------------------------------------------------
+# The v0.1.24 release candidate failed to load on every real upgrading
+# installation with:
+#
+#     sqlite3.OperationalError: no such column: reconciled
+#
+# Root cause: the new index on storm_predictions(reconciled) was placed in
+# _SCHEMA_SQL, which runs FIRST and unconditionally, before migration
+# detection. Its `CREATE TABLE IF NOT EXISTS storm_predictions` is a
+# silent no-op against the existing v0.1.23 table, so the index then
+# referenced a column that did not exist yet — and raised before any
+# migration could add it.
+#
+# Why the existing migration test did not catch it: it hand-built a
+# PARTIAL database containing only schema_meta, forecast_snapshots and
+# bucket_stats. With no storm_predictions table present, _SCHEMA_SQL
+# genuinely created it, complete with the new column, and the index
+# succeeded. The test was verifying a shape that no real installation
+# ever had.
+#
+# The fixture below is therefore the complete v0.1.23 schema, and these
+# tests are the upgrade-path gate.
+V0_1_23_SCHEMA = """
+CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT);
+INSERT INTO schema_meta VALUES ('schema_version','2');
+CREATE TABLE station_observations (
+    id INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+    temperature REAL, humidity REAL, pressure REAL
+);
+CREATE TABLE forecast_snapshots (
+    id INTEGER PRIMARY KEY, source TEXT NOT NULL, issued_at TEXT NOT NULL,
+    valid_at TEXT NOT NULL, variable TEXT NOT NULL, value REAL,
+    trigger_reason TEXT DEFAULT 'scheduled',
+    reconciliation_status TEXT NOT NULL DEFAULT 'pending'
+);
+CREATE TABLE radar_observations (
+    id INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+    precip_rate_mmh REAL, precip_type TEXT
+);
+CREATE TABLE bucket_stats (
+    hour_of_day INTEGER NOT NULL, season TEXT NOT NULL,
+    lead_time_bucket TEXT NOT NULL, source TEXT NOT NULL,
+    measurement TEXT NOT NULL, ema_bias REAL NOT NULL DEFAULT 0.0,
+    ema_abs_error REAL NOT NULL DEFAULT 0.0,
+    ema_weight REAL NOT NULL DEFAULT 0.0,
+    sample_count INTEGER NOT NULL DEFAULT 0, last_updated TEXT,
+    PRIMARY KEY (hour_of_day, season, lead_time_bucket, source, measurement)
+);
+CREATE TABLE storm_predictions (
+    id INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+    probability REAL NOT NULL, features TEXT
+);
+CREATE TABLE storm_events (
+    id INTEGER PRIMARY KEY, start_ts TEXT NOT NULL, end_ts TEXT,
+    peak_pressure_drop REAL, peak_temp_drop REAL,
+    peak_precip_rate REAL, notes TEXT
+);
+INSERT INTO forecast_snapshots (source, issued_at, valid_at, variable, value)
+    VALUES ('ch1','2026-09-01T00:00:00+00:00','2999-01-01T12:00:00+00:00','temperature',20.0);
+INSERT INTO station_observations (ts, temperature, humidity, pressure)
+    VALUES ('2026-09-01T12:00:00+00:00', 20.0, 50.0, 950.0);
+INSERT INTO bucket_stats
+    (hour_of_day, season, lead_time_bucket, source, measurement, sample_count)
+    VALUES (12,'summer','short','ch1','temperature',42);
+INSERT INTO storm_predictions (ts, probability, features)
+    VALUES ('2026-09-01T12:00:00+00:00', 0.7, '{}');
+"""
+
+
+@pytest.fixture
+def v0_1_23_database():
+    path = tempfile.mktemp(suffix=".db")
+    raw = sqlite3.connect(path)
+    raw.executescript(V0_1_23_SCHEMA)
+    raw.commit()
+    raw.close()
+    return path
+
+
+def test_a_real_v0_1_23_database_opens_without_raising(v0_1_23_database):
+    """The regression gate. This is the exact failure that took setup down:
+    an index over a migration-added column placed in the pre-migration
+    schema script."""
+    database = SwissWeatherDB(v0_1_23_database)
+    try:
+        assert database._get_meta("schema_version") == str(SCHEMA_VERSION)
+    finally:
+        database.close()
+
+
+def test_every_index_can_be_created_on_an_upgraded_database(v0_1_23_database):
+    """Guards the general rule rather than the one index that broke: any
+    index over a migration-added column must live in
+    _POST_MIGRATION_INDEX_SQL, never in _SCHEMA_SQL."""
+    database = SwissWeatherDB(v0_1_23_database)
+    try:
+        indexes = {
+            r["name"]
+            for r in database._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert "idx_forecast_pending" in indexes
+        assert "idx_predictions_reconciled" in indexes
+    finally:
+        database.close()
+
+
+def test_upgrade_preserves_facts_and_rebuilds_derived_tables(v0_1_23_database):
+    """The §3 contract, asserted rather than described: raw provider
+    forecasts and raw sensor readings are facts and survive; learned and
+    interpretation-dependent tables are rebuilt, because three v0.1.24
+    fixes changed what their stored values MEAN."""
+    database = SwissWeatherDB(v0_1_23_database)
+    try:
+        count = lambda t: database._conn.execute(
+            f"SELECT COUNT(*) AS n FROM {t}"
+        ).fetchone()["n"]
+
+        assert count("forecast_snapshots") == 1, "raw forecasts must survive"
+        assert count("station_observations") == 1, "raw observations must survive"
+        assert count("bucket_stats") == 0, "learned weights must be discarded"
+        assert count("storm_predictions") == 0
+
+        cols = lambda t: {
+            r["name"] for r in database._conn.execute(f"PRAGMA table_info({t})")
+        }
+        assert "reconciled" in cols("storm_predictions")
+        assert "precip_accum_mm_1h" in cols("radar_observations")
+        assert "precip_rate_mmh" not in cols("radar_observations")
+    finally:
+        database.close()
+
+
+def test_upgraded_database_reopens_cleanly_a_second_time(v0_1_23_database):
+    """Migration must be idempotent: the second open takes the
+    already-current path and must not re-run the rebuild or re-raise."""
+    first = SwissWeatherDB(v0_1_23_database)
+    first.insert_forecast_snapshot("ch1", "i", "v", "temperature", 1.0)
+    first.close()
+
+    second = SwissWeatherDB(v0_1_23_database)
+    try:
+        assert second._conn.execute(
+            "SELECT COUNT(*) AS n FROM forecast_snapshots"
+        ).fetchone()["n"] == 2, "a second open re-ran the migration"
+    finally:
+        second.close()
+
+
+def test_upgraded_database_is_immediately_usable(v0_1_23_database):
+    """Beyond opening: the reconciliation and storm paths must work on a
+    migrated database, not just on a freshly created one."""
+    database = SwissWeatherDB(v0_1_23_database)
+    try:
+        database.apply_reconciliation_batch(
+            [(_key(), 0.5, 0.5, 2.0, 1, "2026-09-02T12:00:00+00:00")], [], []
+        )
+        assert database.get_bucket_stats(_key()) is not None
+
+        database.insert_storm_prediction("2026-09-01T00:00:00+00:00", 0.9, {})
+        assert database.get_unreconciled_storm_predictions(
+            "2026-09-02T00:00:00+00:00", 0.5
+        )
+    finally:
+        database.close()
