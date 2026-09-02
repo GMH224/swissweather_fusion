@@ -41,6 +41,30 @@ async def async_setup_entry(
     async_add_entities([SwissWeatherFusionWeather(entry, runtime)])
 
 
+def _is_daytime_now(hass: Any) -> bool | None:
+    """Whether the sun is currently above the horizon, or None if unknown.
+
+    v0.1.28 (SWF-P2-005). Read from Home Assistant's own `sun.sun`
+    entity rather than computed here: core already tracks it, it is
+    correct for the installation's real location, and it costs nothing.
+    Returning None when the entity is missing or in an unexpected state
+    means derive_condition keeps its pre-v0.1.28 answer rather than
+    guessing — a wrong "clear-night" at noon would be more conspicuous
+    than the bug being fixed.
+    """
+    try:
+        state = hass.states.get("sun.sun")
+    except AttributeError:  # pragma: no cover - defensive
+        return None
+    if state is None:
+        return None
+    if state.state == "above_horizon":
+        return True
+    if state.state == "below_horizon":
+        return False
+    return None
+
+
 class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
     _attr_has_entity_name = True
     _attr_name = None
@@ -99,6 +123,7 @@ class SwissWeatherFusionWeather(CoordinatorEntity, WeatherEntity):
             self._current.get("precip"),
             self._current.get("temperature"),
             self._current.get("humidity"),
+            is_daytime=_is_daytime_now(self.hass),
         )
 
     async def async_forecast_hourly(self) -> list[Forecast]:

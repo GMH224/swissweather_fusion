@@ -28,13 +28,39 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
 
 STAC_COLLECTION = "ch.meteoschweiz.ogd-radar-precip"
 STAC_ITEMS_URL = (
     f"https://data.geo.admin.ch/api/stac/v1/collections/{STAC_COLLECTION}/items"
 )
+
+
+def stac_item_url_for_date(day: date) -> str:
+    """URL of the STAC item holding a given calendar day's radar files.
+
+    **v0.1.28 fix (SWF-P1-005).** The client used to request
+    ``/items?limit=1&sortby=-datetime`` and take whatever came back. That
+    is wrong, because ``properties.datetime`` on these items is not the
+    data date — it is an UPDATE timestamp, refreshed whenever any file in
+    the item changes. MeteoSwiss recomputes an 8-day-delayed "reanalysis"
+    that overwrites old hourly CPC files, so an item from two weeks ago
+    routinely carries today's datetime and sorts first.
+
+    Observed live on 2 September 2026: the newest-by-datetime item was
+    ``20260819-ch`` — 14 days old, and about to expire — with
+    ``properties.datetime`` of 2026-09-02T04:00Z. Every radar reading the
+    integration took was from 19 August while being treated as current.
+
+    That defect predates v0.1.24; the freshness gate added in P1-13 would
+    now catch the stale scan times and zero the radar signal, so the
+    symptom would have been "radar never contributes" rather than
+    "phantom precipitation". Either way the fetch has to select the right
+    item, and item ids are plainly date-stamped (``YYYYMMDD-ch``), so
+    addressing one directly is both correct and far cheaper than paging.
+    """
+    return f"{STAC_ITEMS_URL}/{day:%Y%m%d}-ch"
 
 # WGS84 (lat/lon) -> Swiss LV95, standard EPSG codes, not project-specific.
 WGS84_EPSG = "EPSG:4326"
@@ -179,9 +205,25 @@ class StacAsset:
 #    wrong-product bug into a permanent hard outage of the radar source.
 CPC_PRODUCT_CODE = "CPC"
 CPC_ACCUMULATION_SEGMENT = "_00060"  # 60-minute accumulation
+# v0.1.28 fix (SWF-P1-004), CRITICAL: matched case-INSENSITIVELY.
+#
+# MeteoSwiss's documentation writes the naming convention in uppercase
+# (CPCyyjjjHHMMQ_nnnnn.XYZ.h5), and v0.1.24 encoded that literally. The
+# files the API actually serves are lowercase:
+#
+#     cpc2623100000_00060.001.h5      <- real
+#     rzc262310000vl.001.h5
+#
+# So every genuine CombiPrecip file was rejected and the client raised
+# "No CombiPrecip assets found in STAC response" on every single poll.
+# The v0.1.23 code accepted any .h5 and therefore never noticed the
+# difference. The contract was built from documentation and never
+# validated against a real response — see tests/test_v0_1_28_real_stac.py,
+# which now uses verbatim hrefs captured from the live API.
 _CPC_FILENAME_RE = re.compile(
     r"^CPC(?P<yy>\d{2})(?P<jjj>\d{3})(?P<hhmm>\d{4})(?P<quality>\d)"
-    r"_(?P<accum>\d{5})\."
+    r"_(?P<accum>\d{5})\.",
+    re.IGNORECASE,
 )
 
 
@@ -490,17 +532,38 @@ class CombiPrecipClient:
         # this project. A longer allowance (60s) than the other clients'
         # 30s, since a genuine slow-but-working download of a real file
         # shouldn't get killed as if it were a stuck connection.
-        async with self._session.get(
-            STAC_ITEMS_URL,
-            params={"limit": 1, "sortby": "-datetime"},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            resp.raise_for_status()
-            payload = await resp.json()
+        # v0.1.28 (SWF-P1-005): address today's item directly, falling
+        # back to yesterday's. Two items are enough by construction: the
+        # newest CPC file is always in today's item, except in the first
+        # minutes after UTC midnight before that day's first file lands —
+        # which is exactly what the fallback covers. MeteoSwiss also
+        # pre-creates the following day's (empty) item, another reason
+        # "newest item" is not a safe proxy for "newest data".
+        today = datetime.now(timezone.utc).date()
+        assets: list[StacAsset] = []
+        errors: list[str] = []
+        for day in (today, today - timedelta(days=1)):
+            try:
+                async with self._session.get(
+                    stac_item_url_for_date(day),
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    resp.raise_for_status()
+                    payload = await resp.json()
+            except Exception as err:  # noqa: BLE001 - try the next day
+                errors.append(f"{day}: {err}")
+                continue
+            # A single item is a Feature, not a FeatureCollection.
+            assets = parse_stac_items_response({"features": [payload]})
+            if assets:
+                break
 
-        assets = parse_stac_items_response(payload)
         if not assets:
-            raise ValueError("No CombiPrecip assets found in STAC response")
+            raise ValueError(
+                "No CombiPrecip assets found in STAC response for "
+                f"{today} or the preceding day"
+                + (f" ({'; '.join(errors)})" if errors else "")
+            )
         latest = assets[0]
         # v0.1.24 (P1-16): remember the quality code parsed from the
         # selected filename so write_temp_and_extract can stamp it onto

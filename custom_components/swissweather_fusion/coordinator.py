@@ -1029,7 +1029,23 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
     day, not always hitting noon exactly.
     """
 
-    CHECK_INTERVAL = timedelta(hours=6)
+    # v0.1.28 fix (SWF-P2-006): 1 hour, not 6.
+    #
+    # const.py states this call happens "at local noon", and the hour was
+    # chosen for a meteorological reason — the seasonal /forecast/hourly
+    # upgrade is most useful then. But noon was only ever a GATE
+    # (`local_now.hour >= 12`), not a schedule, and the coordinator woke
+    # every 6 hours counted from Home Assistant start-up. The real call
+    # time was therefore "the first check after noon", anywhere from
+    # 12:00 to nearly 18:00, silently drifting on every restart. An
+    # installation started at 08:14 made its daily call at 14:14.
+    #
+    # An hourly check makes the call land within an hour of noon, always.
+    # It costs nothing: the daily gate (_last_successful_call_date) and
+    # the noon gate both still apply, so 23 of the 24 checks return
+    # immediately without touching the network, and — since v0.1.27's
+    # SWF-P1-001 fix — without reserving quota either.
+    CHECK_INTERVAL = timedelta(hours=1)
 
     def __init__(
         self,
@@ -1442,6 +1458,28 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         )
         self._db = db
 
+    def _is_daytime_at(self, when: datetime) -> Optional[bool]:
+        """Whether the sun is above the horizon at `when` (v0.1.28).
+
+        Uses Home Assistant's own astral helpers so the answer matches
+        core's sun entity and the installation's real location. Returns
+        None if that cannot be determined, which makes derive_condition
+        fall back to its pre-v0.1.28 behaviour rather than guessing.
+        """
+        try:
+            from homeassistant.helpers.sun import get_astral_event_date
+
+            from homeassistant.util import dt as dt_util
+
+            local = dt_util.as_local(when)
+            sunrise = get_astral_event_date(self.hass, "sunrise", local.date())
+            sunset = get_astral_event_date(self.hass, "sunset", local.date())
+            if sunrise is None or sunset is None:
+                return None
+            return sunrise <= when < sunset
+        except Exception:  # noqa: BLE001 - a forecast icon must never break a refresh
+            return None
+
     async def _async_update_data(self) -> dict[str, Any]:
         # v0.1.14: same defense-in-depth backstop as every other
         # coordinator now has. Generous (120s) since this job now does
@@ -1581,8 +1619,18 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                     # v0.1.24 (P2-10): shared mapping. Raw precip and the
                     # hourly 0.1 mm threshold, matching this site's own
                     # pre-existing behaviour.
+                    #
+                    # v0.1.28 (SWF-P2-005): day/night is evaluated PER
+                    # FORECAST HOUR, not from "now" — this is the site
+                    # where the sun icon at 02:00 was actually visible.
+                    # A fixed hour cutoff would be wrong for Switzerland,
+                    # where sunset moves about three hours between June
+                    # and December, so real solar elevation is used.
                     "condition": model_a.derive_condition(
-                        precip, temperature, humidity
+                        precip,
+                        temperature,
+                        humidity,
+                        is_daytime=self._is_daytime_at(target),
                     ),
                 }
             )
@@ -1669,6 +1717,9 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         )
         self._db = db
         self.last_reconciled_count: int = 0
+        # v0.1.28 (SWF-P1-007): cached for ForecastAccuracySensor, so no
+        # entity has to touch the database from the event loop.
+        self.temperature_mae: Optional[dict[str, Any]] = None
         # v0.1.24 fix (P2-03 / P2-04): ONE lock, shared with the other
         # coordinator that writes the same tables.
         #
@@ -1690,6 +1741,48 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         async with self._reconcile_lock:
             async with asyncio.timeout(120):
                 return await self.hass.async_add_executor_job(self._reconcile)
+
+    def _compute_temperature_mae(self) -> Optional[dict[str, Any]]:
+        """Sample-count-weighted mean absolute error across temperature buckets.
+
+        Synchronous by design — only ever called from inside the executor
+        job that _reconcile() already runs in.
+
+        Weighted by sample_count so a bucket with three observations does
+        not carry the same authority as one with three hundred. Returns
+        None only when nothing has genuinely been learned yet, which on a
+        fresh install is the honest answer.
+
+        v0.1.28 (SWF-P1-007): note this iterates sqlite3.Row objects.
+        v0.1.24's version called `.items()` on the same list as though it
+        were a dict, raised AttributeError on every call, and had that
+        swallowed by a blanket `except Exception: return None` — so the
+        sensor silently showed nothing for four releases while looking
+        implemented. No blanket except here: a failure in reconciliation
+        should surface, not hide.
+        """
+        rows = self._db.get_all_bucket_stats()
+
+        total_weighted = 0.0
+        total_samples = 0
+        buckets = 0
+        for row in rows:
+            if row["measurement"] != "temperature":
+                continue
+            sample_count = row["sample_count"] or 0
+            if sample_count <= 0:
+                continue
+            total_weighted += (row["ema_abs_error"] or 0.0) * sample_count
+            total_samples += sample_count
+            buckets += 1
+
+        if total_samples == 0:
+            return None
+        return {
+            "value": round(total_weighted / total_samples, 3),
+            "bucket_count": buckets,
+            "sample_count": total_samples,
+        }
 
     def _reconcile(self) -> datetime:
         """Synchronous — only ever called via the executor job above.
@@ -1860,6 +1953,19 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         self._db.apply_reconciliation_batch(
             list(bucket_updates.values()), reconciled_ids, skipped_ids
         )
+
+        # v0.1.28 fix (SWF-P1-007): the headline accuracy figure is
+        # computed HERE, inside the executor job that already holds the
+        # database, and cached for the sensor to read.
+        #
+        # v0.1.24's P3-02 fix had ForecastAccuracySensor.native_value
+        # query SQLite directly from a property. Home Assistant polls
+        # that property on the event loop roughly every 30 seconds, so
+        # it was blocking database I/O on the loop — the same defect
+        # class as the manifest read v0.1.25 introduced and v0.1.26
+        # removed. Doing it once per reconciliation cycle, off-loop, is
+        # both correct and far less work.
+        self.temperature_mae = self._compute_temperature_mae()
 
         self.last_reconciled_count = reconciled_count
         _LOGGER.debug(

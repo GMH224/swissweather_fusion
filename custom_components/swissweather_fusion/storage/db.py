@@ -1150,29 +1150,21 @@ class SwissWeatherDB:
     def set_meteonomiqs_last_successful_call_date(self, iso_date: str) -> None:
         self._set_meta("meteonomiqs_last_successful_call_date", iso_date)
 
-    # -- SRF geolocation cache (v0.1.24, IND-07) -------------------------------
-
-    def get_srf_geolocation_id(self, coordinate_key: str) -> Optional[str]:
-        """SRF's geolocation ID for a rounded coordinate pair.
-
-        **v0.1.24 fix (IND-07).** SrfClient held both its OAuth token and
-        its resolved geolocation ID as plain instance attributes, and the
-        client is constructed fresh on every setup. Since every options
-        change triggers a config-entry reload, each one re-ran the
-        geolocation lookup — an avoidable quota-consuming call against
-        the one source with a rotating credential. This project already
-        persists exactly this class of state for meteoblue and
-        Meteonomiqs (the L-07/L-08 fixes); SRF simply never received the
-        same treatment.
-
-        Keyed by rounded coordinates so that relocating the installation
-        naturally invalidates the cache instead of silently reusing the
-        old location's ID.
-        """
-        return self._get_meta(f"srf_geolocation_id:{coordinate_key}")
-
-    def set_srf_geolocation_id(self, coordinate_key: str, geolocation_id: str) -> None:
-        self._set_meta(f"srf_geolocation_id:{coordinate_key}", geolocation_id)
+    # v0.1.28: the SRF geolocation cache (get/set_srf_geolocation_id) was
+    # REMOVED here, and IND-07 is closed as "will not fix".
+    #
+    # IND-07 proposed persisting SRF's resolved geolocation id across
+    # restarts to save one lookup per reload. The methods were added in
+    # v0.1.24 but never wired into clients/srf.py, so they were dead code
+    # from the start.
+    #
+    # They are deleted rather than left pending because the maintainer
+    # has ruled clients/srf.py out of scope: the SRF API key is bound to
+    # a single registered coordinate, and any change touching how that
+    # geolocation is resolved risks invalidating the key and needing a
+    # new registration. Saving one HTTP call per reload does not come
+    # close to justifying that. Leaving unwired scaffolding in place
+    # would only invite a future contributor to connect it.
 
     # -- storm prediction reconciliation (v0.1.24, P2-08) ----------------------
 

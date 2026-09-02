@@ -172,6 +172,46 @@ def redact_secret_values(text: str, *, secrets: Iterable[str]) -> str:
     return text
 
 
+# v0.1.28 fix (SWF-P1-006): a coordinate PAIR, matched by shape rather
+# than by value.
+#
+# redact_coordinate_strings() above substitutes the CONFIGURED latitude
+# and longitude wherever they appear as text, and was written precisely
+# to catch SRF's geolocationId. It does catch it — but only when the id
+# equals the configured coordinates, and in practice it does not: SRF
+# resolves a request to its OWN nearest grid point and returns that.
+#
+# Observed in a real diagnostics export: an installation configured at
+# one position had its SRF geolocation id come back as a neighbouring
+# grid point roughly a kilometre away. Every key-based rule missed it
+# (the key is "id"), and the value sweep missed it (different numbers),
+# so the household's location was written verbatim into a file this
+# module's own note invites the user to share.
+#
+# Matching by shape closes the class rather than the instance. A
+# "<number>.<decimals>,<number>.<decimals>" pair inside a weather
+# diagnostics payload is essentially never innocuous — no temperature,
+# pressure or humidity field is serialized that way — whereas the value
+# sweep can only ever catch coordinates we already know.
+#
+# NOTE: this changes only what is WRITTEN INTO THE DIAGNOSTICS EXPORT.
+# It does not touch clients/srf.py, the coordinates sent to any
+# provider, or the geolocation id used at runtime. SRF's request
+# behaviour is deliberately left exactly as it is.
+_COORDINATE_PAIR_RE = re.compile(
+    r"(?<![\d.])"
+    r"[-+]?\d{1,3}\.\d{2,8}"
+    r"\s*,\s*"
+    r"[-+]?\d{1,3}\.\d{2,8}"
+    r"(?![\d.])"
+)
+
+
+def redact_coordinate_pairs(text: str) -> str:
+    """Redact anything shaped like a "lat,lon" pair, whatever its value."""
+    return _COORDINATE_PAIR_RE.sub("[COORDINATE_PAIR_REDACTED]", text)
+
+
 def redact_diagnostic_payload(
     payload: Any, *, latitude: float, longitude: float
 ) -> Any:
@@ -195,6 +235,12 @@ def redact_diagnostic_payload(
     coordinate_redacted = redact_coordinate_strings(
         serialized, latitude=latitude, longitude=longitude
     )
+    # v0.1.28 (SWF-P1-006): then the shape-based pass, which catches
+    # coordinate pairs belonging to a provider's own grid rather than to
+    # this installation. Runs second so the value-based substitution gets
+    # first refusal and its more specific [LAT_REDACTED]/[LON_REDACTED]
+    # markers survive where they apply.
+    coordinate_redacted = redact_coordinate_pairs(coordinate_redacted)
     try:
         return json.loads(coordinate_redacted)
     except (TypeError, ValueError):

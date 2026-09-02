@@ -248,13 +248,18 @@ def test_meteonomiqs_last_successful_call_date_roundtrips(db):
     assert db.get_meteonomiqs_last_successful_call_date() == "2026-07-25"
 
 
-def test_srf_geolocation_id_is_keyed_by_location(db):
-    """Keyed by rounded coordinates so relocating the installation
-    naturally invalidates the cache rather than silently reusing the old
-    location's ID."""
-    db.set_srf_geolocation_id("46.9481_7.4474", "geo-123")
-    assert db.get_srf_geolocation_id("46.9481_7.4474") == "geo-123"
-    assert db.get_srf_geolocation_id("47.3769_8.5417") is None
+def test_srf_geolocation_cache_is_absent_by_deliberate_decision(db):
+    """v0.1.28: IND-07 is closed as "will not fix", and the accessors are
+    gone.
+
+    The SRF API key is bound to a single registered coordinate, so
+    anything touching how that geolocation is resolved risks invalidating
+    the key. Saving one HTTP lookup per reload does not justify that
+    risk. Asserted as an absence so that reinstating the scaffolding is a
+    deliberate act with this reasoning in front of whoever does it.
+    """
+    assert not hasattr(db, "get_srf_geolocation_id")
+    assert not hasattr(db, "set_srf_geolocation_id")
 
 
 # ---------------------------------------------------------------------------

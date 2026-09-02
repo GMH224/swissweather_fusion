@@ -1813,9 +1813,9 @@ for a `.status` attribute rather than importing aiohttp's exception
 types), so it's directly unit-tested without needing a live failure to
 trigger it.
 
-## v0.1.24–v0.1.27 — architecture notes
+## v0.1.24–v0.1.28 — architecture notes
 
-Full remediation record: `swissweather_fusion_v0.1.27_remediation_audit.md`.
+Full remediation record: `swissweather_fusion_v0.1.28_remediation_audit.md`.
 The design decisions worth knowing before reading the code:
 
 ### Model A blend weights are dimensionless (IND-01)
@@ -1899,7 +1899,50 @@ observed", not "a meteorologist would call this a storm".
 
 ---
 
-## Known gaps (the honest list, updated for v0.1.24)
+
+### CombiPrecip: never trust the naming documentation (v0.1.28)
+
+MeteoSwiss documents the CPC filename convention in uppercase. The API
+serves lowercase. v0.1.24 encoded the documented form into a
+case-sensitive regex and every real file was rejected — radar was dead
+for 56 consecutive polls before anyone noticed.
+
+Two rules follow, and `tests/test_v0_1_28_real_fixtures.py` enforces both:
+
+1. **Asset fixtures are copied verbatim from a live capture**, not
+   written from the spec. Where documentation and response disagree, only
+   the response matters.
+2. **Never select a STAC item by `properties.datetime`.** It is an update
+   timestamp, not the data date — MeteoSwiss's 8-day reanalysis rewrites
+   old files and refreshes it, so a two-week-old item routinely sorts
+   first. Items are date-stamped in their id (`YYYYMMDD-ch`); address the
+   one you want.
+
+### clients/srf.py is out of scope (v0.1.28)
+
+**Do not modify how the SRF geolocation is resolved.** The API key is
+bound to a single registered coordinate, and changing the resolution path
+risks invalidating it and requiring a new registration. IND-07
+(persisting the geolocation id) is closed as "will not fix" and its
+scaffolding deleted, not left dormant.
+
+The v0.1.28 coordinate-pair redaction (SWF-P1-006) touches only what is
+written into the diagnostics export. It does not change any request, any
+coordinate sent, or the id used at runtime.
+
+### Entities must not touch the database (v0.1.28)
+
+`native_value` is a property Home Assistant polls on the event loop.
+Querying SQLite from one is blocking I/O on the loop — the accuracy
+sensor did it for four releases. Derived figures belong in the
+coordinator that already owns the data and already runs in an executor
+job; entities read the cached result.
+
+Relatedly: **no blanket `except Exception` in an entity property.** It
+converted a hard `AttributeError` into a silently blank sensor that
+looked implemented.
+
+## Known gaps (the honest list, updated for v0.1.28)
 
 **Closed since v0.1.1:**
 
@@ -1915,6 +1958,20 @@ observed", not "a meteorologist would call this a storm".
 
 **Still open:**
 
+- **`purge_days` on existing installations.** The 90-day default added in
+  v0.1.24 applies to new installs only; entries created earlier keep
+  `purge_days = 0` ("keep forever"). Deliberately not migrated — silently
+  changing a user's retention policy is worse than leaving it — but worth
+  setting under Configure.
+- **Meteonomiqs as a Model A expert.** Considered and declined for now.
+  Its hourly endpoint returns only pressure and precipitation, and Model
+  A reconciles temperature/humidity/pressure, so the intersection is
+  pressure alone — the measurement where all models already agree. Its
+  real strength is short-range radar nowcasting, which is why it feeds
+  Model B. The stored `meteonomiqs_*` rows are still unread (see
+  IND-10); measuring its pressure error via bucket_stats *without*
+  promoting it to the blend is the sensible next step, and turns an
+  impression into a number.
 - **Repairs and service actions (IND-11).** No `async_create_issue`
   usage, no `services.yaml`. Exhausted quota, a revoked key or an
   oversized database cannot raise a user-visible repair, and there is no

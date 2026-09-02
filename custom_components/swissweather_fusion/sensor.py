@@ -67,7 +67,7 @@ async def async_setup_entry(
 
     entities: list[SensorEntity] = [
         StatusSensor(entry, runtime),
-        ForecastAccuracySensor(entry, db),
+        ForecastAccuracySensor(entry, runtime),
         ActiveSourcesSensor(entry, db, runtime),
         LastLearningASensor(entry, runtime),
         LastLearningBSensor(entry, db),
@@ -154,79 +154,68 @@ class StatusSensor(_BaseSensor):
 
 
 class ForecastAccuracySensor(_BaseSensor):
-    """Rolling 7-day MAE of the blended forecast vs. actual station
-    reading, for temperature (the natural headline number — humidity and
-    pressure MAE are exposed as attributes rather than separate top-level
-    sensors, per plan doc §7).
+    """Learned mean absolute temperature error across all buckets.
+
+    **v0.1.28 fix (SWF-P1-007).** This sensor was blank for four
+    releases, in two different ways, and the second was worse than the
+    first.
+
+    Through v0.1.23 it returned None by design — an honest, documented
+    stub. v0.1.24's P3-02 fix set out to implement it from
+    `bucket_stats.ema_abs_error`, which is real, durable, continuously
+    updated data. But it iterated `get_all_bucket_stats()` — a list of
+    sqlite3.Row — as though it were a dict, raising AttributeError on
+    every single call, and wrapped that in a blanket
+    `except Exception: return None`. The result looked implemented and
+    behaved like a stub. Its own test asserted None-when-nothing-learned,
+    which is indistinguishable from None-because-it-crashed, so the test
+    passed against permanently broken code.
+
+    It also queried SQLite from a property, which Home Assistant polls on
+    the event loop.
+
+    Both are fixed by moving the computation into
+    ModelALearningCoordinator, which already reads bucket_stats inside an
+    executor job every 20 minutes. This entity now just reads the cached
+    result — no database access, no blanket except, and a genuine number
+    to display.
     """
 
     _attr_native_unit_of_measurement = "°C"
-    _attr_device_class = SensorDeviceClass.TEMPERATURE
     _attr_state_class = SensorStateClass.MEASUREMENT
 
-    def __init__(self, entry: ConfigEntry, db: SwissWeatherDB) -> None:
-        # v0.1.24 fix (P3-02): renamed from "Forecast accuracy (7d MAE)",
-        # a methodology this sensor never actually implemented.
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        # Entity key and unique_id deliberately unchanged, so existing
+        # installations keep their entity_id and history.
         super().__init__(
             entry, "forecast_accuracy", "Forecast accuracy (learned temperature MAE)"
         )
-        self._db = db
-        self._bucket_count = 0
-        self._sample_count = 0
+        self._runtime = runtime
+
+    @property
+    def _mae(self) -> Optional[dict[str, Any]]:
+        coordinator = self._runtime.get("learning_coordinator")
+        return getattr(coordinator, "temperature_mae", None) if coordinator else None
 
     @property
     def native_value(self) -> Optional[float]:
-        """Sample-count-weighted mean absolute error across temperature buckets.
-
-        **v0.1.24 fix (P3-02).** This returned None unconditionally, with
-        a docstring saying a true rolling MAE was "best done once real
-        data exists" — while bucket_stats.ema_abs_error had been real,
-        durable, continuously-updated error data the whole time,
-        maintained by the same learning loop the blend already depends on
-        and corrected in the v0.1.23 L-03 fix to measure the residual
-        against previous_bias rather than self-fittingly.
-
-        Weighted by sample_count so a bucket with three observations does
-        not carry the same authority as one with three hundred. Returns
-        None only when nothing has genuinely been learned yet, which on a
-        fresh install is the honest answer.
-        """
-        try:
-            all_stats = self._db.get_all_bucket_stats()
-        except Exception:  # noqa: BLE001 - a sensor must never break setup
-            return None
-
-        total_weighted = 0.0
-        total_samples = 0
-        buckets = 0
-        for key, stats in all_stats.items():
-            if key.measurement != "temperature":
-                continue
-            if stats.sample_count <= 0:
-                continue
-            total_weighted += stats.ema_abs_error * stats.sample_count
-            total_samples += stats.sample_count
-            buckets += 1
-
-        self._bucket_count = buckets
-        self._sample_count = total_samples
-        if total_samples == 0:
-            return None
-        return round(total_weighted / total_samples, 3)
+        mae = self._mae
+        return mae["value"] if mae else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """v0.1.24 (P3-02): the methodology is disclosed on the entity
-        rather than only in a source comment, so anyone reading this
-        number in the UI can see what it actually measures."""
+        """The methodology is disclosed on the entity itself, so anyone
+        reading this number in the UI can see what it actually measures
+        (v0.1.24, P3-02)."""
+        mae = self._mae
         return {
             "methodology": (
                 "sample-count-weighted mean of bucket_stats.ema_abs_error "
                 "across temperature buckets; an EMA of |forecast - observed|, "
                 "not a fixed-window MAE"
             ),
-            "temperature_bucket_count": self._bucket_count,
-            "total_sample_count": self._sample_count,
+            "temperature_bucket_count": mae["bucket_count"] if mae else 0,
+            "total_sample_count": mae["sample_count"] if mae else 0,
         }
 
 

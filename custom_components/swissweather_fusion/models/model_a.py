@@ -487,6 +487,11 @@ def aggregate_twice_daily_forecast(
                     (max(temps) if is_daytime else min(temps)) if temps else None,
                     max(humidities) if humidities else None,
                     precip_threshold=0.5,
+                    # v0.1.28 (SWF-P2-005): this site already knows which
+                    # half of the day it describes, so the night period
+                    # now correctly reports clear-night rather than a sun
+                    # icon at 3am.
+                    is_daytime=is_daytime,
                 ),
             }
         )
@@ -501,6 +506,7 @@ def derive_condition(
     temperature: float | None,
     humidity: float | None,
     precip_threshold: float = 0.1,
+    is_daytime: bool | None = None,
 ) -> str | None:
     """Map blended values to a Home Assistant weather condition string.
 
@@ -548,4 +554,28 @@ def derive_condition(
     if humidity is not None and humidity >= CONDITION_CLOUDY_HUMIDITY_THRESHOLD:
         return "cloudy"
 
+    # v0.1.28 fix (SWF-P2-005): a clear sky at 02:00 is "clear-night", not
+    # "sunny".
+    #
+    # Home Assistant defines these as two distinct conditions — "sunny"
+    # means the sun is shining, "clear-night" means a clear sky without
+    # it — and core performs NO automatic day/night substitution. The
+    # provider integration must emit the right one; other integrations
+    # (Kachelmann, for example) map their clear-sky symbol to one or the
+    # other based on time of day for exactly this reason. Emitting
+    # "sunny" for every clear hour therefore drew a bright sun icon
+    # through the middle of the night in the hourly forecast.
+    #
+    # `is_daytime=None` means "caller doesn't know", and keeps the
+    # pre-v0.1.28 answer. The daily aggregation deliberately passes None:
+    # a daily summary is a daytime summary, and "clear-night" would be
+    # wrong for it.
+    #
+    # Only the sunny branch is affected. "partlycloudy" has a night
+    # variant in some icon sets but not in Home Assistant's condition
+    # list, and this project's "cloudy" branch is a humidity proxy
+    # anyway — inventing more night variants would claim precision the
+    # model does not have.
+    if is_daytime is False:
+        return "clear-night"
     return "sunny"
