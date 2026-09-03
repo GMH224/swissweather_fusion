@@ -608,6 +608,42 @@ class SwissWeatherDB:
             )
             self._conn.commit()
 
+    def get_reference_value(
+        self, variable: str, hour_prefix: str
+    ) -> Optional[float]:
+        """Median provider forecast for one variable and hour.
+
+        **v0.2.4 (SWF-024-002).** Generalises get_reference_pressure_hpa.
+        The pressure cross-check added in v0.2.3 caught a real
+        misconfiguration, but it existed only for pressure — because
+        pressure happened to be the measurement that broke first.
+
+        Temperature and humidity are learned from the same single station
+        with the same total trust and had no equivalent check. A domestic
+        sensor in afternoon sun reads several degrees high; Model A would
+        conclude all five providers forecast cold and warm the blend to
+        match a badly-sited thermometer. Nothing would have flagged it.
+
+        Median rather than mean, so one absurd provider value cannot drag
+        the reference far enough to mask a genuine station error.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT value FROM forecast_snapshots "
+                "WHERE variable = ? AND value IS NOT NULL "
+                "AND source != 'blend' "
+                "AND substr(valid_at, 1, 13) = ? "
+                "ORDER BY value",
+                (variable, hour_prefix),
+            )
+            values = [row["value"] for row in cur.fetchall()]
+        if not values:
+            return None
+        middle = len(values) // 2
+        if len(values) % 2 == 1:
+            return values[middle]
+        return (values[middle - 1] + values[middle]) / 2.0
+
     def get_reference_pressure_hpa(self, hour_prefix: str) -> Optional[float]:
         """Median provider mean-sea-level pressure for a given hour.
 

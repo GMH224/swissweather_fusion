@@ -35,9 +35,17 @@ from .clients.open_meteo import OPTIONAL_HOURLY_VARIABLES, OpenMeteoClient
 from .clients.srf import SrfClient
 from .health import SourceHealth, classify_exception
 from .const import (
+    MIN_SAMPLES_TO_TRUST_BUCKET,
+    BLEND_VERIFICATION_LEAD_HOURS,
+    FRESHNESS_MAX_BOOST,
+    FRESHNESS_MIN_FACTOR,
+    FRESHNESS_OVERDUE_FLOOR,
+    FRESHNESS_OVERDUE_MULTIPLE,
+    SOURCE_BLEND,
+    SOURCE_UPDATE_CADENCE,
     PRESSURE_PLAUSIBLE_MAX_HPA,
     PRESSURE_PLAUSIBLE_MIN_HPA,
-    STATION_PRESSURE_REFERENCE_TOLERANCE_HPA,
+    STATION_REFERENCE_TOLERANCES,
     METEOBLUE_ANNUAL_CALL_BUDGET,
     METEOBLUE_SCHEDULED_RETRY_COOLDOWN,
     METEONOMIQS_NOWCAST_TARGET_WINDOW,
@@ -988,6 +996,11 @@ class StationCoordinator(DataUpdateCoordinator):
         # as a diagnostic sensor so a datum mismatch is visible rather
         # than inferred.
         self.pressure_reference_delta: Optional[float] = None
+        # v0.2.4 (SWF-024-002): station-minus-provider for every learned
+        # measurement, exposed as diagnostic sensors.
+        self.reference_deltas: dict[str, Optional[float]] = {
+            "temperature": None, "humidity": None, "pressure": None,
+        }
         self._elevation_m = elevation_m
 
     def _read_float_state(
@@ -1102,54 +1115,76 @@ class StationCoordinator(DataUpdateCoordinator):
             # mechanism for an EMA to forget one.
             pressure = None
 
-        # v0.2.3 fix (SWF-023-001): cross-check against the providers.
+        # v0.2.3 / v0.2.4 (SWF-023-001, SWF-024-002): cross-check every
+        # station measurement against the provider consensus.
         #
-        # The absolute-bounds check above only catches a double-reduced
-        # reading when it happens to exceed a world record — so on a
-        # 1024 hPa day it fires, and on a 1010 hPa day the same 65 hPa
-        # error sails through at 1075. The error is identical; only the
-        # weather differs. That is luck, not detection.
+        # The absolute-bounds check above only catches an error when the
+        # resulting number happens to be impossible. A double-reduced
+        # 1024 hPa reading exceeds a world record and is caught; the
+        # identical error on a 1010 hPa day lands at 1075 and is not.
+        # That is luck, not detection.
         #
-        # Every provider reports mean-sea-level pressure and models agree
-        # on it closely, so their consensus is a reliable yardstick. A
-        # disagreement beyond STATION_PRESSURE_REFERENCE_TOLERANCE_HPA is
-        # not weather — it is roughly a 200 m altitude error, an order of
-        # magnitude below the ~65 hPa signature of a double reduction but
-        # far outside any legitimate model spread.
+        # v0.2.3 fixed this for pressure only, because pressure was the
+        # measurement that happened to break first. Temperature and
+        # humidity are learned from the same single station with the same
+        # total trust: a sensor in afternoon sun reads several degrees
+        # high, and Model A would conclude all five providers forecast
+        # cold and warm the blend to match a badly-sited thermometer.
         #
-        # The delta is retained either way, so the relationship is
-        # visible on a sensor rather than having to be inferred from a
-        # number that slowly climbs.
-        self.pressure_reference_delta = None
-        if pressure is not None:
+        # The tolerances are deliberately wide — see
+        # STATION_REFERENCE_TOLERANCES. They reject gross configuration
+        # errors, not microclimate, because genuine local difference is
+        # exactly the signal this project exists to learn. The deltas are
+        # recorded either way, so slow drift stays visible on a sensor
+        # even when it is not rejected.
+        hour_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+        checked = {
+            "temperature": temperature,
+            "humidity": humidity,
+            "pressure": pressure,
+        }
+        for variable, value in checked.items():
+            self.reference_deltas[variable] = None
+            if value is None:
+                continue
             reference = await self.hass.async_add_executor_job(
-                self._db.get_reference_pressure_hpa,
-                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H"),
+                self._db.get_reference_value, variable, hour_prefix
             )
-            if reference is not None:
-                delta = pressure - reference
-                self.pressure_reference_delta = round(delta, 1)
-                if abs(delta) > STATION_PRESSURE_REFERENCE_TOLERANCE_HPA:
-                    _LOGGER.warning(
-                        "Station pressure %.1f hPa disagrees with the provider "
-                        "consensus %.1f hPa by %.1f hPa. That is far outside any "
-                        "legitimate model spread and is almost always the "
-                        "'pressure sensor already reports sea-level pressure' "
-                        "option being set incorrectly — check it under "
-                        "Configure. Discarding this reading rather than letting "
-                        "Model A learn from it.",
-                        pressure, reference, delta,
-                    )
-                    if self._diagnostics is not None:
-                        self._diagnostics.record(
-                            source="station", event_type="data_quality",
-                            detail=(
-                                f"pressure {pressure:.1f} hPa disagrees with "
-                                f"provider consensus {reference:.1f} hPa by "
-                                f"{delta:+.1f} hPa; check the sea-level setting"
-                            ),
-                        )
-                    pressure = None
+            if reference is None:
+                continue
+            delta = value - reference
+            self.reference_deltas[variable] = round(delta, 1)
+            tolerance = STATION_REFERENCE_TOLERANCES.get(variable)
+            if tolerance is None or abs(delta) <= tolerance:
+                continue
+
+            _LOGGER.warning(
+                "Station %s of %.1f disagrees with the provider consensus "
+                "%.1f by %+.1f, beyond the %.0f tolerance. That is far "
+                "outside any legitimate local difference and usually means "
+                "the sensor is misconfigured (wrong unit, wrong entity, or "
+                "for pressure the sea-level option set incorrectly). "
+                "Discarding this reading rather than letting Model A learn "
+                "from it.",
+                variable, value, reference, delta, tolerance,
+            )
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="station", event_type="data_quality",
+                    detail=(
+                        f"{variable} {value:.1f} disagrees with provider "
+                        f"consensus {reference:.1f} by {delta:+.1f}"
+                    ),
+                )
+            if variable == "temperature":
+                temperature = None
+            elif variable == "humidity":
+                humidity = None
+            else:
+                pressure = None
+
+        # Retained for the pressure-specific diagnostic sensor.
+        self.pressure_reference_delta = self.reference_deltas.get("pressure")
 
         # v0.1.24 fix (IND-02): do not write a row when every value is
         # missing. compute_tendency_features used to take samples[-1]
@@ -1692,6 +1727,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         """
         from .models import model_a
 
+        now = model_a.utcnow()
         hour_of_day = target_hour.hour
         season = model_a.derive_season(target_hour)
         target_iso = target_hour.replace(minute=0, second=0, microsecond=0).isoformat()
@@ -1714,10 +1750,35 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                     )
                 )
             else:
+                # v0.2.4 (SWF-024-003): scale the LEARNED weight by how
+                # fresh this source's run is relative to its own cadence.
+                #
+                # Applied only to the learned branch. A cold-start source
+                # has no learned weight to modulate, and its neutral
+                # weight is already defined relative to the trusted set
+                # (IND-01) — scaling it would break that relationship.
+                #
+                # issued_at is the time this run was first SEEN. Because
+                # unchanged runs are deduplicated by fingerprint, a run
+                # keeps its original issued_at across later polls, so
+                # this is publication-observation time, within one poll
+                # interval of availability. The provider's true
+                # initialisation time is available from Open-Meteo's
+                # metadata API and is the better signal; using it is a
+                # pending refinement, documented in DEVELOPER.md.
+                freshness = model_a.freshness_factor(
+                    now - issued_at if issued_at is not None else None,
+                    SOURCE_UPDATE_CADENCE.get(source),
+                    max_boost=FRESHNESS_MAX_BOOST,
+                    min_factor=FRESHNESS_MIN_FACTOR,
+                    overdue_multiple=FRESHNESS_OVERDUE_MULTIPLE,
+                    overdue_floor=FRESHNESS_OVERDUE_FLOOR,
+                )
                 contributions.append(
                     model_a.SourceContribution(
                         source=source, raw_value=raw_value,
-                        ema_bias=bucket.ema_bias, ema_weight=bucket.ema_weight,
+                        ema_bias=bucket.ema_bias,
+                        ema_weight=bucket.ema_weight * freshness,
                         sample_count=bucket.sample_count,
                     )
                 )
@@ -1954,6 +2015,33 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 {k: v for k, v in entry.items() if v is not None or k == "datetime"}
             )
 
+        # v0.2.4 (SWF-024-001): record the blend's own output so it can
+        # be reconciled against observations exactly like a provider.
+        #
+        # This is what makes the fusion falsifiable. If the blend's
+        # learned ema_abs_error does not undercut the best single
+        # source's, the bias correction is not earning its complexity —
+        # and that is the single most valuable thing this project could
+        # discover about itself.
+        blend_rows = []
+        issued_at_iso = now.isoformat()
+        for lead in BLEND_VERIFICATION_LEAD_HOURS:
+            target = now + timedelta(hours=lead)
+            target_iso = target.isoformat()
+            for measurement in self.LEARNED_MEASUREMENTS:
+                value = self._blend_by_class(
+                    measurement, target,
+                    latest_forecast=latest_forecast, bucket_lookup=bucket_lookup,
+                )
+                if value is None:
+                    continue
+                blend_rows.append(
+                    (SOURCE_BLEND, issued_at_iso, target_iso, measurement,
+                     value, "blend_verification")
+                )
+        if blend_rows:
+            self._db.insert_forecast_snapshots_bulk(blend_rows)
+
         return {
             "current": current,
             "expert_weights": expert_weights,
@@ -2039,6 +2127,8 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         # v0.1.28 (SWF-P1-007): cached for ForecastAccuracySensor, so no
         # entity has to touch the database from the event loop.
         self.temperature_mae: Optional[dict[str, Any]] = None
+        # v0.2.4 (SWF-024-005): cached for the learning-progress sensor.
+        self.learning_progress: Optional[dict[str, Any]] = None
         # v0.1.24 fix (P2-03 / P2-04): ONE lock, shared with the other
         # coordinator that writes the same tables.
         #
@@ -2060,6 +2150,38 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         async with self._reconcile_lock:
             async with asyncio.timeout(120):
                 return await self.hass.async_add_executor_job(self._reconcile)
+
+    def _compute_learning_progress(self) -> dict[str, Any]:
+        """How much of the learned state is actually usable yet.
+
+        **v0.2.4 (SWF-024-005).** The accuracy numbers alone cannot
+        distinguish "learning has finished and this is the achievable
+        error" from "learning has not started and these are raw provider
+        values". Sample counts are the only thing that separates them.
+
+        A bucket below MIN_SAMPLES_TO_TRUST_BUCKET contributes at the
+        cold-start weight, which means bias correction is doing nothing
+        for it. `trusted_pct` is therefore the share of buckets that are
+        genuinely working.
+
+        The denominator is buckets that EXIST, not the ~4,300 the key
+        space allows. Most of that space is never reachable — ICON-CH1
+        only forecasts 33 hours, so it can have no long-lead buckets at
+        all — and dividing by an unreachable total would report a
+        permanently low number that never means anything.
+        """
+        rows = self._db.get_all_bucket_stats()
+        total = 0
+        trusted = 0
+        for row in rows:
+            total += 1
+            if (row["sample_count"] or 0) >= MIN_SAMPLES_TO_TRUST_BUCKET:
+                trusted += 1
+        return {
+            "buckets_total": total,
+            "buckets_trusted": trusted,
+            "trusted_pct": round(100.0 * trusted / total, 1) if total else 0.0,
+        }
 
     def _compute_temperature_mae(self) -> Optional[dict[str, Any]]:
         """Sample-count-weighted mean absolute error across temperature buckets.
@@ -2097,10 +2219,42 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
 
         if total_samples == 0:
             return None
+
+        # v0.2.4 (SWF-024-001): alongside the provider average, report
+        # the BLEND's own learned error and the best single source's.
+        #
+        # These three numbers together answer the question this project
+        # could not previously ask: does fusion beat its inputs? If
+        # blend_mae does not undercut best_source_mae, the learned bias
+        # correction is not earning its complexity.
+        per_source: dict[str, tuple[float, int]] = {}
+        for row in rows:
+            if row["measurement"] != "temperature":
+                continue
+            count = row["sample_count"] or 0
+            if count <= 0:
+                continue
+            weighted, seen = per_source.get(row["source"], (0.0, 0))
+            per_source[row["source"]] = (
+                weighted + (row["ema_abs_error"] or 0.0) * count, seen + count
+            )
+        source_mae = {
+            src: weighted / seen for src, (weighted, seen) in per_source.items() if seen
+        }
+        blend_mae = source_mae.pop(SOURCE_BLEND, None)
+        best_source = min(source_mae.items(), key=lambda kv: kv[1]) if source_mae else None
+
         return {
             "value": round(total_weighted / total_samples, 3),
             "bucket_count": buckets,
             "sample_count": total_samples,
+            "blend_mae": round(blend_mae, 3) if blend_mae is not None else None,
+            "best_source": best_source[0] if best_source else None,
+            "best_source_mae": round(best_source[1], 3) if best_source else None,
+            "blend_beats_best_source": (
+                None if blend_mae is None or best_source is None
+                else blend_mae < best_source[1]
+            ),
         }
 
     def _reconcile(self) -> datetime:
@@ -2285,6 +2439,7 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         # removed. Doing it once per reconciliation cycle, off-loop, is
         # both correct and far less work.
         self.temperature_mae = self._compute_temperature_mae()
+        self.learning_progress = self._compute_learning_progress()
 
         self.last_reconciled_count = reconciled_count
         _LOGGER.debug(

@@ -171,6 +171,61 @@ class SourceContribution:
 MAX_LEARNED_WEIGHT_RATIO = 8.0
 
 
+def freshness_factor(
+    age: "timedelta | None",
+    cadence: "timedelta | None",
+    *,
+    max_boost: float,
+    min_factor: float,
+    overdue_multiple: float,
+    overdue_floor: float,
+) -> float:
+    """Weight multiplier for how fresh a source's model run is.
+
+    **v0.2.4 (SWF-024-003).** Returns 1.0 at the source's MEAN run age
+    (cadence / 2), above 1.0 when fresher than typical, below when
+    staler. See SOURCE_UPDATE_CADENCE in const.py for why centring
+    matters: a curve that only ever reduced the weight would double-count
+    staleness that ema_abs_error has already absorbed.
+
+    Linear between the bounds — the honest shape, since the true
+    skill-decay curve is unknown and bucket_stats will eventually measure
+    it. Under-correcting is the right error until then.
+
+    Beyond `overdue_multiple` cadences the source is not ageing normally,
+    it is failing, and the historical average does not cover that. The
+    factor then continues below the symmetric floor toward
+    `overdue_floor`, approaching cold-start trust.
+
+    Returns 1.0 (no adjustment) whenever age or cadence is unknown, so a
+    missing signal never silently reweights anything.
+    """
+    if age is None or cadence is None:
+        return 1.0
+    cadence_seconds = cadence.total_seconds()
+    if cadence_seconds <= 0:
+        return 1.0
+
+    age_seconds = max(0.0, age.total_seconds())
+    mean_age = cadence_seconds / 2.0
+    overdue_at = cadence_seconds * overdue_multiple
+
+    if age_seconds >= overdue_at:
+        # Failing, not ageing: decay further, bottoming out at the floor
+        # after one more cadence beyond the overdue threshold.
+        excess = (age_seconds - overdue_at) / cadence_seconds
+        return max(overdue_floor, min_factor - (min_factor - overdue_floor) * min(1.0, excess))
+
+    if age_seconds <= mean_age:
+        # Fresher than typical: interpolate mean_age -> 0 as 1.0 -> boost.
+        share = (mean_age - age_seconds) / mean_age
+        return 1.0 + (max_boost - 1.0) * share
+
+    # Staler than typical: interpolate mean_age -> overdue as 1.0 -> min.
+    share = (age_seconds - mean_age) / (overdue_at - mean_age)
+    return 1.0 - (1.0 - min_factor) * min(1.0, share)
+
+
 def _reference_weight(contributions: list[SourceContribution]) -> float:
     """The weight scale for THIS blend, in this measurement's units.
 
@@ -404,9 +459,21 @@ def aggregate_daily_forecast(
     results: list[dict[str, Any]] = []
     for day in sorted(by_day):
         entries = by_day[day]
-        temps = [e["native_temperature"] for e in entries if e["native_temperature"] is not None]
+        # v0.2.4 fix (SWF-024-004): .get(), not direct indexing.
+        #
+        # v0.2.1 rewrote the hourly forecast builder to strip keys whose
+        # value is None, so that optional parameters do not appear as
+        # nulls in the Forecast dict. That silently made these direct
+        # lookups unsafe: an hour with no precipitation value has no
+        # "native_precipitation" KEY at all, and this raised KeyError —
+        # taking down the entire blend cycle, not just that hour.
+        temps = [
+            e.get("native_temperature") for e in entries
+            if e.get("native_temperature") is not None
+        ]
         precips = [
-            e["native_precipitation"] for e in entries if e["native_precipitation"] is not None
+            e.get("native_precipitation") for e in entries
+            if e.get("native_precipitation") is not None
         ]
         total_precip = sum(precips) if precips else None
         # v0.1.24 (P2-10): needed by derive_condition's "cloudy" branch.
@@ -497,9 +564,21 @@ def aggregate_twice_daily_forecast(
 
     results: list[dict[str, Any]] = []
     for (day, is_daytime), entries in sorted(by_period.items(), key=lambda kv: (kv[0][0], not kv[0][1])):
-        temps = [e["native_temperature"] for e in entries if e["native_temperature"] is not None]
+        # v0.2.4 fix (SWF-024-004): .get(), not direct indexing.
+        #
+        # v0.2.1 rewrote the hourly forecast builder to strip keys whose
+        # value is None, so that optional parameters do not appear as
+        # nulls in the Forecast dict. That silently made these direct
+        # lookups unsafe: an hour with no precipitation value has no
+        # "native_precipitation" KEY at all, and this raised KeyError —
+        # taking down the entire blend cycle, not just that hour.
+        temps = [
+            e.get("native_temperature") for e in entries
+            if e.get("native_temperature") is not None
+        ]
         precips = [
-            e["native_precipitation"] for e in entries if e["native_precipitation"] is not None
+            e.get("native_precipitation") for e in entries
+            if e.get("native_precipitation") is not None
         ]
         total_precip = sum(precips) if precips else None
         # v0.1.24 (P2-10): needed by derive_condition's "cloudy" branch.

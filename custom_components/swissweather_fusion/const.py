@@ -119,6 +119,27 @@ ALL_FORECAST_SOURCES = (
     SOURCE_METEOBLUE,
 )
 
+# v0.2.4 (SWF-024-001): the blend's own output, stored back as a
+# pseudo-source so it can be reconciled like any other.
+#
+# Until v0.2.4 nothing measured whether fusion actually helps.
+# bucket_stats recorded how wrong each individual PROVIDER was; the
+# blended answer — the number the user actually sees — was never checked
+# against anything. The project's central claim, that learned bias
+# correction across five sources beats the best single source, was
+# therefore untested and untestable.
+#
+# Deliberately NOT a member of ALL_FORECAST_SOURCES: including it would
+# feed the blend its own output and make the fusion self-referential.
+# It is reconciled, and never consumed.
+SOURCE_BLEND = "blend"
+
+# Lead offsets at which the blend records itself for verification.
+# A handful of representative horizons rather than all 168 hours, which
+# would multiply forecast_snapshots volume for no analytical gain — the
+# question is how skill varies with lead time, and six points answer it.
+BLEND_VERIFICATION_LEAD_HOURS = (1, 3, 6, 12, 24, 48)
+
 # CombiPrecip is deliberately NOT in ALL_FORECAST_SOURCES: it's ground-truth
 # radar observation, not a forecast to bias-correct, and never enters Model
 # A's bucket_stats. It's a Model B feature only. See plan doc §10.
@@ -468,3 +489,79 @@ PRESSURE_PLAUSIBLE_MAX_HPA = 1085.0
 # disagreement (roughly a 200 m altitude error) while still an order of
 # magnitude below the ~65 hPa signature of a double reduction.
 STATION_PRESSURE_REFERENCE_TOLERANCE_HPA = 25.0
+
+
+# ---------------------------------------------------------------------------
+# Station cross-check tolerances (v0.2.4, SWF-024-002)
+# ---------------------------------------------------------------------------
+# How far a station reading may sit from the provider consensus before it
+# is discarded as a configuration error rather than accepted as weather.
+#
+# These are deliberately GENEROUS. They exist to catch gross errors — an
+# undeclared Fahrenheit sensor, a stuck humidity element, a doubly
+# reduced pressure — not calibration drift or genuine microclimate. A
+# thermometer above a patio legitimately reads several degrees above a
+# 1 km model grid cell on a sunny afternoon, and that difference is real
+# signal the learning SHOULD absorb as provider bias.
+#
+# Rejecting narrowly would therefore destroy the very thing Model A is
+# built to learn. So: reject only the implausible, but EXPOSE the delta
+# always, via the diagnostic sensors, so slow drift is visible even
+# though it is not rejected.
+#
+# Temperature: 20 K. An undeclared Fahrenheit sensor reading 68 against a
+# forecast of 20 gives 48 K, comfortably caught; a sunny-wall siting
+# error of 5-8 K is not, and should not be.
+# Humidity: 40 pp. A stuck element at 0 or 100 %RH against a typical 60 %
+# gives 40-60 pp; ordinary sensor disagreement is a few points.
+STATION_REFERENCE_TOLERANCES = {
+    "temperature": 20.0,
+    "humidity": 40.0,
+    "pressure": STATION_PRESSURE_REFERENCE_TOLERANCE_HPA,
+}
+
+
+# ---------------------------------------------------------------------------
+# Forecast freshness weighting (v0.2.4, SWF-024-003)
+# ---------------------------------------------------------------------------
+# Verified provider model cadences. ICON-CH1 runs 8x/day and ICON-CH2
+# 4x/day (MeteoSwiss; confirmed independently by Open-Meteo's model
+# table). ICON-D2 runs 8x/day. SRF recomputes roughly hourly. meteoblue
+# computes its own models twice daily, but OUR staleness there is set by
+# the 3-calls-per-day credit budget, not by the model — so its effective
+# cadence is ours, not theirs.
+SOURCE_UPDATE_CADENCE = {
+    SOURCE_CH1: timedelta(hours=3),
+    SOURCE_CH2: timedelta(hours=6),
+    SOURCE_ICON_D2: timedelta(hours=3),
+    SOURCE_SRF: timedelta(hours=1),
+    SOURCE_METEOBLUE: timedelta(hours=8),
+}
+
+# The freshness curve is CENTRED on each source's mean run age
+# (cadence/2), not on zero. This matters more than the shape.
+#
+# ema_abs_error is learned from samples whose ages are spread across the
+# source's cadence, so the AVERAGE staleness penalty is already baked
+# into the learned weight — ICON-CH2 already scores slightly worse partly
+# because its data is typically older. A curve that only ever reduced the
+# weight would therefore penalise the same staleness twice: once
+# historically, once live.
+#
+# Centring means E[f] is approximately 1 over a cycle, so the learned
+# weight keeps its meaning and only DEVIATIONS from normal staleness are
+# corrected. It also halves the oscillation amplitude, since the swing is
+# symmetric about current behaviour rather than always downward.
+#
+# The amplitude is capped conservatively. Neither the true skill-decay
+# curve nor its magnitude is known, and bucket_stats will eventually
+# measure it — under-correcting is the right error to make until then.
+FRESHNESS_MAX_BOOST = 1.2
+FRESHNESS_MIN_FACTOR = 0.8
+
+# Beyond this multiple of its own cadence a source is not merely stale,
+# it is failing — a stuck feed rather than normal ageing. The historical
+# average does not cover that case, so the decay becomes asymmetric and
+# continues below the symmetric floor toward the cold-start weight.
+FRESHNESS_OVERDUE_MULTIPLE = 2.0
+FRESHNESS_OVERDUE_FLOOR = 0.3

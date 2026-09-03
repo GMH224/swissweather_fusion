@@ -23,6 +23,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    MIN_SAMPLES_TO_TRUST_BUCKET,
     ALL_FORECAST_SOURCES,
     DOMAIN,
     SOURCE_CH1,
@@ -74,6 +75,10 @@ async def async_setup_entry(
         StormOnsetProbabilitySensor(entry, runtime),
         StorageSizeSensor(entry, runtime),
         PressureReferenceDeltaSensor(entry, runtime),
+        BlendAccuracySensor(entry, runtime),
+        BestSourceAccuracySensor(entry, runtime),
+        LearningProgressSensor(entry, runtime),
+        TrustedBucketCountSensor(entry, runtime),
     ]
     for source in ALL_FORECAST_SOURCES:
         entities.append(ExpertWeightSensor(entry, runtime, source))
@@ -250,6 +255,17 @@ class ForecastAccuracySensor(_BaseSensor):
             ),
             "temperature_bucket_count": mae["bucket_count"] if mae else 0,
             "total_sample_count": mae["sample_count"] if mae else 0,
+            # v0.2.4 (SWF-024-001): the falsifiability attributes. The
+            # headline value above is the average error of the INPUTS;
+            # these say whether the blended output does better than the
+            # best of them. blend_beats_best_source is the honest
+            # scoreboard for the whole approach.
+            "blend_mae": mae.get("blend_mae") if mae else None,
+            "best_source": mae.get("best_source") if mae else None,
+            "best_source_mae": mae.get("best_source_mae") if mae else None,
+            "blend_beats_best_source": (
+                mae.get("blend_beats_best_source") if mae else None
+            ),
         }
 
 
@@ -628,3 +644,155 @@ class PressureReferenceDeltaSensor(_BaseSensor):
                 "already reports sea-level pressure' option is set wrongly."
             ),
         }
+
+
+class _LearningStatSensor(_BaseSensor):
+    """Shared base for the learning-progress sensors.
+
+    **v0.2.4 (SWF-024-005).** These exist because Home Assistant records
+    long-term statistics for a sensor's STATE and never for its
+    attributes. v0.2.4 first put blend_mae, best_source_mae and the
+    sample counts on ForecastAccuracySensor as attributes — where the
+    current value is visible but the TREND, which is the entire question
+    being asked, cannot be charted.
+
+    Putting each on its own state makes the story readable: learning
+    progress climbs to a plateau, blend error falls and flattens, and the
+    gap between blend and best-source is either positive or it is not.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self, entry: ConfigEntry, runtime: dict[str, Any], suffix: str, name: str
+    ) -> None:
+        super().__init__(entry, suffix, name)
+        self._runtime = runtime
+
+    @property
+    def _mae(self) -> Optional[dict[str, Any]]:
+        coordinator = self._runtime.get("learning_coordinator")
+        return getattr(coordinator, "temperature_mae", None) if coordinator else None
+
+    @property
+    def _progress(self) -> Optional[dict[str, Any]]:
+        coordinator = self._runtime.get("learning_coordinator")
+        return getattr(coordinator, "learning_progress", None) if coordinator else None
+
+
+class BlendAccuracySensor(_LearningStatSensor):
+    """Mean absolute temperature error of the BLENDED output.
+
+    This is the curve that should visibly bend downward over the first
+    days and then flatten — unlike the per-provider average, which
+    measures how noisy ICON inherently is and which no amount of learning
+    can change.
+    """
+
+    _attr_native_unit_of_measurement = "°C"
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, runtime, "blend_accuracy", "Blend accuracy (MAE)")
+
+    @property
+    def native_value(self) -> Optional[float]:
+        mae = self._mae
+        return mae.get("blend_mae") if mae else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        mae = self._mae or {}
+        return {
+            "beats_best_source": mae.get("blend_beats_best_source"),
+            "methodology": (
+                "EMA of |blend forecast - observed| for temperature, from "
+                "blend output recorded as a pseudo-source and reconciled "
+                "like any provider. Chart against 'Best source accuracy' "
+                "to see whether fusion is earning its complexity."
+            ),
+        }
+
+
+class BestSourceAccuracySensor(_LearningStatSensor):
+    """Mean absolute temperature error of the single best provider.
+
+    The honest benchmark. If the blend cannot beat this, the learned bias
+    correction is not worth its complexity — and that is worth seeing
+    rather than assuming.
+    """
+
+    _attr_native_unit_of_measurement = "°C"
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(
+            entry, runtime, "best_source_accuracy", "Best source accuracy (MAE)"
+        )
+
+    @property
+    def native_value(self) -> Optional[float]:
+        mae = self._mae
+        return mae.get("best_source_mae") if mae else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        mae = self._mae or {}
+        return {"best_source": mae.get("best_source")}
+
+
+class LearningProgressSensor(_LearningStatSensor):
+    """Share of learned buckets that have enough samples to be trusted.
+
+    Without this, a flat accuracy line is ambiguous: it could mean
+    learning has converged, or that it never started. Below
+    MIN_SAMPLES_TO_TRUST_BUCKET a bucket contributes at the cold-start
+    weight and bias correction is doing nothing for it.
+
+    Expect this to climb toward a plateau, then step DOWN at each season
+    boundary — buckets are keyed by season, so a transition empties the
+    seasonal ones and they refill. That is expected behaviour, not a
+    regression.
+    """
+
+    _attr_native_unit_of_measurement = "%"
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, runtime, "learning_progress", "Learning progress")
+
+    @property
+    def native_value(self) -> Optional[float]:
+        progress = self._progress
+        return progress.get("trusted_pct") if progress else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        progress = self._progress or {}
+        return {
+            "buckets_trusted": progress.get("buckets_trusted"),
+            "buckets_total": progress.get("buckets_total"),
+            "minimum_samples_to_trust": MIN_SAMPLES_TO_TRUST_BUCKET,
+            "note": (
+                "Percentage is of buckets that exist, not of the full key "
+                "space — most of that space is unreachable (ICON-CH1 only "
+                "forecasts 33 hours, so it can have no long-lead buckets). "
+                "Expect a step down at each season boundary."
+            ),
+        }
+
+
+class TrustedBucketCountSensor(_LearningStatSensor):
+    """Absolute number of trusted buckets.
+
+    Complements the percentage, which alone hides whether the
+    denominator is sane — 100% of four buckets is not convergence.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, runtime, "trusted_buckets", "Trusted buckets")
+
+    @property
+    def native_value(self) -> Optional[int]:
+        progress = self._progress
+        return progress.get("buckets_trusted") if progress else None
