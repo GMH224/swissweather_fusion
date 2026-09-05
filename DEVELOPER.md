@@ -1815,7 +1815,7 @@ trigger it.
 
 ## v0.1.24–v0.1.28 — architecture notes
 
-Full remediation record: `swissweather_fusion_v0.2.4_release_audit.md`.
+Full remediation record: `swissweather_fusion_v0.2.5_release_audit.md`.
 The design decisions worth knowing before reading the code:
 
 ### Model A blend weights are dimensionless (IND-01)

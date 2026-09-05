@@ -761,6 +761,25 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
             )
             for p in parsed.points
         ]
+        # v0.2.5 (SWF-025-002): store meteoblue's own hourly confidence
+        # score. It has been parsed into
+        # ParsedMeteoblueForecast.predictability since v0.1.x and thrown
+        # away ever since — the architecture document's Class D
+        # ("provider metadata") gap. A source telling us it is unsure
+        # about a particular hour is information.
+        if parsed.predictability:
+            for point, confidence in zip(
+                [p for p in parsed.points if p.variable == "temperature"],
+                parsed.predictability,
+            ):
+                if confidence is None:
+                    continue
+                rows.append((
+                    "meteoblue", parsed.issued_at.isoformat(),
+                    point.valid_at.isoformat(), "predictability",
+                    confidence, trigger_reason,
+                ))
+
         # v0.1.24 fix (P1-24): surface an array-length mismatch instead
         # of letting zip() truncate silently. Open-Meteo has done this
         # since v0.1.19; meteoblue had no equivalent.
@@ -1660,6 +1679,11 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         # collected, stored, and then never fused or exposed. A user
         # looking for UV in the card found nothing.
         "uv_index", "sunshine_duration",
+        # v0.2.5 (SWF-025-001): convective and vertical structure.
+        "cape", "convective_inhibition", "freezing_level_height",
+        "snowfall_height", "cloud_base",
+        # v0.2.5 (SWF-025-002): provider-reported confidence, Class D.
+        "predictability",
     )
     CATEGORICAL_MEASUREMENTS = ("weather_code",)
     # Everything queried from storage in one pass.
@@ -2469,6 +2493,7 @@ class ModelBCoordinator(DataUpdateCoordinator):
         meteoblue_coordinator: MeteoblueCoordinator,
         meteonomiqs_coordinator: MeteonomiqsCoordinator,
         *,
+        blend_coordinator: Any = None,
         diagnostics: Any = None,
     ) -> None:
         super().__init__(
@@ -2482,6 +2507,11 @@ class ModelBCoordinator(DataUpdateCoordinator):
         self._combiprecip_coordinator = combiprecip_coordinator
         self._meteoblue_coordinator = meteoblue_coordinator
         self._meteonomiqs_coordinator = meteonomiqs_coordinator
+        # v0.2.5 (SWF-025-001): source of fused CAPE / convective
+        # inhibition for the current hour. Optional so this coordinator
+        # stays independently constructible; without it Model B simply
+        # has no instability input, exactly as before v0.2.5.
+        self._blend_coordinator = blend_coordinator
         # v0.1.26: this coordinator had no diagnostics recorder at all.
         # P2-09's future-dated-sample fix referenced self._diagnostics
         # anyway, which would have raised AttributeError on the first
@@ -2577,10 +2607,19 @@ class ModelBCoordinator(DataUpdateCoordinator):
             for v in radar_values
         )
 
+        # v0.2.5 (SWF-025-001): instability for the current hour, taken
+        # from the blend's own fused output rather than any single model.
+        blend_current = {}
+        blend_coordinator = self._blend_coordinator
+        if blend_coordinator is not None and blend_coordinator.data:
+            blend_current = blend_coordinator.data.get("current", {}) or {}
+
         features = model_b.compute_tendency_features(
             samples=samples,
             now_epoch_seconds=time.time(),
             radar_points=radar_points,
+            cape=blend_current.get("cape"),
+            convective_inhibition=blend_current.get("convective_inhibition"),
         )
         base_probability = model_b.score_v0_graduated(features, now=now)
         probability = base_probability

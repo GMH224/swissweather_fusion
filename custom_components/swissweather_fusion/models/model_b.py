@@ -39,6 +39,13 @@ from datetime import datetime, timezone
 from typing import Optional, Sequence
 
 from ..const import (
+    CAPE_MARGINAL_JKG,
+    CAPE_MARGINAL_PROBABILITY,
+    CAPE_MODERATE_JKG,
+    CAPE_MODERATE_PROBABILITY,
+    CAPE_STRONG_JKG,
+    CAPE_STRONG_PROBABILITY,
+    CIN_STRONG_CAP_JKG,
     LOCAL_POINT_PROBABILITY,
     RADAR_FRESHNESS_LIMIT,
     RADAR_PRECIP_ACCUM_MM_THRESHOLD,
@@ -111,6 +118,10 @@ class TendencyFeatures:
     delta_temperature_30min: Optional[float]
     delta_temperature_60min: Optional[float]
     radar_points: tuple[RadarPointReading, ...] = field(default_factory=tuple)
+    # v0.2.5 (SWF-025-001): atmospheric instability, from the blended
+    # provider forecast for the current hour. None when unavailable.
+    cape: Optional[float] = None
+    convective_inhibition: Optional[float] = None
 
 
 def _nearest_sample_at_or_before(
@@ -175,6 +186,8 @@ def compute_tendency_features(
     samples: Sequence[StationSample],
     now_epoch_seconds: float,
     radar_points: tuple[RadarPointReading, ...] = (),
+    cape: Optional[float] = None,
+    convective_inhibition: Optional[float] = None,
 ) -> TendencyFeatures:
     """Compute Δpressure/Δhumidity/Δtemperature over 10/30/60 min windows,
     plus whatever multi-point radar reading was supplied.
@@ -206,6 +219,8 @@ def compute_tendency_features(
         delta_temperature_30min=delta(30, "temperature"),
         delta_temperature_60min=delta(60, "temperature"),
         radar_points=radar_points,
+        cape=cape,
+        convective_inhibition=convective_inhibition,
     )
 
 
@@ -310,6 +325,48 @@ def _radar_signal_probability(
     return 0.0
 
 
+def convective_probability(
+    cape: Optional[float], convective_inhibition: Optional[float]
+) -> float:
+    """Storm potential implied by atmospheric instability.
+
+    **v0.2.5 (SWF-025-001).** The first instability input Model B has
+    ever had. Before this the score was station tendency and upwind
+    radar only — it could not tell steady frontal rain arriving from the
+    southwest from a thunderstorm developing overhead.
+
+    **Why CIN gates CAPE rather than reducing it.** High CAPE under a
+    strong cap is the classic false-alarm case: the energy is there and
+    nothing can reach it. Treating capped instability as a storm signal
+    would make the score cry wolf on every warm afternoon, which is how
+    a warning becomes ignored. So a strong cap suppresses the CAPE
+    contribution outright rather than scaling it.
+
+    Unknown CIN does NOT suppress — same asymmetry as radar quality
+    (P1-16). If the field is absent we still want the CAPE signal;
+    treating unknown as capped would silently discard the whole
+    contribution whenever a provider omits one variable.
+
+    Returns 0.0 rather than None when CAPE is unavailable, because this
+    is combined with max() against the other signals and None would
+    force every caller to special-case it.
+    """
+    if cape is None:
+        return 0.0
+
+    # A strong cap means the instability cannot be released.
+    if convective_inhibition is not None and convective_inhibition <= CIN_STRONG_CAP_JKG:
+        return 0.0
+
+    if cape >= CAPE_STRONG_JKG:
+        return CAPE_STRONG_PROBABILITY
+    if cape >= CAPE_MODERATE_JKG:
+        return CAPE_MODERATE_PROBABILITY
+    if cape >= CAPE_MARGINAL_JKG:
+        return CAPE_MARGINAL_PROBABILITY
+    return 0.0
+
+
 def score_v0_graduated(
     features: TendencyFeatures, now: Optional[datetime] = None
 ) -> float:
@@ -327,7 +384,21 @@ def score_v0_graduated(
     """
     tendency_score = score_v0(features)
     radar_score = _radar_signal_probability(features.radar_points, now)
-    return max(tendency_score, radar_score)
+    # v0.2.5 (SWF-025-001): instability joins the max().
+    #
+    # max(), not a sum: these are three independent lines of evidence for
+    # the same event, not additive contributions to it. Summing would let
+    # three weak signals manufacture a strong one.
+    #
+    # The CAPE band probabilities sit below V0_TRIGGER_PROBABILITY by
+    # design, so instability alone cannot fire the trigger — it raises
+    # concern and supports a radar or tendency signal, which is the
+    # honest weight for a measure of POTENTIAL rather than of an event in
+    # progress.
+    convective_score = convective_probability(
+        features.cape, features.convective_inhibition
+    )
+    return max(tendency_score, radar_score, convective_score)
 
 
 def refine_with_meteonomiqs(

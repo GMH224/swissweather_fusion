@@ -16,10 +16,16 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.helpers.entity import EntityCategory
+# v0.2.5: canonical home since the entity-category move; the
+# helpers.entity alias is deprecated.
+from homeassistant.const import EntityCategory
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+# v0.2.5: AddEntitiesCallback is superseded by the
+# config-entry-specific callback type.
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+)
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
@@ -61,7 +67,7 @@ def _get_health(runtime: dict[str, Any], source: str) -> Optional[SourceHealth]:
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     runtime = hass.data[DOMAIN][entry.entry_id]
     db: SwissWeatherDB = runtime["db"]
@@ -79,6 +85,21 @@ async def async_setup_entry(
         BestSourceAccuracySensor(entry, runtime),
         LearningProgressSensor(entry, runtime),
         TrustedBucketCountSensor(entry, runtime),
+        # v0.2.5: the new fused parameters, on the UI as primary entities.
+        BlendedValueSensor(entry, runtime, "cape", "Convective energy (CAPE)",
+                           "J/kg", icon="mdi:flash-outline"),
+        BlendedValueSensor(entry, runtime, "convective_inhibition",
+                           "Convective inhibition", "J/kg", icon="mdi:lock-outline"),
+        BlendedValueSensor(entry, runtime, "freezing_level_height",
+                           "Freezing level", "m", icon="mdi:snowflake-thermometer"),
+        BlendedValueSensor(entry, runtime, "snowfall_height", "Snowfall level",
+                           "m", icon="mdi:snowflake"),
+        BlendedValueSensor(entry, runtime, "cloud_base", "Cloud base", "m",
+                           icon="mdi:cloud-outline"),
+        BlendedValueSensor(entry, runtime, "predictability",
+                           "Forecast confidence (meteoblue)", "%",
+                           icon="mdi:check-decagram-outline", diagnostic=True),
+        ConvectiveRiskSensor(entry, runtime),
     ]
     for source in ALL_FORECAST_SOURCES:
         entities.append(ExpertWeightSensor(entry, runtime, source))
@@ -796,3 +817,113 @@ class TrustedBucketCountSensor(_LearningStatSensor):
     def native_value(self) -> Optional[int]:
         progress = self._progress
         return progress.get("buckets_trusted") if progress else None
+
+
+class BlendedValueSensor(_BaseSensor):
+    """A fused forecast parameter, surfaced as its own entity.
+
+    **v0.2.5.** The parameters added in v0.2.0-v0.2.5 reach the weather
+    entity's forecast, but several are not members of Home Assistant's
+    Forecast contract and therefore cannot be rendered by any weather
+    card — CAPE, convective inhibition, freezing level, snowfall level,
+    cloud base and provider confidence among them.
+
+    Giving each its own sensor is the mechanism the architecture review
+    identified (AR-01) for exactly this case: standard fields flow
+    through the weather entity, non-standard ones need entities. It also
+    means each gets long-term statistics and can be charted.
+
+    Reads the blend's already-computed current values — no database
+    access from a property.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(
+        self,
+        entry: ConfigEntry,
+        runtime: dict[str, Any],
+        measurement: str,
+        name: str,
+        unit: Optional[str],
+        *,
+        icon: Optional[str] = None,
+        diagnostic: bool = False,
+    ) -> None:
+        super().__init__(entry, measurement, name)
+        self._runtime = runtime
+        self._measurement = measurement
+        self._attr_native_unit_of_measurement = unit
+        if icon:
+            self._attr_icon = icon
+        if diagnostic:
+            self._attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    @property
+    def native_value(self) -> Optional[float]:
+        coordinator = self._runtime.get("blend_coordinator")
+        if coordinator is None or not coordinator.data:
+            return None
+        return (coordinator.data.get("current") or {}).get(self._measurement)
+
+
+class ConvectiveRiskSensor(_BaseSensor):
+    """Storm potential implied by instability alone.
+
+    **v0.2.5 (SWF-025-001).** Separated from the headline storm score so
+    the two lines of evidence stay legible. The storm score is the
+    maximum of station tendency, upwind radar and this — meaning a high
+    combined score could come from rain already arriving, or from an
+    unstable atmosphere with nothing happening yet. Those call for
+    different responses, and one number cannot express both.
+
+    Reports 0 when the atmosphere is capped: high CAPE under strong
+    convective inhibition is the classic false-alarm case, and a
+    convective-risk reading that ignores the lid would cry wolf on every
+    warm afternoon.
+    """
+
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:weather-lightning"
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, "convective_risk", "Convective risk")
+        self._runtime = runtime
+
+    def _current(self) -> dict[str, Any]:
+        coordinator = self._runtime.get("blend_coordinator")
+        if coordinator is None or not coordinator.data:
+            return {}
+        return coordinator.data.get("current") or {}
+
+    @property
+    def native_value(self) -> Optional[float]:
+        from .models.model_b import convective_probability
+
+        current = self._current()
+        cape = current.get("cape")
+        if cape is None:
+            return None
+        return round(
+            convective_probability(cape, current.get("convective_inhibition")) * 100, 1
+        )
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        from .const import CIN_STRONG_CAP_JKG
+
+        current = self._current()
+        cin = current.get("convective_inhibition")
+        return {
+            "cape": current.get("cape"),
+            "convective_inhibition": cin,
+            "capped": None if cin is None else cin <= CIN_STRONG_CAP_JKG,
+            "is_calibrated_probability": False,
+            "methodology": (
+                "Conventional CAPE bands (300 / 1000 / 2500 J/kg), suppressed "
+                "entirely when convective inhibition indicates a strong cap. "
+                "Textbook thresholds, not tuned for this location — a v0 "
+                "heuristic like the radar thresholds."
+            ),
+        }

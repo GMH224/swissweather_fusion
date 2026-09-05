@@ -222,9 +222,45 @@ PARAMETERS: dict[str, ForecastParameter] = {
                           "worst case is the operationally relevant one"),
     "uv_index": _p("uv_index", ParameterClass.FUSED, None, fuse_mean,
                    0, 20, desc="UV index"),
-    "sunshine_duration": _p("sunshine_duration", ParameterClass.FUSED, "min",
-                            fuse_mean, 0, 60,
-                            desc="sunshine minutes within the hour"),
+    "sunshine_duration": _p("sunshine_duration", ParameterClass.FUSED, "s",
+                            fuse_mean, 0, 3600,
+                            desc="sunshine seconds within the hour"),
+
+    # -- v0.2.5: convective and vertical structure ------------------------
+    # CAPE is the standard measure of how much energy is available to a
+    # rising parcel — the closest thing to a thunderstorm predictor any
+    # of these providers offers. Fused with MAX rather than mean: like a
+    # wind gust it is a hazard indicator, and averaging away one model's
+    # warning is the wrong direction to be wrong in.
+    "cape": _p("cape", ParameterClass.FUSED, "J/kg", fuse_max, 0, 8000,
+               desc="convective available potential energy"),
+    # Convective inhibition is the lid on that energy. It is reported as
+    # a NEGATIVE number (or zero), and more negative means a stronger
+    # cap. Fused with max — i.e. the LEAST inhibited of the models —
+    # because a weak cap is the pessimistic case, consistent with CAPE.
+    "convective_inhibition": _p("convective_inhibition", ParameterClass.FUSED,
+                                "J/kg", fuse_max, -5000, 0,
+                                desc="convective inhibition; 0 = no cap"),
+    # Height of the 0 degC isotherm. The honest rain-vs-snow
+    # discriminator at a given altitude, replacing a surface-temperature
+    # guess. Mean is right: it is a smooth continuous field.
+    "freezing_level_height": _p("freezing_level_height", ParameterClass.FUSED,
+                                "m", fuse_mean, 0, 9000,
+                                desc="altitude of the 0 degC isotherm"),
+    "snowfall_height": _p("snowfall_height", ParameterClass.FUSED, "m",
+                          fuse_mean, 0, 9000,
+                          desc="altitude above which precipitation falls as snow"),
+    "cloud_base": _p("cloud_base", ParameterClass.FUSED, "m", fuse_mean,
+                     0, 20000, desc="height of the cloud base"),
+    # -- v0.2.5: provider self-reported confidence (Class D) --------------
+    # meteoblue's own hourly forecast-confidence score, parsed since
+    # v0.1.x into ParsedMeteoblueForecast.predictability and never
+    # stored. A source telling us it is unsure about a particular hour is
+    # information, and discarding it was the architecture document's
+    # Class D gap.
+    "predictability": _p("predictability", ParameterClass.FUSED, "%",
+                         fuse_mean, 0, 100,
+                         desc="provider-reported forecast confidence"),
 }
 
 

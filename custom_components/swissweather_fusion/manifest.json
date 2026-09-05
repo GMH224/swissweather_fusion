@@ -1,7 +1,7 @@
 {
   "domain": "swissweather_fusion",
   "name": "SwissWeather Fusion",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "codeowners": [
     "@fusion-project-maintainers"
   ],

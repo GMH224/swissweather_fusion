@@ -10,7 +10,8 @@ kind shown by, e.g., weather-fusion-ai's own device grouping).
 from __future__ import annotations
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.entity import DeviceInfo
+# v0.2.5: DeviceInfo now lives in the device registry helper.
+from homeassistant.helpers.device_registry import DeviceInfo
 
 from .const import DOMAIN
 

@@ -76,6 +76,28 @@ HOURLY_VARIABLES = (
     "apparent_temperature",
     "cloud_cover",
     "visibility",
+    # v0.2.5 — convective and vertical-structure variables.
+    #
+    # These were the missing half of Model B. const.py and model_b.py
+    # both recorded that CAPE "was hoped for but turned out to require a
+    # paid tier" — that conclusion was drawn from Meteonomiqs' /forecast2
+    # and then carried for several releases without being re-checked
+    # against the other providers. Open-Meteo offers CAPE and convective
+    # inhibition FREE for all three ICON models, on the same request we
+    # already make.
+    #
+    # Until now Model B had no instability input at all: it was a
+    # rain-approach detector using station tendency and upwind radar,
+    # with nothing describing whether the atmosphere was actually capable
+    # of convection.
+    "cape",
+    "convective_inhibition",
+    # Freezing level is the honest way to decide rain vs snow at a given
+    # altitude, replacing a surface-temperature guess.
+    "freezing_level_height",
+    "snowfall_height",
+    "cloud_base",
+    "sunshine_duration",
     # Class C — categorical, never averaged
     "weather_code",
 )
@@ -198,6 +220,13 @@ _VARIABLE_NAME_MAP = {
     "visibility": "visibility",
     "weather_code": "weather_code",
     "uv_index": "uv_index",
+    # v0.2.5
+    "cape": "cape",
+    "convective_inhibition": "convective_inhibition",
+    "freezing_level_height": "freezing_level_height",
+    "snowfall_height": "snowfall_height",
+    "cloud_base": "cloud_base",
+    "sunshine_duration": "sunshine_duration",
     "relative_humidity_2m": "humidity",
     # v0.1.2 fix: was surface_pressure (pressure at the source's own grid
     # elevation), which doesn't match what SRF/meteoblue/the local station

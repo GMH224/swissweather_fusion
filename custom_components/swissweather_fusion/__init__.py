@@ -222,18 +222,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass, db, latitude, longitude, meteonomiqs_api_key,
             diagnostics=diagnostics_recorder,
         )
-        model_b_coordinator = ModelBCoordinator(
-            hass,
-            db,
-            station_coordinator,
-            combiprecip_coordinator,
-            meteoblue_coordinator,
-            meteonomiqs_coordinator,
-            diagnostics=diagnostics_recorder,
-        )
-        # v0.1.5: computes Model A's current values + hourly/daily/twice-daily
-        # forecast in one batched executor job — see coordinator.py for why
-        # this replaced logic that used to live directly in weather.py.
+        # v0.2.5 (SWF-025-001): the blend is constructed FIRST so Model B
+        # can read fused CAPE and convective inhibition from it. The blend
+        # has no dependency on Model B, so the order is free to change.
         blend_coordinator = ModelABlendCoordinator(hass, db)
         # v0.1.7: the actual learning step — without this, bucket_stats never
         # gets populated at all, and Model A's blend is only ever an
@@ -250,6 +241,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         learning_coordinator = ModelALearningCoordinator(
             hass, db, reconcile_lock=shared_learning_lock
         )
+        model_b_coordinator = ModelBCoordinator(
+            hass,
+            db,
+            station_coordinator,
+            combiprecip_coordinator,
+            meteoblue_coordinator,
+            meteonomiqs_coordinator,
+            blend_coordinator=blend_coordinator,
+            diagnostics=diagnostics_recorder,
+        )
+        # v0.1.5: computes Model A's current values + hourly/daily/twice-daily
+        # forecast in one batched executor job — see coordinator.py for why
+        # this replaced logic that used to live directly in weather.py.
         # v0.1.23 fix (L-10): the only caller of db.purge_older_than() — see
         # RetentionCoordinator's docstring in coordinator.py. purge_days=0
         # (the default) makes this coordinator a permanent no-op, matching

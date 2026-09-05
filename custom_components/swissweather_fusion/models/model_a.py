@@ -488,6 +488,13 @@ def aggregate_daily_forecast(
                 "native_temperature": max(temps) if temps else None,
                 "native_templow": min(temps) if temps else None,
                 "native_precipitation": total_precip,
+                # v0.2.5 (SWF-025-004): the daily forecast now CARRIES
+                # cloud cover. It was already computed here to feed the
+                # condition resolver and then discarded, so an automation
+                # reading daily.cloud_coverage silently got nothing —
+                # a template default rather than an error, which is the
+                # worst way for a field to be missing.
+                "cloud_coverage": max(clouds) if clouds else None,
                 # v0.1.24 (P2-10): 0.5 mm passed explicitly — a DAILY
                 # total is not the same quantity as an hourly amount and
                 # must not silently inherit the hourly site's threshold.

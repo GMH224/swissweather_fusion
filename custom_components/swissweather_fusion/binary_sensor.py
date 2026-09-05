@@ -11,7 +11,11 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+# v0.2.5: AddEntitiesCallback is superseded by the
+# config-entry-specific callback type.
+from homeassistant.helpers.entity_platform import (
+    AddConfigEntryEntitiesCallback,
+)
 
 from .const import DOMAIN
 from .device import build_device_info
@@ -19,7 +23,7 @@ from .sensor import ALL_TELEMETRY_SOURCES, _get_health, is_source_healthy
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     runtime = hass.data[DOMAIN][entry.entry_id]
     async_add_entities([DegradedBinarySensor(entry, runtime)])

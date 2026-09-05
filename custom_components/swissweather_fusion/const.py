@@ -565,3 +565,45 @@ FRESHNESS_MIN_FACTOR = 0.8
 # continues below the symmetric floor toward the cold-start weight.
 FRESHNESS_OVERDUE_MULTIPLE = 2.0
 FRESHNESS_OVERDUE_FLOOR = 0.3
+
+
+# ---------------------------------------------------------------------------
+# Convective instability thresholds (v0.2.5, SWF-025-001)
+# ---------------------------------------------------------------------------
+# Until v0.2.5 Model B had no instability input at all. Its own module
+# docstring and const.py both recorded that CAPE "was hoped for but
+# turned out to require a paid tier" — a conclusion drawn from
+# Meteonomiqs' /forecast2 and then carried for several releases without
+# being re-checked against the other providers. Open-Meteo supplies CAPE
+# and convective inhibition free for all three ICON models.
+#
+# What this changes: Model B was a rain-APPROACH detector — station
+# pressure/humidity tendency plus upwind radar — with nothing describing
+# whether the atmosphere could actually convect. It could not distinguish
+# steady frontal rain arriving from the southwest from a developing
+# thunderstorm overhead.
+#
+# The CAPE bands below are the conventional operational ranges. They are
+# textbook figures, not tuned against this location, and are therefore a
+# v0 heuristic exactly like the radar thresholds — see DEVELOPER.md.
+# storm_events now accumulates, so they become measurable rather than
+# permanent assumptions.
+CAPE_MARGINAL_JKG = 300.0     # weak instability; showers possible
+CAPE_MODERATE_JKG = 1000.0    # thunderstorms plausible given a trigger
+CAPE_STRONG_JKG = 2500.0      # severe potential
+
+# Convective inhibition is reported as a negative number; more negative
+# is a stronger cap. Below this the atmosphere is effectively lidded and
+# high CAPE alone should NOT raise the score — capped instability is the
+# classic false-alarm case, and getting it wrong in the other direction
+# would make the score cry wolf on every warm afternoon.
+CIN_STRONG_CAP_JKG = -75.0
+
+# Contribution of instability alone. Deliberately below
+# V0_TRIGGER_PROBABILITY: CAPE describes POTENTIAL, not an event in
+# progress. It should raise concern and support a radar or tendency
+# signal, never fire the trigger by itself on a merely unstable
+# afternoon.
+CAPE_MARGINAL_PROBABILITY = 0.20
+CAPE_MODERATE_PROBABILITY = 0.45
+CAPE_STRONG_PROBABILITY = 0.60

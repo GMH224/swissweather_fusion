@@ -55,6 +55,9 @@ def _install_homeassistant_stubs() -> None:
     )
     const.UnitOfSpeed = type("UnitOfSpeed", (), {"METERS_PER_SECOND": "m/s"})
     const.PERCENTAGE = "%"
+    const.EntityCategory = type(
+        "EntityCategory", (), {"DIAGNOSTIC": "diagnostic", "CONFIG": "config"}
+    )
     const.UnitOfLength = type(
         "UnitOfLength", (), {"METERS": "m", "KILOMETERS": "km"}
     )
@@ -137,7 +140,11 @@ def _install_homeassistant_stubs() -> None:
         "EntityCategory", (), {"DIAGNOSTIC": "diagnostic", "CONFIG": "config"}
     )
 
+    device_registry_mod = _module("homeassistant.helpers.device_registry")
+    device_registry_mod.DeviceInfo = dict
+
     entity_platform = _module("homeassistant.helpers.entity_platform")
+    entity_platform.AddConfigEntryEntitiesCallback = object
     entity_platform.AddEntitiesCallback = object
 
     components = _module("homeassistant.components")
