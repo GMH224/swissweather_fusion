@@ -38,13 +38,21 @@ from .const import (
     SOURCE_ICON_D2,
     SOURCE_METEOBLUE,
     SOURCE_METEONOMIQS,
+    SOURCE_WETTERALARM,
     SOURCE_SRF,
 )
 from .device import build_device_info
 from .health import SourceHealth
 from .storage.db import SwissWeatherDB
 
-ALL_TELEMETRY_SOURCES = ALL_FORECAST_SOURCES + (SOURCE_COMBIPRECIP, SOURCE_METEONOMIQS)
+# v0.2.6 audit (SWF-026-005): wetteralarm included. Its coordinator
+# creates a SourceHealth like every other source, but omitting it here
+# meant that health was recorded and never surfaced — no last-success
+# sensor, no contribution to the degraded/status entities. A source that
+# can fail silently is one whose failures are discovered late.
+ALL_TELEMETRY_SOURCES = ALL_FORECAST_SOURCES + (
+    SOURCE_COMBIPRECIP, SOURCE_METEONOMIQS, SOURCE_WETTERALARM,
+)
 
 
 def _get_health(runtime: dict[str, Any], source: str) -> Optional[SourceHealth]:
@@ -100,6 +108,7 @@ async def async_setup_entry(
                            "Forecast confidence (meteoblue)", "%",
                            icon="mdi:check-decagram-outline", diagnostic=True),
         ConvectiveRiskSensor(entry, runtime),
+        OfficialWarningSensor(entry, runtime),
     ]
     for source in ALL_FORECAST_SOURCES:
         entities.append(ExpertWeightSensor(entry, runtime, source))
@@ -927,3 +936,105 @@ class ConvectiveRiskSensor(_BaseSensor):
                 "heuristic like the radar thresholds."
             ),
         }
+
+
+class OfficialWarningSensor(_BaseSensor):
+    """The active official severe-weather warning, if any.
+
+    **v0.2.6 (SWF-026-001).** Deliberately ONE entity carrying the whole
+    warning, rather than either of the two obvious alternatives.
+
+    *Not* folded into the storm onset score: that score is
+    `max()` of three heuristics this project invented, and adding an
+    authority's judgement to it would make a high reading ambiguous
+    between "our unvalidated rule fired" and "a meteorologist issued a
+    warning" — two things warranting different responses, which one
+    number cannot express.
+
+    *Not* split across eight sensors either (alarm id, valid-from,
+    valid-to, priority, region, title, hint, signature), which is what
+    the upstream project did. Seven of those are meaningless in
+    isolation, none is something to automate on, and each would carry a
+    separate availability and history of its own.
+
+    Instead: **the state is the thing you automate on** — the severity
+    level — and every other field is an attribute. Nothing the API
+    returns is discarded, including the raw payload, so a field this
+    integration does not yet interpret is still recoverable rather than
+    lost at the boundary.
+    """
+
+    _attr_icon = "mdi:alert-decagram-outline"
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, "official_warning", "Official weather warning")
+        self._runtime = runtime
+        self._attr_attribution = "Warnings by Wetter-Alarm (GVB)"
+
+    @property
+    def _warning(self) -> Any:
+        coordinator = self._runtime.get("wetteralarm_coordinator")
+        return getattr(coordinator, "warning", None) if coordinator else None
+
+    @property
+    def native_value(self) -> Optional[str]:
+        """Severity level: none / yellow / orange / red.
+
+        A text state rather than a number, because the levels are
+        ordinal categories issued by an authority, not a measurement.
+        Rendering them as 1/2/3 would invite arithmetic that means
+        nothing — the gap between yellow and orange is not the gap
+        between orange and red.
+        """
+        warning = self._warning
+        if warning is None:
+            return None
+        return warning.level
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        warning = self._warning
+        coordinator = self._runtime.get("wetteralarm_coordinator")
+        attrs: dict[str, Any] = {
+            "active": bool(warning and warning.is_active),
+            "poi_id": getattr(coordinator, "poi_id", None),
+            "poi_distance_km": getattr(coordinator, "poi_distance_km", None),
+            "source": "Wetter-Alarm (Gebäudeversicherung Bern)",
+            "relationship_to_storm_score": (
+                "Independent of the storm onset risk score. That score is a "
+                "heuristic this integration computes; this is a warning "
+                "issued by an external authority. Deliberately not combined, "
+                "so the two remain distinguishable."
+            ),
+        }
+        if warning is None or not warning.is_active:
+            return attrs
+
+        attrs.update({
+            "alarm_id": warning.alarm_id,
+            "priority": warning.priority,
+            "title": warning.title,
+            "hint": warning.hint,
+            "region": warning.region,
+            "signature": warning.signature,
+            "valid_from": warning.valid_from.isoformat() if warning.valid_from else None,
+            "valid_to": warning.valid_to.isoformat() if warning.valid_to else None,
+        })
+
+        # v0.2.6 audit (SWF-026-002): concurrent warnings are surfaced in
+        # full. The state carries the most severe; this carries all of
+        # them, because a frost warning alongside a thunderstorm warning
+        # is two distinct things to act on.
+        all_warnings = getattr(coordinator, "warnings", None) or []
+        if len(all_warnings) > 1:
+            attrs["concurrent_warnings"] = [
+                {
+                    "title": w.title,
+                    "level": w.level,
+                    "priority": w.priority,
+                    "valid_to": w.valid_to.isoformat() if w.valid_to else None,
+                }
+                for w in all_warnings
+            ]
+        attrs["warning_count"] = len(all_warnings)
+        return attrs

@@ -33,6 +33,13 @@ from .clients.meteoblue import BonusCallTracker, MeteoblueClient, should_fire_sc
 from .clients.meteonomiqs import AnnualCallBudget, MeteonomiqsClient, needs_keepalive_call
 from .clients.open_meteo import OPTIONAL_HOURLY_VARIABLES, OpenMeteoClient
 from .clients.srf import SrfClient
+from .clients.wetteralarm import (
+    WeatherWarning,
+    parse_all_alarms,
+    WetterAlarmClient,
+    find_nearest_poi,
+    load_poi_index,
+)
 from .health import SourceHealth, classify_exception
 from .const import (
     MIN_SAMPLES_TO_TRUST_BUCKET,
@@ -43,6 +50,9 @@ from .const import (
     FRESHNESS_OVERDUE_MULTIPLE,
     SOURCE_BLEND,
     SOURCE_UPDATE_CADENCE,
+    SOURCE_WETTERALARM,
+    WETTERALARM_MAX_POI_DISTANCE_KM,
+    WETTERALARM_POLL_INTERVAL,
     PRESSURE_PLAUSIBLE_MAX_HPA,
     PRESSURE_PLAUSIBLE_MIN_HPA,
     STATION_REFERENCE_TOLERANCES,
@@ -3035,3 +3045,173 @@ class StormEventReconciliationCoordinator(DataUpdateCoordinator):
         peak_precip = max(precips) if precips else None
 
         return peak_drop, peak_precip
+
+
+class WetterAlarmCoordinator(DataUpdateCoordinator):
+    """Official Swiss severe-weather warnings from Wetter-Alarm (GVB).
+
+    **v0.2.6 (SWF-026-001).** The first external-authority signal in this
+    project. Everything else Model B uses — station tendency, upwind
+    radar, CAPE bands — is a heuristic this project invented and cannot
+    validate. A Wetter-Alarm warning is a decision made by an
+    organisation with lightning detection, full radar coverage and human
+    oversight.
+
+    **Why this is NOT folded into the storm onset score.**
+
+    The storm score is `max(tendency, radar, convective)` — three
+    invented heuristics, deliberately combined because they are three
+    views of one question. Adding an official warning to that max() would
+    be a category error and would destroy information in both directions:
+
+    - A high score would no longer distinguish "our unvalidated
+      heuristic fired" from "a meteorologist issued a warning". Those
+      warrant completely different responses, and one number cannot
+      express both.
+    - The warning's own richness — hazard type, severity level, validity
+      window, the issuing region, the advisory text — would collapse
+      into a single float. A hail warning valid until 18:00 and a frost
+      warning valid overnight are not interchangeable, and `max()` cannot
+      tell them apart.
+
+    So it is exposed as its own entity with its full payload intact. An
+    automation wanting "official warning OR our heuristic" can express
+    that trivially; recovering the distinction after a max() is
+    impossible.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        latitude: float,
+        longitude: float,
+        *,
+        language: str = "de",
+        diagnostics: Any = None,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="swissweather_fusion_wetteralarm",
+            update_interval=WETTERALARM_POLL_INTERVAL,
+        )
+        self._latitude = latitude
+        self._longitude = longitude
+        self._language = language
+        self._diagnostics = diagnostics
+        self._client = WetterAlarmClient(async_get_clientsession(hass))
+        self.health = SourceHealth()
+
+        # Resolved lazily on first refresh: the POI index is a bundled
+        # file and reading it is blocking I/O, which must not happen on
+        # the event loop or during __init__.
+        self.poi_id: Optional[int] = None
+        self.poi_distance_km: Optional[float] = None
+        self._poi_resolved = False
+        # Deduplication: the endpoint returns the whole national list, so
+        # an unchanged response is the normal case. The upstream project
+        # re-parsed it every cycle regardless.
+        self._last_payload_fingerprint: Optional[str] = None
+        self.warning: WeatherWarning = WeatherWarning()
+        # v0.2.6 audit (SWF-026-002): every concurrent warning, most
+        # severe first. `warning` is the headline; this is the full set,
+        # because a frost warning and a thunderstorm warning can be in
+        # force at once and dropping either loses real information.
+        self.warnings: list[WeatherWarning] = []
+
+    async def _async_resolve_poi(self) -> None:
+        """Find the nearest catalogued town, once."""
+        if self._poi_resolved:
+            return
+        # v0.2.6 audit (SWF-026-004): the SEARCH runs in the executor
+        # too, not just the file read. Scanning 6,261 entries with a
+        # haversine each takes ~3 ms — small, but it is pure CPU work on
+        # the event loop for no reason, and this project has already
+        # shipped one blocking-on-the-loop defect (v0.1.25's manifest
+        # read). Both halves belong in the same job.
+        def _resolve() -> Optional[tuple[int, float]]:
+            return find_nearest_poi(
+                self._latitude, self._longitude, load_poi_index()
+            )
+
+        try:
+            nearest = await self.hass.async_add_executor_job(_resolve)
+        except Exception as err:  # noqa: BLE001 - one feature, not setup
+            # v0.2.6 audit (SWF-026-009): deliberately does NOT mark
+            # resolution complete. The flag used to be set before this
+            # try block, so a single transient failure — a slow disk, a
+            # momentary I/O error during startup — permanently disabled
+            # official warnings for the whole process lifetime, with no
+            # retry until Home Assistant restarted. Failing permanently
+            # on a transient error is the wrong default; the next poll
+            # now tries again.
+            _LOGGER.warning(
+                "Could not load the Wetter-Alarm location index; will retry "
+                "on the next poll: %s", err,
+            )
+            return
+
+        # Resolution genuinely completed — mark it done so the index is
+        # not re-read every poll. Out-of-coverage counts as resolved:
+        # the answer will not change.
+        self._poi_resolved = True
+        if nearest is None:
+            return
+        poi_id, distance = nearest
+        if distance > WETTERALARM_MAX_POI_DISTANCE_KM:
+            _LOGGER.info(
+                "Nearest Wetter-Alarm location is %.0f km away, beyond the "
+                "%.0f km coverage limit — this service covers Switzerland "
+                "only, so official warnings will not be available here.",
+                distance, WETTERALARM_MAX_POI_DISTANCE_KM,
+            )
+            return
+        self.poi_id = poi_id
+        self.poi_distance_km = round(distance, 1)
+        _LOGGER.debug(
+            "Wetter-Alarm resolved to POI %s, %.1f km away", poi_id, distance
+        )
+
+    async def _async_update_data(self) -> WeatherWarning:
+        await self._async_resolve_poi()
+        if self.poi_id is None:
+            return WeatherWarning()
+
+        start = time.monotonic()
+        try:
+            async with asyncio.timeout(30):
+                payload = await self._client.async_fetch_alarms()
+        except Exception as err:  # noqa: BLE001
+            kind = self.health.record_error(err)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source=SOURCE_WETTERALARM, event_type="poll_failure",
+                    detail=str(err)[:200],
+                )
+            raise UpdateFailed(
+                f"Wetter-Alarm fetch failed ({kind} error): {err}"
+            ) from None
+
+        # Dedup on the raw alarm list. Most polls return an unchanged
+        # national list; re-deriving the same warning from it is wasted
+        # work and produces misleading "updated" timestamps.
+        fingerprint = repr(sorted(
+            (a.get("id"), a.get("priority"), tuple(sorted(a.get("poi_ids") or [])))
+            for a in (payload.get("meteo_alarms") or []) if isinstance(a, dict)
+        ))
+        changed = fingerprint != self._last_payload_fingerprint
+        self._last_payload_fingerprint = fingerprint
+
+        self.warnings = parse_all_alarms(payload, self.poi_id, self._language)
+        self.warning = self.warnings[0] if self.warnings else WeatherWarning()
+        self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+
+        if changed and self._diagnostics is not None:
+            self._diagnostics.record(
+                source=SOURCE_WETTERALARM, event_type="poll_success",
+                detail=(
+                    f"active: {self.warning.title}"
+                    if self.warning.is_active else "no active warning"
+                ),
+            )
+        return self.warning

@@ -188,7 +188,7 @@ def _install_homeassistant_stubs() -> None:
     binary_sensor_component = _module("homeassistant.components.binary_sensor")
     binary_sensor_component.BinarySensorEntity = type("BinarySensorEntity", (), {})
     binary_sensor_component.BinarySensorDeviceClass = type(
-        "BinarySensorDeviceClass", (), {"PROBLEM": "problem"}
+        "BinarySensorDeviceClass", (), {"PROBLEM": "problem", "SAFETY": "safety"}
     )
 
     _install_voluptuous_stub_only_if_really_missing()

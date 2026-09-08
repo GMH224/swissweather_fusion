@@ -26,7 +26,10 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddConfigEntryEntitiesCallback
 ) -> None:
     runtime = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([DegradedBinarySensor(entry, runtime)])
+    async_add_entities([
+        DegradedBinarySensor(entry, runtime),
+        OfficialWarningActiveBinarySensor(entry, runtime),
+    ])
 
 
 class DegradedBinarySensor(BinarySensorEntity):
@@ -75,3 +78,33 @@ class DegradedBinarySensor(BinarySensorEntity):
             for source in ALL_TELEMETRY_SOURCES
             if (health := _get_health(self._runtime, source)) is not None
         )
+
+
+class OfficialWarningActiveBinarySensor(BinarySensorEntity):
+    """Whether an official severe-weather warning is currently in force.
+
+    v0.2.6. Exists alongside the detail sensor purely for automation
+    ergonomics: a `SAFETY` binary sensor is the idiomatic thing to
+    trigger on, and expressing "is there a warning" as a state
+    comparison against a text level would be fragile.
+
+    It adds no information the detail sensor lacks — it is a different
+    view of the same fact, which is the acceptable kind of duplication.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Official weather warning active"
+    _attr_device_class = BinarySensorDeviceClass.SAFETY
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        self._entry = entry
+        self._runtime = runtime
+        self._attr_unique_id = f"{entry.entry_id}_official_warning_active"
+        self._attr_device_info = build_device_info(entry)
+        self._attr_attribution = "Warnings by Wetter-Alarm (GVB)"
+
+    @property
+    def is_on(self) -> bool:
+        coordinator = self._runtime.get("wetteralarm_coordinator")
+        warning = getattr(coordinator, "warning", None) if coordinator else None
+        return bool(warning and warning.is_active)

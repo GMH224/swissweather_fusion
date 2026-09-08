@@ -607,3 +607,27 @@ CIN_STRONG_CAP_JKG = -75.0
 CAPE_MARGINAL_PROBABILITY = 0.20
 CAPE_MODERATE_PROBABILITY = 0.45
 CAPE_STRONG_PROBABILITY = 0.60
+
+
+# ---------------------------------------------------------------------------
+# Official severe-weather warnings (v0.2.6, SWF-026-001)
+# ---------------------------------------------------------------------------
+SOURCE_WETTERALARM = "wetteralarm"
+
+# 20 minutes, not the 60 SECONDS the upstream project used.
+#
+# A severe-weather warning is the rarest event class this integration
+# handles — most days produce none at all — and the upstream cadence
+# meant 1,440 requests/day against an unauthenticated third-party
+# endpoint, more aggressive than this project's radar polling for
+# genuinely fast-changing data. Warnings are issued hours ahead by a
+# human-supervised process; 20 minutes is far inside any useful
+# response window and is a fifteenth of the request volume.
+WETTERALARM_POLL_INTERVAL = timedelta(minutes=20)
+
+# A location further than this from the nearest catalogued town is
+# almost certainly outside Switzerland, where Wetter-Alarm has no
+# coverage. Warning silently on a 200 km-distant match would be worse
+# than reporting no coverage: it would look like "no warnings" rather
+# than "wrong country".
+WETTERALARM_MAX_POI_DISTANCE_KM = 25.0

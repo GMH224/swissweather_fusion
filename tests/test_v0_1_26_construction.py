@@ -179,6 +179,14 @@ def test_retention_coordinator_constructs_with_and_without_a_lock(hass, db):
     assert without._retention_lock is not None
 
 
+def test_wetteralarm_coordinator_constructs(hass, db):
+    """v0.2.6: takes coordinates rather than a database — it holds no
+    persistent state of its own, only the current warning."""
+    c = coord.WetterAlarmCoordinator(hass, LAT, LON, diagnostics=None)
+    assert c.poi_id is None, "POI resolution must be deferred off __init__"
+    assert c.warning is not None and not c.warning.is_active
+
+
 def test_storm_reconciliation_coordinator_constructs(hass, db):
     """P2-08's new coordinator — new code has no prior call site to
     validate it against, so constructing it is the only check there is."""

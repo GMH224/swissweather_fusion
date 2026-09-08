@@ -38,6 +38,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .coordinator import (
     StormEventReconciliationCoordinator,
+    WetterAlarmCoordinator,
     CombiPrecipCoordinator,
     MeteoblueCoordinator,
     MeteonomiqsCoordinator,
@@ -269,6 +270,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         storm_reconciliation_coordinator = StormEventReconciliationCoordinator(
             hass, db, diagnostics=diagnostics_recorder
         )
+        # v0.2.6 (SWF-026-001): official Swiss severe-weather warnings.
+        # Constructed inside the same guard, so a failure here closes the
+        # database like any other construction failure (SWF-021-012).
+        wetteralarm_coordinator = WetterAlarmCoordinator(
+            hass, latitude, longitude, diagnostics=diagnostics_recorder
+        )
     except Exception:
         # Nothing is registered yet at this point, so closing the
         # connection is the whole of the required cleanup.
@@ -362,11 +369,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     derived_coordinators = (
         model_b_coordinator, blend_coordinator, learning_coordinator,
         retention_coordinator, storm_reconciliation_coordinator,
+        wetteralarm_coordinator,
     )
     derived_labels = (
         "Model B scoring", "Model A blend computation",
         "Model A learning reconciliation", "retention purge",
         "storm event reconciliation",
+        "official weather warnings",
     )
     derived_results = await asyncio.gather(
         *(c.async_config_entry_first_refresh() for c in derived_coordinators),
@@ -395,6 +404,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "learning_coordinator": learning_coordinator,
         "retention_coordinator": retention_coordinator,
         "storm_reconciliation_coordinator": storm_reconciliation_coordinator,
+        "wetteralarm_coordinator": wetteralarm_coordinator,
         "diagnostics_recorder": diagnostics_recorder,
     }
 
@@ -488,6 +498,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # that the entire Model B v1 plan depends on was, in practice,
         # still not being populated.
         storm_reconciliation_coordinator,
+        wetteralarm_coordinator,
     ):
         entry.async_on_unload(coordinator.async_add_listener(_noop))
 
@@ -514,6 +525,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             learning_coordinator,
             retention_coordinator,
             storm_reconciliation_coordinator,
+            wetteralarm_coordinator,
         ):
             await coordinator.async_shutdown()
         await hass.async_add_executor_job(db.close)
@@ -555,6 +567,7 @@ def _all_coordinators(runtime: dict) -> list:
         "learning_coordinator",
         "retention_coordinator",
         "storm_reconciliation_coordinator",
+        "wetteralarm_coordinator",
     )
     return [runtime[k] for k in keys if k in runtime]
 
