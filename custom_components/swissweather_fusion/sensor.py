@@ -1007,6 +1007,56 @@ class OfficialWarningSensor(_BaseSensor):
                 "so the two remain distinguishable."
             ),
         }
+
+        # v0.2.6 audit (SWF-026-002): concurrent warnings surfaced in
+        # full. The state carries the most severe; this carries all of
+        # them, since a frost warning alongside a thunderstorm warning is
+        # two distinct things to act on.
+        all_warnings = getattr(coordinator, "warnings", None) or []
+        if len(all_warnings) > 1:
+            attrs["concurrent_warnings"] = [
+                {
+                    "title": w.title,
+                    "level": w.level,
+                    "priority": w.priority,
+                    "valid_to": w.valid_to.isoformat() if w.valid_to else None,
+                }
+                for w in all_warnings
+            ]
+        attrs["warning_count"] = len(all_warnings)
+
+        # v0.2.7 fix (SWF-027-001): the pre-warning case. A live
+        # installation's dashboard showed "Gewittergefahr, gultig ab
+        # 20:00" on Wetter-Alarm's own site at 15:35 CET, while this
+        # sensor correctly reported "none" — is_current() deliberately
+        # excludes a warning whose valid_from is still in the future
+        # (that is what stops an EXPIRED warning showing as active,
+        # SWF-026-003). Both behaviours are correct for what they
+        # answer; the sensor just was not answering the question a
+        # dashboard needs.
+        #
+        # The main state is UNCHANGED — still "in force right now", so
+        # any automation gating on it (irrigation shutoff, closing
+        # blinds) still waits for the real thing rather than firing on a
+        # forecast. Computed before the early return below, so it
+        # appears even when nothing is currently active.
+        upcoming = getattr(coordinator, "upcoming_warnings", None) or []
+        not_yet_active = [w for w in upcoming if w not in all_warnings]
+        if not_yet_active:
+            soonest = min(
+                not_yet_active,
+                key=lambda w: w.valid_from or datetime.max.replace(tzinfo=timezone.utc),
+            )
+            attrs["next_warning"] = {
+                "title": soonest.title,
+                "level": soonest.level,
+                "priority": soonest.priority,
+                "region": soonest.region,
+                "hint": soonest.hint,
+                "valid_from": soonest.valid_from.isoformat() if soonest.valid_from else None,
+                "valid_to": soonest.valid_to.isoformat() if soonest.valid_to else None,
+            }
+
         if warning is None or not warning.is_active:
             return attrs
 

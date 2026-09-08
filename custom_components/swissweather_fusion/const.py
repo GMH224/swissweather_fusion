@@ -631,3 +631,11 @@ WETTERALARM_POLL_INTERVAL = timedelta(minutes=20)
 # than reporting no coverage: it would look like "no warnings" rather
 # than "wrong country".
 WETTERALARM_MAX_POI_DISTANCE_KM = 25.0
+
+
+# v0.2.7 (SWF-027-001): how far ahead a published-but-not-yet-started
+# warning is still surfaced. Wetter-Alarm's own "Gewittergefahr"
+# advisory is explicitly issued "several hours" ahead per their public
+# documentation; 6 hours covers that without showing warnings so far out
+# they are not yet actionable.
+WETTERALARM_LOOKAHEAD = timedelta(hours=6)

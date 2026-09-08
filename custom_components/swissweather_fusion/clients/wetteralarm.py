@@ -45,7 +45,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 _LOGGER = logging.getLogger(__name__)
@@ -111,6 +111,33 @@ class WeatherWarning:
     @property
     def is_active(self) -> bool:
         return self.alarm_id is not None
+
+    def is_upcoming(
+        self, within: timedelta, now: Optional[datetime] = None
+    ) -> bool:
+        """Whether this warning starts within `within` of `now`, or has
+        already started.
+
+        **v0.2.7 (SWF-027-001).** `is_current()` answers "is this in
+        force right now" — correct for automations that should not act
+        early, but the wrong question for a dashboard tile. Wetter-Alarm
+        publishes "Gewittergefahr" hours ahead of the event specifically
+        so the advance notice is visible; a sensor that only reveals it
+        the moment it starts defeats the purpose of a pre-warning.
+
+        A live installation's screenshot at 15:35 CET showed the app
+        displaying a warning valid from 20:00 — a real gap this method
+        closes, without changing what `is_current()`/`is_active` mean
+        for anything already depending on them.
+        """
+        if not self.is_active:
+            return False
+        moment = now or datetime.now(timezone.utc)
+        if self.valid_to is not None and moment > self.valid_to:
+            return False
+        if self.valid_from is None:
+            return True
+        return moment >= self.valid_from - within
 
     def is_current(self, now: Optional[datetime] = None) -> bool:
         """Whether this warning is in force at `now`.
@@ -241,6 +268,7 @@ def parse_all_alarms(
     poi_id: int,
     language: str = "de",
     now: Optional[datetime] = None,
+    lookahead: Optional[timedelta] = None,
 ) -> list[WeatherWarning]:
     """Every warning currently in force for `poi_id`, most severe first.
 
@@ -259,9 +287,15 @@ def parse_all_alarms(
 
     Expired alarms are excluded here — see WeatherWarning.is_current.
     """
+    # v0.2.7 (SWF-027-001): `lookahead` widens the window to include
+    # warnings that have been published but have not started yet — the
+    # pre-warning case. Defaults to 0, i.e. is_current()'s exact
+    # behaviour, so every existing caller is unaffected unless it opts
+    # in.
+    window = lookahead if lookahead is not None else timedelta(0)
     warnings = [
         w for w in _iter_matching_alarms(payload, poi_id, language)
-        if w.is_current(now)
+        if w.is_upcoming(window, now)
     ]
     warnings.sort(key=lambda w: (w.priority or 0), reverse=True)
     return warnings

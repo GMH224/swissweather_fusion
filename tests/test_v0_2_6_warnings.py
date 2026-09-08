@@ -553,3 +553,166 @@ def test_poi_index_is_not_retained_after_resolution():
     source = inspect.getsource(coord.WetterAlarmCoordinator)
     assert "self._index" not in source
     assert "self.poi_index" not in source
+
+
+# ---------------------------------------------------------------------------
+# v0.2.7 (SWF-027-001) — pre-warning visibility
+# ---------------------------------------------------------------------------
+# A live installation compared this integration's sensor against
+# Wetter-Alarm's own website at 15:35 CET (13:35 UTC) and found a real
+# gap: the website showed "Gewittergefahr, gultig ab 20:00" while the
+# sensor reported "none". Both were correct for what they answer —
+# is_current() deliberately excludes a not-yet-started warning, which is
+# what stops an EXPIRED warning showing as active (SWF-026-003) — but the
+# sensor was answering the wrong question for a dashboard.
+REAL_PAYLOAD = {"meteo_alarms": [{
+    "id": 338253, "priority": 1,
+    "valid_from": "2026-09-08T18:00:00.000Z",
+    "valid_to": "2026-09-08T23:00:00.000Z",
+    "poi_ids": [145140],
+    "de": {"title": "Gewittergefahr", "hint": "lose Gegenstände sichern"},
+    "region": {"de": {"name": "Frauenfeld"}},
+}]}
+SCREENSHOT_TIME = datetime(2026, 9, 8, 13, 35, tzinfo=timezone.utc)  # 15:35 CEST
+
+
+def test_reproduces_the_reported_gap_with_is_current():
+    """The exact scenario. This must stay False: is_current() answers
+    "in force right now" and must not change meaning."""
+    warning = wa.parse_alarms_response(REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME)
+    assert not warning.is_active
+
+
+def test_is_upcoming_closes_the_gap_at_the_same_moment():
+    """The fix, checked at the exact reported time."""
+    from swissweather_fusion.const import WETTERALARM_LOOKAHEAD
+
+    warnings = wa.parse_all_alarms(
+        REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME, lookahead=WETTERALARM_LOOKAHEAD
+    )
+    assert warnings and warnings[0].title == "Gewittergefahr"
+
+
+def test_is_upcoming_respects_the_lookahead_boundary():
+    """A warning 7 hours out must not appear with a 6-hour lookahead —
+    the point of a bound is that it bounds."""
+    far_future = datetime(2026, 9, 8, 10, 59, tzinfo=timezone.utc)  # 7h1m before 18:00
+    from datetime import timedelta
+
+    matched = [
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        if w.is_upcoming(timedelta(hours=6), far_future)
+    ]
+    assert not matched
+
+
+def test_is_upcoming_true_exactly_at_the_lookahead_edge():
+    from datetime import timedelta
+
+    exactly_6h_before = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+    matched = [
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        if w.is_upcoming(timedelta(hours=6), exactly_6h_before)
+    ]
+    assert matched
+
+
+def test_is_upcoming_still_true_once_the_warning_is_actually_active():
+    """A currently-active warning must also satisfy is_upcoming — the
+    dashboard should not lose sight of it the moment it starts."""
+    from datetime import timedelta
+
+    now = datetime(2026, 9, 8, 19, 0, tzinfo=timezone.utc)  # during the window
+    matched = [
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        if w.is_upcoming(timedelta(hours=6), now)
+    ]
+    assert matched
+
+
+def test_is_upcoming_excludes_an_expired_warning():
+    """The SWF-026-003 guarantee must survive: is_upcoming is a superset
+    of is_current going forward in time, never backward."""
+    from datetime import timedelta
+
+    after_expiry = datetime(2026, 9, 9, 1, 1, tzinfo=timezone.utc)  # 1 min past valid_to
+    matched = [
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        if w.is_upcoming(timedelta(hours=6), after_expiry)
+    ]
+    assert not matched
+
+
+def test_default_lookahead_is_zero_so_existing_callers_are_unaffected():
+    """Every caller that does not opt in gets exactly is_current()'s
+    behaviour — the fix must be additive, not a silent behaviour change
+    for automations already depending on the strict definition."""
+    with_no_lookahead = wa.parse_all_alarms(REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME)
+    assert with_no_lookahead == []
+
+
+def test_coordinator_exposes_upcoming_without_a_second_fetch():
+    """Both current and upcoming views are derived from the SAME poll —
+    no extra request against the unauthenticated endpoint."""
+    import inspect
+
+    from swissweather_fusion import coordinator as coord
+
+    source = inspect.getsource(coord.WetterAlarmCoordinator._async_update_data)
+    assert source.count("async_fetch_alarms") == 1
+    assert "upcoming_warnings" in source
+
+
+def test_next_warning_attribute_surfaces_the_soonest_pre_warning():
+    from swissweather_fusion.sensor import OfficialWarningSensor
+
+    sensor = object.__new__(OfficialWarningSensor)
+    sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": wa.WeatherWarning(),  # nothing active
+        "warnings": [],
+        "upcoming_warnings": wa.parse_all_alarms(
+            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            lookahead=__import__("datetime").timedelta(hours=6),
+        ),
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
+    assert attrs["next_warning"]["title"] == "Gewittergefahr"
+    assert attrs["next_warning"]["valid_from"] == "2026-09-08T18:00:00+00:00"
+
+
+def test_no_next_warning_key_when_nothing_upcoming():
+    """The attribute should not appear at all rather than being present
+    and null — cleaner for a template checking `next_warning is defined`."""
+    from swissweather_fusion.sensor import OfficialWarningSensor
+
+    sensor = object.__new__(OfficialWarningSensor)
+    sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": wa.WeatherWarning(), "warnings": [],
+        "upcoming_warnings": [],
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
+    assert "next_warning" not in attrs
+
+
+def test_already_active_warning_is_not_duplicated_as_next_warning():
+    """Once a warning is active it belongs in the main state; it must
+    not also appear as 'next', which would be confusing on a dashboard."""
+    from swissweather_fusion.sensor import OfficialWarningSensor
+
+    now_during = datetime(2026, 9, 8, 19, 0, tzinfo=timezone.utc)
+    active = wa.parse_all_alarms(REAL_PAYLOAD, 145140, now=now_during)
+    upcoming = wa.parse_all_alarms(
+        REAL_PAYLOAD, 145140, now=now_during,
+        lookahead=__import__("datetime").timedelta(hours=6),
+    )
+    sensor = object.__new__(OfficialWarningSensor)
+    sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": active[0], "warnings": active,
+        "upcoming_warnings": upcoming,
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
+    assert "next_warning" not in attrs
+    assert attrs["active"] is True

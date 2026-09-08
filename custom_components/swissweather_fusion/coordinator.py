@@ -51,6 +51,7 @@ from .const import (
     SOURCE_BLEND,
     SOURCE_UPDATE_CADENCE,
     SOURCE_WETTERALARM,
+    WETTERALARM_LOOKAHEAD,
     WETTERALARM_MAX_POI_DISTANCE_KM,
     WETTERALARM_POLL_INTERVAL,
     PRESSURE_PLAUSIBLE_MAX_HPA,
@@ -3118,6 +3119,11 @@ class WetterAlarmCoordinator(DataUpdateCoordinator):
         # because a frost warning and a thunderstorm warning can be in
         # force at once and dropping either loses real information.
         self.warnings: list[WeatherWarning] = []
+        # v0.2.7 (SWF-027-001): warnings published but not yet in force,
+        # within WETTERALARM_LOOKAHEAD. `warning`/`warnings` above are
+        # UNCHANGED in meaning — still "in force right now" — so nothing
+        # depending on them behaves differently.
+        self.upcoming_warnings: list[WeatherWarning] = []
 
     async def _async_resolve_poi(self) -> None:
         """Find the nearest catalogued town, once."""
@@ -3204,6 +3210,10 @@ class WetterAlarmCoordinator(DataUpdateCoordinator):
 
         self.warnings = parse_all_alarms(payload, self.poi_id, self._language)
         self.warning = self.warnings[0] if self.warnings else WeatherWarning()
+        # v0.2.7: same payload, wider window — no second fetch.
+        self.upcoming_warnings = parse_all_alarms(
+            payload, self.poi_id, self._language, lookahead=WETTERALARM_LOOKAHEAD
+        )
         self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
 
         if changed and self._diagnostics is not None:
