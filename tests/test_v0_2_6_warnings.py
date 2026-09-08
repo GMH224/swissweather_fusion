@@ -716,3 +716,106 @@ def test_already_active_warning_is_not_duplicated_as_next_warning():
     attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
     assert "next_warning" not in attrs
     assert attrs["active"] is True
+
+
+# ---------------------------------------------------------------------------
+# v0.2.8 (SWF-028-001) — flat next_warning_* attributes
+# ---------------------------------------------------------------------------
+# Home Assistant's state_attr() returns a silent None for nested dict
+# attributes in some core versions — a documented upstream bug
+# (home-assistant/core#150292). A live installation confirmed it exactly:
+# state_attr(eid, 'next_warning') returned None while Developer Tools
+# showed the dict correctly and top-level scalar attributes (title,
+# priority, region, valid_from, valid_to for an ACTIVE warning) rendered
+# fine in the same template. The bug is specific to nesting.
+def test_next_warning_scalars_are_top_level_attributes():
+    """The fix: the same fields the active-warning case already exposes
+    as top-level scalars are now available for the upcoming case too,
+    sidestepping the HA core bug entirely rather than working around it
+    in every consuming template."""
+    from swissweather_fusion.sensor import OfficialWarningSensor
+
+    sensor = object.__new__(OfficialWarningSensor)
+    sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": wa.WeatherWarning(), "warnings": [],
+        "upcoming_warnings": wa.parse_all_alarms(
+            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            lookahead=__import__("datetime").timedelta(hours=6),
+        ),
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
+
+    assert attrs["next_warning_title"] == "Gewittergefahr"
+    assert attrs["next_warning_level"] == "yellow"
+    assert attrs["next_warning_priority"] == 1
+    assert attrs["next_warning_region"] == "Frauenfeld"
+    assert attrs["next_warning_valid_from"] == "2026-09-08T18:00:00+00:00"
+    assert attrs["next_warning_valid_to"] == "2026-09-08T23:00:00+00:00"
+
+
+def test_nested_next_warning_dict_is_preserved_alongside_the_flat_fields():
+    """The nested dict is kept, not replaced — dropping it would lose
+    information for any consumer reading attributes directly in Python
+    (scripts, pyscript), where the HA core bug does not apply."""
+    from swissweather_fusion.sensor import OfficialWarningSensor
+
+    sensor = object.__new__(OfficialWarningSensor)
+    sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": wa.WeatherWarning(), "warnings": [],
+        "upcoming_warnings": wa.parse_all_alarms(
+            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            lookahead=__import__("datetime").timedelta(hours=6),
+        ),
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
+
+    assert attrs["next_warning"]["title"] == "Gewittergefahr"
+    assert attrs["next_warning_title"] == attrs["next_warning"]["title"]
+
+
+def test_has_next_warning_boolean_is_a_scalar_shortcut():
+    """A plain boolean is never affected by the nested-dict bug, so a
+    template can check `has_next_warning` without touching next_warning
+    or next_warning_title at all."""
+    from swissweather_fusion.sensor import OfficialWarningSensor
+
+    with_upcoming = object.__new__(OfficialWarningSensor)
+    with_upcoming._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": wa.WeatherWarning(), "warnings": [],
+        "upcoming_warnings": wa.parse_all_alarms(
+            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            lookahead=__import__("datetime").timedelta(hours=6),
+        ),
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    assert OfficialWarningSensor.extra_state_attributes.fget(with_upcoming)[
+        "has_next_warning"
+    ] is True
+
+    without = object.__new__(OfficialWarningSensor)
+    without._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": wa.WeatherWarning(), "warnings": [], "upcoming_warnings": [],
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    assert OfficialWarningSensor.extra_state_attributes.fget(without)[
+        "has_next_warning"
+    ] is False
+
+
+def test_no_flat_next_warning_keys_when_nothing_upcoming():
+    """The flat keys must not appear at all (not even as None) when
+    there is nothing upcoming — consistent with next_warning's own
+    absence in that case."""
+    from swissweather_fusion.sensor import OfficialWarningSensor
+
+    sensor = object.__new__(OfficialWarningSensor)
+    sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
+        "warning": wa.WeatherWarning(), "warnings": [], "upcoming_warnings": [],
+        "poi_id": 145140, "poi_distance_km": 0.5,
+    })()}
+    attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
+    assert "next_warning_title" not in attrs
+    assert "next_warning" not in attrs
+    assert attrs["has_next_warning"] is False

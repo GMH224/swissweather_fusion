@@ -1042,10 +1042,42 @@ class OfficialWarningSensor(_BaseSensor):
         # appears even when nothing is currently active.
         upcoming = getattr(coordinator, "upcoming_warnings", None) or []
         not_yet_active = [w for w in upcoming if w not in all_warnings]
+        attrs["has_next_warning"] = bool(not_yet_active)
         if not_yet_active:
             soonest = min(
                 not_yet_active,
                 key=lambda w: w.valid_from or datetime.max.replace(tzinfo=timezone.utc),
+            )
+            # v0.2.8 fix (SWF-028-001): flattened to top-level attributes,
+            # ALONGSIDE the nested dict rather than instead of it.
+            #
+            # A live installation's dashboard could not read
+            # `next_warning.title` in a Lovelace markdown card: HA's
+            # state_attr() returns a silent None for nested dict
+            # attributes in some core versions — a documented upstream
+            # bug (home-assistant/core#150292) — even though the same
+            # attribute displays correctly in Developer Tools and is
+            # reachable from Python. The active-warning attributes below
+            # (title, priority, region, valid_from, valid_to, hint) are
+            # already top-level scalars and were never affected; this
+            # gives the upcoming case the same, reliably-templatable
+            # shape.
+            #
+            # The nested `next_warning` dict is kept too — for scripts,
+            # pyscript, and any consumer reading attributes directly in
+            # Python, where the bug does not apply, dropping it would be
+            # exactly the kind of information loss this project has
+            # avoided everywhere else.
+            attrs["next_warning_title"] = soonest.title
+            attrs["next_warning_level"] = soonest.level
+            attrs["next_warning_priority"] = soonest.priority
+            attrs["next_warning_region"] = soonest.region
+            attrs["next_warning_hint"] = soonest.hint
+            attrs["next_warning_valid_from"] = (
+                soonest.valid_from.isoformat() if soonest.valid_from else None
+            )
+            attrs["next_warning_valid_to"] = (
+                soonest.valid_to.isoformat() if soonest.valid_to else None
             )
             attrs["next_warning"] = {
                 "title": soonest.title,
