@@ -57,7 +57,10 @@ _LOGGER = logging.getLogger(__name__)
 # the migration, just the trigger for it.
 # v0.1.24: bumped to 3. See _migrate_to_v3 for what changes and why this
 # one is a clean rebuild rather than an additive migration.
-SCHEMA_VERSION = 3
+# v0.3.0: bumped to 4 for the blend_comparison table and the two run-time
+# attribution columns on forecast_snapshots. See _migrate_to_v4 — that one
+# IS additive for raw data, and deliberately destructive for bucket_stats.
+SCHEMA_VERSION = 4
 
 # v0.1.23: how far back the v1->v2 migration re-opens forecast_snapshots
 # rows for a fresh, correct reconciliation pass. Deliberately reuses the
@@ -66,6 +69,31 @@ SCHEMA_VERSION = 3
 # window) rather than inventing a second number that could drift out of
 # sync with it.
 MIGRATION_REOPEN_WINDOW = timedelta(days=14)
+
+# Columns each schema version guarantees. Used by _ensure_schema to decide
+# what to migrate, on the evidence of the actual table shape rather than
+# on what schema_meta claims (v0.1.24, P2-01).
+#
+# v0.2.2 (SWF-021-008) established the rule these encode: EVERY column any
+# migration has ever added must appear here. A sentinel set that is a
+# subset of the real requirements will eventually declare a
+# partially-migrated database current.
+_V3_REQUIRED_COLUMNS = {
+    "forecast_snapshots": {"reconciliation_status"},
+    "storm_predictions": {"reconciled"},
+    "radar_observations": {"precip_accum_mm_1h", "quality"},
+}
+
+# Derived, not restated: v4 is v3 plus two columns on one table. Written
+# this way so a future v5 cannot accidentally drop a v3 requirement while
+# copying the block.
+_V4_REQUIRED_COLUMNS = {
+    **_V3_REQUIRED_COLUMNS,
+    "forecast_snapshots": (
+        _V3_REQUIRED_COLUMNS["forecast_snapshots"]
+        | {"run_initialised_at", "lead_time_basis"}
+    ),
+}
 
 _TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -97,7 +125,21 @@ CREATE TABLE IF NOT EXISTS forecast_snapshots (
     -- never be double-counted (L-01) and a late-arriving row is never
     -- invisible just because it landed after some other row's valid_at
     -- (L-02) — see ModelALearningCoordinator._reconcile().
-    reconciliation_status TEXT NOT NULL DEFAULT 'pending'
+    reconciliation_status TEXT NOT NULL DEFAULT 'pending',
+    -- v0.3.0 (W0/ARC-04): the model run's own initialisation time, as
+    -- reported by the provider, distinct from issued_at (which stays
+    -- "when this integration first saw the run" — freshness_factor and
+    -- the v0.1.19 fingerprint de-duplication both legitimately want
+    -- observation time, not run time).
+    --
+    -- NULL where the provider exposes no run time at all (SRF,
+    -- meteoblue) or where the metadata fetch failed. lead_time_basis
+    -- records which of the two a row's lead time was actually derived
+    -- from, so a bucket mixing the two is detectable rather than
+    -- silently averaged. Recording the basis is the whole point: an
+    -- undeclared mix is how this class of defect stays invisible.
+    run_initialised_at TEXT,
+    lead_time_basis TEXT NOT NULL DEFAULT 'poll'
 );
 
 -- v0.1.24 (P1-14): column renamed from precip_rate_mmh. CombiPrecip
@@ -125,6 +167,42 @@ CREATE TABLE IF NOT EXISTS bucket_stats (
     sample_count INTEGER NOT NULL DEFAULT 0,
     last_updated TEXT,
     PRIMARY KEY (hour_of_day, season, lead_time_bucket, source, measurement)
+);
+
+-- v0.3.0 (W0/ARC-05): the paired blend-vs-source comparison.
+--
+-- ONE row per (valid_at, measurement, lead_hours), holding the blend's
+-- PUBLISHED value and every contributing source's raw and debiased value
+-- as of the same moment, plus the observation once it arrives. Because
+-- all of them live on one row, they are graded on identical targets by
+-- construction — there is no way to accidentally compare two different
+-- sample populations, which is precisely what went wrong with the
+-- bucket_stats-derived comparison this replaces (see const.py).
+--
+-- `contributors` is a JSON object:
+--     {"ch1": {"raw": 12.4, "debiased": 12.1, "trusted": true,
+--              "lead_hours": 7.2, "basis": "run"}, ...}
+-- JSON rather than a second normalised table because these rows are only
+-- ever read in bulk for the report and never joined against, and because
+-- storm_predictions.features already established the pattern here.
+--
+-- UNIQUE(valid_at, measurement, lead_hours) with INSERT OR IGNORE means
+-- the FIRST observation of each cell wins. The blend coordinator runs
+-- every 10 minutes, so without this the table would take 144 samples of
+-- each cell per day instead of one, at no analytical gain.
+CREATE TABLE IF NOT EXISTS blend_comparison (
+    id INTEGER PRIMARY KEY,
+    valid_at TEXT NOT NULL,
+    measurement TEXT NOT NULL,
+    lead_hours INTEGER NOT NULL,
+    issued_at TEXT NOT NULL,
+    lead_time_basis TEXT NOT NULL DEFAULT 'poll',
+    blend_value REAL NOT NULL,
+    contributors TEXT NOT NULL,
+    actual_value REAL,
+    reconciled_at TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    UNIQUE (valid_at, measurement, lead_hours)
 );
 
 CREATE TABLE IF NOT EXISTS storm_events (
@@ -190,6 +268,13 @@ CREATE INDEX IF NOT EXISTS idx_forecast_pending
     WHERE reconciliation_status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_predictions_reconciled
     ON storm_predictions(reconciled, ts);
+-- v0.3.0: blend_comparison. Here, not in _TABLE_SQL, for the reason set
+-- out at length above — the rule now has no exceptions to remember.
+CREATE INDEX IF NOT EXISTS idx_blend_comparison_pending
+    ON blend_comparison(status, valid_at)
+    WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_blend_comparison_report
+    ON blend_comparison(status, measurement, lead_hours);
 """
 
 
@@ -310,14 +395,29 @@ class SwissWeatherDB:
         # partially-migrated database current — the same class of silent
         # wrongness the shape-based detection replaced metadata-trust to
         # avoid.
-        required = {
-            "forecast_snapshots": {"reconciliation_status"},
-            "storm_predictions": {"reconciled"},
-            "radar_observations": {"precip_accum_mm_1h", "quality"},
-        }
+        # v0.3.0: the per-version requirement sets are named separately
+        # and the current one is DERIVED from the previous one, rather
+        # than being two hand-maintained lists that must be kept in
+        # agreement. _V3_REQUIRED_COLUMNS decides whether the v3 rebuild
+        # is needed; _V4_REQUIRED_COLUMNS decides whether anything is
+        # needed at all.
+        #
+        # The first attempt here tested a single column
+        # (forecast_snapshots.reconciliation_status) to decide whether to
+        # run _migrate_to_v3. That is wrong for exactly the reason the
+        # v0.2.2 fix (SWF-021-008) documents: a v2 database HAS that
+        # column and still lacks storm_predictions.reconciled, so the v3
+        # rebuild was skipped and _INDEX_SQL then failed with
+        # "no such column: reconciled" — reproducing the v0.1.24 setup
+        # outage this whole ordering exists to prevent. Caught by
+        # tests/test_v0_1_26_construction.py before release.
+        looks_v3 = all(
+            columns <= actual.get(table, set())
+            for table, columns in _V3_REQUIRED_COLUMNS.items()
+        )
         looks_current = all(
             columns <= actual.get(table, set())
-            for table, columns in required.items()
+            for table, columns in _V4_REQUIRED_COLUMNS.items()
         )
         # Metadata absence is used only as a SECONDARY signal: a database
         # with no data tables and no version row is genuinely new. It can
@@ -335,7 +435,18 @@ class SwissWeatherDB:
 
         # Tables exist but are not at the current shape. Migrate on the
         # evidence of the shape itself, not on what the metadata claims.
-        self._migrate_to_v3()
+        #
+        # v0.3.0: the two migrations are dispatched separately rather than
+        # chained unconditionally. _migrate_to_v3 DROPS radar_observations,
+        # storm_predictions and storm_events, which is correct for a
+        # pre-v3 database (those rows mean something different there) and
+        # gratuitously destructive for a v3 one, where the only thing
+        # v0.3.0 changes is bucket_stats. Running it on every upgrade
+        # would throw away Model B history nothing in this release
+        # touches.
+        if not looks_v3:
+            self._migrate_to_v3()
+        self._migrate_to_v4()
         self._conn.executescript(_INDEX_SQL)
         self._write_schema_version()
         self._conn.commit()
@@ -372,6 +483,73 @@ class SwissWeatherDB:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(SCHEMA_VERSION),),
         )
+
+    def _migrate_to_v4(self) -> None:
+        """v0.3.0: run-time attribution columns, and a deliberate wipe of
+        learned state.
+
+        **Additive for raw data.** forecast_snapshots gains two columns;
+        every existing row keeps its values and defaults to the 'poll'
+        basis, which is a true statement about those rows — they WERE
+        derived from poll time. blend_comparison is a new table and needs
+        no migration at all: _TABLE_SQL creates it, because
+        `CREATE TABLE IF NOT EXISTS` is only a silent no-op for a table
+        that already exists, and this one does not.
+
+        **Destructive for bucket_stats, by explicit maintainer decision.**
+        Unlike v0.1.24's rebuild, nothing here changes what a learned
+        weight MEANS — ema_bias and ema_abs_error carry exactly the same
+        semantics before and after. The wipe is therefore a choice rather
+        than a necessity, and it was made on the reasoning that a clean
+        start is simpler than reasoning about buckets that mix
+        poll-relative and run-relative lead times.
+
+        Two consequences worth stating plainly rather than discovering
+        later:
+
+        1. Every source returns to cold start, so the blend degenerates
+           to a plain average of raw values until buckets refill. Expect
+           a visible accuracy dip for the first days. That is the wipe,
+           not a regression.
+        2. The SON season buckets accumulated since 1 September are lost
+           along with everything else.
+
+        forecast_snapshots is preserved, so reconciliation refills
+        bucket_stats from raw history rather than from nothing.
+        """
+        _LOGGER.warning(
+            "Migrating SwissWeather Fusion database to schema v%s: adding "
+            "run-time attribution columns, and CLEARING all learned "
+            "bucket_stats by explicit configuration decision (v0.3.0). Raw "
+            "forecasts, station observations and Model B history are "
+            "preserved. Every source restarts at cold start and the blend "
+            "will average raw values until buckets refill — this is "
+            "expected, not a fault.",
+            SCHEMA_VERSION,
+        )
+
+        cols = self._table_shape()
+        existing = cols.get("forecast_snapshots", set())
+        # Guarded individually rather than as a pair: a database that was
+        # interrupted partway through this migration has one column and
+        # not the other, and ALTER TABLE ADD COLUMN raises on a duplicate.
+        if "run_initialised_at" not in existing:
+            self._conn.execute(
+                "ALTER TABLE forecast_snapshots ADD COLUMN run_initialised_at TEXT"
+            )
+        if "lead_time_basis" not in existing:
+            self._conn.execute(
+                "ALTER TABLE forecast_snapshots "
+                "ADD COLUMN lead_time_basis TEXT NOT NULL DEFAULT 'poll'"
+            )
+
+        self._conn.execute("DELETE FROM bucket_stats")
+        # blend_comparison rows written before this point (there are none
+        # in any released version, but a database from an interrupted
+        # upgrade could hold some) would have been graded against a
+        # different learned state. Cheaper to discard than to reason about.
+        self._conn.execute("DELETE FROM blend_comparison")
+        self._conn.commit()
 
     def _migrate_to_v3(self) -> None:
         """v0.1.24: rebuild the learning and event tables from scratch.
@@ -596,16 +774,49 @@ class SwissWeatherDB:
             self._conn.commit()
 
     def insert_forecast_snapshots_bulk(
-        self, rows: Iterable[tuple[str, str, str, str, Optional[float], str]]
+        self, rows: Iterable[tuple]
     ) -> None:
-        """Bulk insert to keep one poll cycle to one transaction."""
-        with self._lock:
-            self._conn.executemany(
-                "INSERT INTO forecast_snapshots "
-                "(source, issued_at, valid_at, variable, value, trigger_reason) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                rows,
+        """Bulk insert to keep one poll cycle to one transaction.
+
+        Accepts either the six-tuple
+        (source, issued_at, valid_at, variable, value, trigger_reason)
+        or the v0.3.0 eight-tuple with (run_initialised_at,
+        lead_time_basis) appended.
+
+        **Why both rather than one.** Every existing caller passes six —
+        including the blend's own self-verification rows, which have no
+        model run behind them and never will. Forcing those to pad two
+        NULLs would be noise at every call site, and a required parameter
+        that is meaningless for half its callers invites someone to pass
+        something plausible rather than nothing. The narrow form is not
+        deprecated; it is correct for sources that have no run time.
+        """
+        rows = list(rows)
+        if not rows:
+            return
+        widths = {len(r) for r in rows}
+        if widths - {6, 8}:
+            raise ValueError(
+                f"forecast_snapshots rows must have 6 or 8 fields, got {sorted(widths)}"
             )
+        wide = [r for r in rows if len(r) == 8]
+        narrow = [r for r in rows if len(r) == 6]
+        with self._lock:
+            if narrow:
+                self._conn.executemany(
+                    "INSERT INTO forecast_snapshots "
+                    "(source, issued_at, valid_at, variable, value, trigger_reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    narrow,
+                )
+            if wide:
+                self._conn.executemany(
+                    "INSERT INTO forecast_snapshots "
+                    "(source, issued_at, valid_at, variable, value, trigger_reason, "
+                    " run_initialised_at, lead_time_basis) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    wide,
+                )
             self._conn.commit()
 
     def get_reference_value(
@@ -989,6 +1200,130 @@ class SwissWeatherDB:
     # summed weights, which is what its docstring's claim about
     # renormalization was describing a design that no longer exists.
 
+    # -- paired blend comparison (v0.3.0, W0/ARC-05) -----------------------------
+
+    def insert_blend_comparisons_bulk(
+        self, rows: Iterable[tuple]
+    ) -> int:
+        """Record paired comparison rows; first write per cell wins.
+
+        Each tuple is
+        (valid_at, measurement, lead_hours, issued_at, lead_time_basis,
+         blend_value, contributors_json).
+
+        INSERT OR IGNORE against the UNIQUE(valid_at, measurement,
+        lead_hours) constraint. The blend coordinator runs every ten
+        minutes and would otherwise re-record the same cell 144 times a
+        day; keeping the first is both cheaper and more honest, since the
+        first observation of a 24-hour-lead cell is the one actually made
+        24 hours ahead.
+
+        Returns the number of rows genuinely inserted, which the caller
+        logs — a count that collapses to zero forever would mean the
+        dedupe key is wrong, and that is worth being able to see.
+        """
+        rows = list(rows)
+        if not rows:
+            return 0
+        with self._lock:
+            cur = self._conn.executemany(
+                "INSERT OR IGNORE INTO blend_comparison "
+                "(valid_at, measurement, lead_hours, issued_at, "
+                " lead_time_basis, blend_value, contributors) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            self._conn.commit()
+            return cur.rowcount or 0
+
+    def get_pending_blend_comparisons(self, until_ts: str) -> list[sqlite3.Row]:
+        """Comparison rows whose target hour has passed and which have no
+        observation yet."""
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT * FROM blend_comparison "
+                "WHERE status = 'pending' AND valid_at <= ? "
+                "ORDER BY valid_at ASC",
+                (until_ts,),
+            )
+            return cur.fetchall()
+
+    def apply_blend_comparison_batch(
+        self,
+        reconciled: list[tuple[float, str, int]],
+        abandoned_ids: list[int],
+    ) -> None:
+        """Write observations and abandonments in ONE transaction.
+
+        `reconciled` holds (actual_value, reconciled_at, row_id).
+
+        Single transaction for the same reason apply_reconciliation_batch
+        is one (v0.1.24 P0-01): a crash between writing the observation
+        and flipping the status would leave a row that is scored but
+        still selectable, and the next pass would score it again. Unlike
+        bucket_stats this table is idempotent under replay — the second
+        write sets the same value — but relying on that is a weaker
+        guarantee than not needing it.
+        """
+        if not reconciled and not abandoned_ids:
+            return
+        with self._lock:
+            try:
+                if reconciled:
+                    self._conn.executemany(
+                        "UPDATE blend_comparison "
+                        "SET actual_value = ?, reconciled_at = ?, "
+                        "    status = 'reconciled' "
+                        "WHERE id = ?",
+                        reconciled,
+                    )
+                if abandoned_ids:
+                    placeholders = ",".join("?" for _ in abandoned_ids)
+                    self._conn.execute(
+                        f"UPDATE blend_comparison SET status = 'abandoned' "
+                        f"WHERE id IN ({placeholders})",
+                        tuple(abandoned_ids),
+                    )
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def get_reconciled_blend_comparisons(
+        self, limit: Optional[int] = None
+    ) -> list[sqlite3.Row]:
+        """Every scored comparison row, newest first, for the report."""
+        sql = (
+            "SELECT * FROM blend_comparison WHERE status = 'reconciled' "
+            "AND actual_value IS NOT NULL ORDER BY valid_at DESC"
+        )
+        params: tuple = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (limit,)
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
+
+    def trim_blend_comparison(self, max_rows: int) -> int:
+        """Keep the newest `max_rows` rows; delete the rest.
+
+        A row-count cap rather than an age cap, and applied regardless of
+        the configured purge_days, because this table exists to answer one
+        question over a fixed evaluation window and an installation with
+        purge_days = 0 must not be able to grow it without limit. That
+        combination — measurement table plus retention disabled — is
+        exactly the reporting installation this release was built for.
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM blend_comparison WHERE id NOT IN ("
+                "  SELECT id FROM blend_comparison ORDER BY valid_at DESC LIMIT ?"
+                ")",
+                (max_rows,),
+            )
+            self._conn.commit()
+            return cur.rowcount or 0
+
     # -- storm events (Model B ground truth) -------------------------------------
 
     def insert_storm_event(
@@ -1066,6 +1401,17 @@ class SwissWeatherDB:
                 (cutoff_ts,),
             )
             deleted["forecast_snapshots"] = cur.rowcount
+            # v0.3.0: comparison rows still waiting for an observation
+            # are protected exactly as pending forecast rows are, and for
+            # the same reason — a purge window shorter than the abandon
+            # age would silently delete the measurement instead of letting
+            # it complete.
+            cur = self._conn.execute(
+                "DELETE FROM blend_comparison "
+                "WHERE valid_at < ? AND status != 'pending'",
+                (cutoff_ts,),
+            )
+            deleted["blend_comparison"] = cur.rowcount
             for table, ts_col in (
                 ("station_observations", "ts"),
                 ("radar_observations", "ts"),
@@ -1350,6 +1696,15 @@ class SwissWeatherDB:
                 cur = self._conn.execute("DELETE FROM bucket_stats")
                 buckets_cleared = cur.rowcount or 0
 
+                # v0.3.0: comparison rows are graded partly on each
+                # source's DEBIASED value, which is a function of the
+                # bucket_stats being cleared on the line above. Rows
+                # scored against learned state that no longer exists
+                # would silently mix two regimes in one report, so they
+                # go with it.
+                cur = self._conn.execute("DELETE FROM blend_comparison")
+                comparisons_cleared = cur.rowcount or 0
+
                 observations_cleared = 0
 
                 # v0.2.3 (SWF-023-001): clear pressure observations that
@@ -1401,13 +1756,16 @@ class SwissWeatherDB:
                 raise
 
         _LOGGER.warning(
-            "Learning reset: %d bucket(s) discarded, %d implausible observation(s) "
-            "cleared, %d recent forecast(s) re-opened for reconciliation. "
-            "Relearning starts on the next cycle.",
-            buckets_cleared, observations_cleared, forecasts_reopened,
+            "Learning reset: %d bucket(s) discarded, %d comparison row(s) "
+            "discarded, %d implausible observation(s) cleared, %d recent "
+            "forecast(s) re-opened for reconciliation. Relearning starts on "
+            "the next cycle.",
+            buckets_cleared, comparisons_cleared, observations_cleared,
+            forecasts_reopened,
         )
         return {
             "buckets_cleared": buckets_cleared,
+            "comparisons_cleared": comparisons_cleared,
             "observations_cleared": observations_cleared,
             "forecasts_reopened": forecasts_reopened,
         }
@@ -1429,6 +1787,7 @@ class SwissWeatherDB:
                 "bucket_stats",
                 "storm_predictions",
                 "storm_events",
+                "blend_comparison",
             ):
                 try:
                     cur = self._conn.execute(f"SELECT COUNT(*) AS n FROM {table}")

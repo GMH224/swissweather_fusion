@@ -306,6 +306,35 @@ async def async_get_config_entry_diagnostics(
         "last_reconciled_count": getattr(learning_coordinator, "last_reconciled_count", None),
     }
 
+    # v0.3.0 (W0/ARC-05): the paired comparison report, in full.
+    #
+    # **This block is the deliverable of the v0.3.0 release.** The whole
+    # point of W0 is that in two to three months someone can download
+    # diagnostics once and answer "does the blend beat the best single
+    # source?" from the file alone, without shell access to the database.
+    # So the per-cell table goes in complete, with every sample count,
+    # rather than summarised down to a verdict.
+    #
+    # Redaction: this structure contains only measurement names, source
+    # names, integer lead hours, error magnitudes and UTC timestamps.
+    # There are no coordinates, no credentials and no free-text provider
+    # strings, so nothing here can carry the embedded-URL leak that
+    # v0.1.20 found in diagnostics_events. It still passes through
+    # redact_diagnostic_payload with the rest of the document rather
+    # than being special-cased around it — a block exempted from
+    # redaction because it "obviously" needs none is how the v0.1.20
+    # defect existed in the first place.
+    blend_comparison = getattr(learning_coordinator, "blend_comparison", None)
+    internal_coordinators["blend_comparison"] = blend_comparison or {
+        "note": (
+            "No paired comparison data yet. Rows accumulate from the first "
+            "blend cycle after upgrade; each needs its target hour to pass "
+            "and a station observation to arrive, so the first scored rows "
+            "appear about an hour after upgrade and the 48-hour lead cells "
+            "two days after that."
+        ),
+    }
+
     # v0.1.20 fix: this used to be `recorder.get_events() if recorder is
     # not None else []` — passed straight through with NO redaction at
     # all, despite the "note" text below always having claimed

@@ -19,10 +19,18 @@ see tests/test_open_meteo.py.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from ..const import (
+    OPEN_METEO_METADATA_MODELS,
+    OPEN_METEO_METADATA_URL_TEMPLATE,
+)
 from ..fingerprint import compute_content_fingerprint
+
+import logging
+
+_LOGGER = logging.getLogger(__name__)
 
 FREE_HOST = "api.open-meteo.com"
 # Confirmed from Open-Meteo's own docs: using an apikey requires this
@@ -365,6 +373,85 @@ def extract_error_reason(payload: dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ModelMetadata:
+    """One model's run timing, from Open-Meteo's metadata endpoint.
+
+    v0.3.0 (W0/ARC-04). Only the fields this project actually reads are
+    kept; the endpoint returns more (grid CRS, chunk length) and Open-Meteo
+    documents that it will return more still in future. Ignoring the rest
+    rather than storing it wholesale keeps redaction review bounded.
+    """
+
+    model: str
+    run_initialised_at: datetime
+    run_available_at: Optional[datetime]
+    update_interval: Optional[timedelta]
+    fetched_at: datetime
+
+    @property
+    def publication_lag(self) -> Optional[timedelta]:
+        """How long after initialisation the run became fetchable.
+
+        The number ARC-04 is about. Measured live on 2026-09-10 at 5h09m
+        for AROME HD against 1h56m for ICON-CH1 — a spread wide enough
+        that treating poll time as run time mis-grades one source against
+        another by hours.
+        """
+        if self.run_available_at is None:
+            return None
+        return self.run_available_at - self.run_initialised_at
+
+
+def build_metadata_url(model: str, api_key: Optional[str] = None) -> str:
+    host = CUSTOMER_HOST if api_key else FREE_HOST
+    return OPEN_METEO_METADATA_URL_TEMPLATE.format(host=host, model=model)
+
+
+def parse_metadata_response(model: str, payload: dict[str, Any]) -> Optional[ModelMetadata]:
+    """Parse a metadata response, or return None if it is not one.
+
+    Returns None rather than raising on a missing or unparseable
+    initialisation time. The caller treats None as "no run time
+    available", which is the same state SRF and meteoblue are permanently
+    in, so the degradation path is one that already exists and is already
+    exercised — not a new branch that only runs when something breaks.
+    """
+    raw = payload.get("last_run_initialisation_time")
+    if raw is None:
+        return None
+    try:
+        initialised = datetime.fromtimestamp(int(raw), timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+    available: Optional[datetime] = None
+    raw_available = payload.get("last_run_availability_time")
+    if raw_available is not None:
+        try:
+            available = datetime.fromtimestamp(int(raw_available), timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            available = None
+
+    interval: Optional[timedelta] = None
+    raw_interval = payload.get("update_interval_seconds")
+    if raw_interval is not None:
+        try:
+            seconds = int(raw_interval)
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds > 0:
+            interval = timedelta(seconds=seconds)
+
+    return ModelMetadata(
+        model=model,
+        run_initialised_at=initialised,
+        run_available_at=available,
+        update_interval=interval,
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+
 class OpenMeteoClient:
     """Requires an aiohttp.ClientSession, normally HA's shared session via
     homeassistant.helpers.aiohttp_client.async_get_clientsession(hass).
@@ -425,3 +512,58 @@ class OpenMeteoClient:
             resp.raise_for_status()
             payload = await resp.json()
         return parse_elevation_response(payload)
+
+    async def async_fetch_model_metadata(
+        self, source: str
+    ) -> Optional[ModelMetadata]:
+        """Fetch one model's run timing. Never raises.
+
+        **v0.3.0 (W0/ARC-04).** Returns None for any failure — unknown
+        source, HTTP error, wrong shape, timeout, or a URL that turns out
+        not to exist. That is deliberate and it is the single most
+        important property of this method.
+
+        The metadata endpoint is an *enhancement* to lead-time
+        attribution, not a dependency of it. If it is unavailable, rows
+        keep the 'poll' basis and the integration behaves exactly as
+        v0.2.8 did. Letting a metadata failure propagate would mean a
+        change to a free, optional, non-rate-limited side-channel could
+        take down forecast collection — trading a real capability for a
+        measurement refinement, which is the wrong way round.
+
+        This matters more than usual here because the request path is the
+        one constant in this release that was not verified against a live
+        call (see const.py: OPEN_METEO_METADATA_URL_TEMPLATE). If it is
+        wrong, this returns None forever and nothing else changes.
+
+        Open-Meteo documents metadata calls as not counted against
+        request limits, so the ten-second timeout is about not blocking a
+        cycle rather than about quota.
+        """
+        import aiohttp
+
+        model = OPEN_METEO_METADATA_MODELS.get(source)
+        if model is None:
+            return None
+        url = build_metadata_url(model, self._api_key)
+        try:
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                if resp.status != 200:
+                    _LOGGER.debug(
+                        "Open-Meteo metadata for %s returned HTTP %s; "
+                        "lead times stay poll-relative",
+                        source, resp.status,
+                    )
+                    return None
+                payload = await resp.json(content_type=None)
+        except Exception as err:  # noqa: BLE001 - see docstring
+            _LOGGER.debug(
+                "Open-Meteo metadata fetch for %s failed (%s); "
+                "lead times stay poll-relative", source, err,
+            )
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return parse_metadata_response(model, payload)

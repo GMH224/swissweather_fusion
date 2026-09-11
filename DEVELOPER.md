@@ -1976,6 +1976,93 @@ a test that fails if it reverts to a mean.
 Keep `derive_condition()`. Sources that provide none of the newer fields
 still depend on it.
 
+## v0.3.0 — why the old accuracy comparison was wrong
+
+Full record: `swissweather_fusion_v0.3.0_release_audit.md`. The design
+decision worth understanding before reading `models/comparison.py`:
+
+### Two averages over different populations are not a comparison
+
+v0.2.4 recorded the blend back into `forecast_snapshots` as a
+pseudo-source so it would be reconciled "like any other", then compared
+the blend's aggregate `ema_abs_error` against the best provider's. The
+recording part works. The comparison does not, and the reason is worth
+internalising because the same shape of mistake is easy to make again:
+
+* a provider writes a bucket sample for **every reconcilable hour of
+  every run** — for ICON-CH1 at 3-hour cadence over a 33-hour horizon,
+  roughly two hundred samples per measurement per day, spread across
+  `short`, `medium` and `long`;
+* the blend wrote at **six fixed lead offsets**, the longest 48 hours, so
+  its rows occupied `short` and `medium` and never `long` at all.
+
+Both numbers are real. Neither is wrong on its own. Comparing them is
+invalid, because forecast error grows with lead time and the two
+averages are taken over different lead-time distributions. The blend was
+graded on an easier exam.
+
+Concretely, with `blend = [(0.5, 100), (0.8, 100)]` and
+`ch1 = [(0.4, 100), (0.7, 100), (2.0, 100)]`: ch1 is better than the
+blend at **every horizon they share**, and the old comparison reports the
+blend winning 0.65 to 1.03, because ch1's long-lead error is averaged
+into the number called "ch1's accuracy".
+
+There was a second, smaller error stacked on top: the blend
+pseudo-source accumulated an `ema_bias` like any other source, so its
+reported error was that of a *post-hoc debiased blend* — which the
+integration never publishes.
+
+### The rule that replaces it
+
+One row per (valid_at, measurement, lead_hours), carrying the blend's
+published value and every source's raw and debiased value together. Then:
+
+```
+margin(S) = MAE(S   over rows where S and the blend both spoke)
+          - MAE(blend over exactly those same rows)
+```
+
+Two properties that matter:
+
+* **The blend's MAE is recomputed per source**, not taken globally. If
+  meteoblue only speaks on half the hours, it is compared against the
+  blend's error *on those hours*.
+* **The benchmark is the strongest single source**, not the average one.
+  The alternative to running this project is not "use the average
+  source"; it is "use whichever one turns out to be good here".
+
+### Why `None` is a first-class answer
+
+`verdict()` returns `None` when no cell has enough samples, and every
+caller reports sample counts beside it. A `None` with `total_pairs: 0`
+means *not yet*; a `None` with `total_pairs: 40000` means *something is
+broken*. Collapsing the two into `False` is how SWF-P1-007 hid a
+completely broken accuracy sensor for four releases.
+
+### One definition, not two
+
+`model_a.debiased_value()` and
+`ModelABlendCoordinator._contributions_at()` were both extracted from
+existing code so the comparison grades sources on **the same numbers the
+blend used**. Recomputing `raw - bias` at the comparison site would have
+been three lines, and would have silently diverged the first time the
+cold-start rule changed — leaving a comparison that evaluated a
+counterfactual the blend never considered, while looking correct.
+
+### `issued_at` vs `run_initialised_at`
+
+`issued_at` is when this integration first *saw* a run. That is the right
+input for `freshness_factor` and for fingerprint de-duplication, and the
+wrong input for lead time. v0.3.0 stores both, plus `lead_time_basis`
+recording which was available, so a bucket mixing the two is detectable
+rather than silently averaged.
+
+Measured publication lag, 15:00Z run on 2026-09-10: ICON-CH1 1h52m,
+ICON-D2 1h29m. A 22-minute spread, which a 24-hour bucket absorbs — which
+is why `derive_lead_time_bucket` still keys off `issued_at` for now.
+AROME HD's lag is 5h09m, and that three-hour differential is what makes
+run-relative bucketing a precondition for adding it.
+
 ## Known gaps (the honest list, updated for v0.2.0)
 
 **Closed since v0.1.1:**
@@ -1990,8 +2077,40 @@ still depend on it.
   forecast.
 - `storm_events` finally has a writer (P2-08).
 
+**Closed in v0.3.0:**
+
+- **The blend-vs-best-source comparison.** It could report a win while
+  the published forecast was worse than its best input — see the v0.3.0
+  section above. Replaced by a paired comparison; the old
+  `blend_beats_best_source` attribute is gone.
+- **Unbounded growth of the measurement table on `purge_days = 0`
+  installations.** `blend_comparison` is trimmed to a row cap regardless
+  of the retention setting, because a table that exists to answer one
+  question over a fixed window must not be able to grow without limit
+  just because retention is off.
+
 **Still open:**
 
+- **Whether the fusion is worth it at all.** This is now measurable and
+  not yet measured. `sensor.*_blend_comparison` accumulates the answer;
+  two to three months of data are needed before it means anything. If it
+  comes back negative, the right response is to simplify toward the best
+  single source rather than to add more sources.
+- **Only temperature, humidity and pressure are compared.** Class B
+  parameters — precipitation, gusts, cloud cover — have no local ground
+  truth, so nothing measures them, and they are what most people judge a
+  forecast by. Closing this means reconciling precipitation against
+  CombiPrecip radar, which changes the class taxonomy. Strongest v0.4
+  candidate.
+- **`run_initialised_at` is recorded but not yet used for bucketing.**
+  The measured lag spread across current sources is 22 minutes, which a
+  24-hour bucket absorbs. It becomes a precondition when AROME (5h09m
+  lag) is added.
+- **Correlation between sources is still unhandled.** Three of five
+  sources are ICON, and for Class B and C parameters the fusion layer
+  discards source identity before combining, so no family rule is even
+  expressible against the current interface. Deferred to W3, and gated on
+  what the measurement above reports.
 - **`purge_days` on existing installations.** The 90-day default added in
   v0.1.24 applies to new installs only; entries created earlier keep
   `purge_days = 0` ("keep forever"). Deliberately not migrated — silently

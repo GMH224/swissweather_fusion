@@ -473,7 +473,12 @@ def test_reset_preserves_raw_forecasts_and_observations(db):
 
 def test_reset_on_a_fresh_database_is_a_harmless_noop(db):
     assert db.reset_all_learning() == {
-        "buckets_cleared": 0, "observations_cleared": 0, "forecasts_reopened": 0,
+        # v0.3.0: comparisons_cleared joins the report. Comparison rows
+        # are scored partly on each source's debiased value, which is a
+        # function of the bucket_stats being cleared, so they cannot
+        # survive a reset that clears those buckets.
+        "buckets_cleared": 0, "comparisons_cleared": 0,
+        "observations_cleared": 0, "forecasts_reopened": 0,
     }
 
 

@@ -137,7 +137,11 @@ def test_freshness_is_applied_to_learned_weights_only():
     Scaling it would break that relationship."""
     import inspect
 
-    source = inspect.getsource(coord.ModelABlendCoordinator._blend_at)
+    # v0.3.0: the contribution-building loop moved out of _blend_at into
+    # _contributions_at, so that the paired comparison grades sources on
+    # the same contributions the blend used. The invariant this test
+    # guards is unchanged and now lives in the new function.
+    source = inspect.getsource(coord.ModelABlendCoordinator._contributions_at)
     cold_start = source[source.index("if bucket is None"):source.index("else:")]
     assert "freshness" not in cold_start
 
@@ -205,10 +209,27 @@ def test_blend_output_is_never_fed_back_into_the_blend(db):
     assert result == pytest.approx(20.0), "the blend consumed its own output"
 
 
-def test_accuracy_reports_whether_the_blend_beats_the_best_source(db):
-    """The falsifiability scoreboard. If blend_mae does not undercut
-    best_source_mae, the learned bias correction is not earning its
-    complexity — and that is worth knowing."""
+def test_per_source_and_blend_mae_are_still_reported(db):
+    """v0.2.4's per-source figures survive; its VERDICT does not.
+
+    This test used to assert
+    ``mae["blend_beats_best_source"] is True`` for this fixture, and it
+    passed. v0.3.0 removed that key, and the reason is worth stating
+    where the old assertion stood rather than only in the changelog.
+
+    The two numbers below are both real, and comparing them is still
+    invalid. blend_mae is drawn from the blend pseudo-source's buckets,
+    which exist only at six lead offsets none beyond 48 hours;
+    best_source_mae is drawn from a provider's buckets, which span every
+    reconcilable hour of every run including the long lead-time bucket.
+    Error grows with lead time, so the blend was being scored on an
+    easier set of forecasts — and the old assertion could therefore hold
+    while the shipped forecast was worse than simply using ch2.
+
+    See tests/test_v0_3_0_w0.py::test_the_old_unpaired_comparison_can_
+    report_a_win_when_the_blend_actually_loses, which constructs exactly
+    that case and demonstrates it.
+    """
     from swissweather_fusion.storage.db import BucketKey
 
     def seed(source, err):
@@ -231,27 +252,8 @@ def test_accuracy_reports_whether_the_blend_beats_the_best_source(db):
     assert mae["blend_mae"] == pytest.approx(0.6)
     assert mae["best_source"] == "ch2"
     assert mae["best_source_mae"] == pytest.approx(0.9)
-    assert mae["blend_beats_best_source"] is True
-
-
-def test_accuracy_reports_honestly_when_the_blend_loses(db):
-    """The result must be reported either way. A scoreboard that can only
-    show a win is not a scoreboard."""
-    from swissweather_fusion.storage.db import BucketKey
-
-    for source, err in (("ch1", 0.5), (SOURCE_BLEND, 1.4)):
-        key = BucketKey(
-            hour_of_day=12, season="summer", lead_time_bucket="short",
-            source=source, measurement="temperature",
-        )
-        db.apply_reconciliation_batch(
-            [(key, 0.0, err, 1.0, 50, "2026-09-02T12:00:00+00:00")], [], []
-        )
-
-    learning = coord.ModelALearningCoordinator(
-        FakeHass(), db, reconcile_lock=asyncio.Lock()
-    )
-    assert learning._compute_temperature_mae()["blend_beats_best_source"] is False
+    assert "blend_beats_best_source" not in mae
+    assert mae["superseded_by"] == "blend_comparison"
 
 
 # ---------------------------------------------------------------------------

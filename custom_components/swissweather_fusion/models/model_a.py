@@ -270,6 +270,34 @@ def _clamp_learned_weight(weight: float | None, reference: float) -> float:
     return max(floor, min(ceiling, weight))
 
 
+def debiased_value(contribution: SourceContribution) -> Optional[float]:
+    """The value this source actually contributes to the blend.
+
+    **v0.3.0 (W0/ARC-05).** Extracted from blend()'s loop, which now
+    calls it, so there is exactly one definition of "what does this
+    source contribute" in the codebase.
+
+    The extraction exists because the paired blend-vs-source comparison
+    (storage/db.py: blend_comparison) has to grade each source on the
+    same number the blend itself used. Recomputing `raw - bias` at the
+    comparison site would have been three lines and would have silently
+    diverged the first time the cold-start rule changed — the comparison
+    would then have been measuring a counterfactual that the blend never
+    evaluated, while looking correct.
+
+    Returns None for a None raw_value, matching blend()'s treatment of a
+    source that has nothing to say for this hour.
+    """
+    if contribution.raw_value is None:
+        return None
+    if contribution.sample_count < MIN_SAMPLES_TO_TRUST_BUCKET:
+        # Cold-start guard: below the trust threshold a source
+        # contributes its raw value, because a partially-learned bias is
+        # worse than no correction at all.
+        return contribution.raw_value
+    return contribution.raw_value - contribution.ema_bias
+
+
 def blend(contributions: list[SourceContribution]) -> float | None:
     """Debias each source, then weight-blend the debiased values.
 
@@ -336,15 +364,14 @@ def blend(contributions: list[SourceContribution]) -> float | None:
     weighted_sum = 0.0
     weight_total = 0.0
     for c in usable:
+        debiased = debiased_value(c)
         if c.sample_count < MIN_SAMPLES_TO_TRUST_BUCKET:
-            debiased = c.raw_value
             # v0.1.24 fix (IND-01): the cold-start weight is now drawn
             # from the same scale as the learned weights in this blend,
             # instead of the hard-coded 1.0 that made the two
             # incomparable. See _reference_weight below.
             weight = reference
         else:
-            debiased = c.raw_value - c.ema_bias
             weight = _clamp_learned_weight(c.ema_weight, reference)
         weighted_sum += debiased * weight
         weight_total += weight

@@ -16,6 +16,7 @@ loop.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import logging
 import time
@@ -43,7 +44,14 @@ from .clients.wetteralarm import (
 from .health import SourceHealth, classify_exception
 from .const import (
     MIN_SAMPLES_TO_TRUST_BUCKET,
+    BLEND_COMPARISON_LEAD_HOURS,
+    BLEND_COMPARISON_MAX_ROWS,
+    BLEND_COMPARISON_MIN_SAMPLES,
     BLEND_VERIFICATION_LEAD_HOURS,
+    LEAD_TIME_BASIS_POLL,
+    LEAD_TIME_BASIS_RUN,
+    MODEL_METADATA_REFRESH_INTERVAL,
+    OPEN_METEO_METADATA_MODELS,
     FRESHNESS_MAX_BOOST,
     FRESHNESS_MIN_FACTOR,
     FRESHNESS_OVERDUE_FLOOR,
@@ -170,6 +178,14 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
             SOURCE_CH2: SourceHealth(),
             SOURCE_ICON_D2: SourceHealth(),
         }
+        # v0.3.0 (W0/ARC-04): last known run initialisation time per
+        # source, refreshed at most once per MODEL_METADATA_REFRESH_INTERVAL.
+        # Purely in-memory and deliberately not persisted: a stale run time
+        # is worse than no run time, and after a restart the next refresh
+        # is at most an hour away. Missing entries mean 'poll' basis, which
+        # is exactly what SRF and meteoblue permanently use.
+        self._model_metadata: dict[str, Any] = {}
+        self._model_metadata_fetched: dict[str, datetime] = {}
 
     def _secret_values(self) -> list[str]:
         """Values that must never appear in a log line or diagnostics
@@ -190,6 +206,26 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                 self._last_run_fingerprint[source] = persisted
             self._fingerprint_loaded_from_db.add(source)
         return self._last_run_fingerprint.get(source)
+
+    async def _get_model_metadata(self, source: str) -> Optional[Any]:
+        """This source's current run metadata, refreshed at most hourly.
+
+        v0.3.0 (W0/ARC-04). Returns None whenever the run time is
+        unknown for any reason — the source has no metadata endpoint, the
+        fetch failed, or the URL is wrong. Callers treat None as "record
+        this row on the poll basis", which is v0.2.8's behaviour.
+        """
+        from .models import model_a as _ma
+
+        now = _ma.utcnow()
+        last = self._model_metadata_fetched.get(source)
+        if last is not None and (now - last) < MODEL_METADATA_REFRESH_INTERVAL:
+            return self._model_metadata.get(source)
+        metadata = await self._client.async_fetch_model_metadata(source)
+        self._model_metadata_fetched[source] = now
+        if metadata is not None:
+            self._model_metadata[source] = metadata
+        return self._model_metadata.get(source)
 
     async def _async_update_data(self) -> dict[str, Any]:
         from .models import model_a
@@ -318,6 +354,19 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
             apply_correction = (
                 grid_elevation is not None and self._actual_elevation_m is not None
             )
+            # v0.3.0 (W0/ARC-04): stamp each row with the model run it
+            # came from, where the provider says so. issued_at keeps its
+            # existing meaning (first seen) because freshness_factor and
+            # the fingerprint dedup both want observation time.
+            metadata = await self._get_model_metadata(source)
+            run_iso = (
+                metadata.run_initialised_at.isoformat()
+                if metadata is not None else None
+            )
+            basis = (
+                LEAD_TIME_BASIS_RUN if run_iso is not None
+                else LEAD_TIME_BASIS_POLL
+            )
             rows = []
             for point in parsed.points:
                 value = point.value
@@ -335,6 +384,8 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                         point.variable,
                         value,
                         "scheduled",
+                        run_iso,
+                        basis,
                     )
                 )
             # v0.1.24 fix (P1-23): provider-independent physical-bounds
@@ -1746,6 +1797,100 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         async with asyncio.timeout(120):
             return await self.hass.async_add_executor_job(self._compute_blend)
 
+    def _record_blend_comparison(
+        self,
+        *,
+        now: datetime,
+        latest_forecast: dict,
+        bucket_lookup: dict,
+    ) -> None:
+        """Write one paired comparison row per (target, measurement, lead).
+
+        Only Class A measurements participate. Class B and Class C have
+        no local ground truth by definition — that is what makes them
+        Class B and C — so there is nothing to reconcile them against and
+        a comparison row for them would be a row that can never be
+        scored. Recording them anyway, to be abandoned later, would
+        inflate the pending count and make a stalled measurement look
+        like a busy one.
+
+        Never raises into the blend cycle: a failure to record the
+        measurement must not stop the forecast the user actually sees.
+        """
+        from .models import model_a
+
+        rows: list[tuple] = []
+        for lead in BLEND_COMPARISON_LEAD_HOURS:
+            target = (now + timedelta(hours=lead)).replace(
+                minute=0, second=0, microsecond=0
+            )
+            for measurement in self.LEARNED_MEASUREMENTS:
+                contributions = self._contributions_at(
+                    measurement, target,
+                    latest_forecast=latest_forecast,
+                    bucket_lookup=bucket_lookup,
+                )
+                blend_value = model_a.blend(contributions)
+                if blend_value is None:
+                    continue
+
+                contributors: dict[str, dict[str, Any]] = {}
+                for c in contributions:
+                    debiased = model_a.debiased_value(c)
+                    if debiased is None:
+                        continue
+                    contributors[c.source] = {
+                        "raw": round(c.raw_value, 4),
+                        "debiased": round(debiased, 4),
+                        "trusted": c.sample_count >= MIN_SAMPLES_TO_TRUST_BUCKET,
+                        "samples": c.sample_count,
+                    }
+                if not contributors:
+                    continue
+
+                rows.append(
+                    (
+                        target.isoformat(),
+                        measurement,
+                        int(lead),
+                        now.isoformat(),
+                        self._comparison_basis(contributors.keys()),
+                        blend_value,
+                        json.dumps(contributors, separators=(",", ":")),
+                    )
+                )
+
+        if not rows:
+            return
+        try:
+            inserted = self._db.insert_blend_comparisons_bulk(rows)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Failed to record blend comparison rows; the forecast itself "
+                "is unaffected"
+            )
+            return
+        if inserted:
+            _LOGGER.debug(
+                "Blend comparison: %d new paired row(s) of %d candidate(s)",
+                inserted, len(rows),
+            )
+
+    def _comparison_basis(self, sources) -> str:
+        """'run' only if EVERY contributing source had a known run time.
+
+        Deliberately all-or-nothing. A row whose lead offset is
+        run-relative for two sources and poll-relative for three is not
+        run-relative; calling it so would reintroduce the undeclared mix
+        that ARC-04 is about. Since SRF and meteoblue expose no run time
+        at all, most rows will read 'poll' — and that is the honest
+        label, not a failure.
+        """
+        for source in sources:
+            if source not in OPEN_METEO_METADATA_MODELS:
+                return LEAD_TIME_BASIS_POLL
+        return LEAD_TIME_BASIS_RUN
+
     def _blend_at(
         self,
         measurement: str,
@@ -1759,6 +1904,36 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         bulk queries, not fetched here. Same blending math as before,
         just no longer paying for a round trip per (hour, measurement,
         source) combination.
+        """
+        from .models import model_a
+
+        contributions = self._contributions_at(
+            measurement, target_hour,
+            latest_forecast=latest_forecast, bucket_lookup=bucket_lookup,
+        )
+        return model_a.blend(contributions)
+
+    def _contributions_at(
+        self,
+        measurement: str,
+        target_hour: datetime,
+        *,
+        latest_forecast: dict[tuple[str, str, str], tuple[float, datetime]],
+        bucket_lookup: dict[tuple, Any],
+    ) -> list[Any]:
+        """Build the per-source contributions for one Class A cell.
+
+        **v0.3.0 (W0/ARC-05).** Extracted verbatim from _blend_at, which
+        now calls it. The paired comparison needs the same contribution
+        list the blend used — the same weights, the same freshness
+        scaling, the same cold-start decisions — and rebuilding it beside
+        the blend would have produced a comparison that graded sources on
+        numbers the blend never saw. Any divergence between the two would
+        have been invisible in the output and fatal to the conclusion.
+
+        This is a pure refactor: blend output is byte-identical to
+        v0.2.8 for identical inputs, which tests/test_v0_3_0_w0.py
+        asserts directly rather than assuming.
         """
         from .models import model_a
 
@@ -1817,7 +1992,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                         sample_count=bucket.sample_count,
                     )
                 )
-        return model_a.blend(contributions)
+        return contributions
 
     def _blend_by_class(
         self,
@@ -2077,6 +2252,19 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         if blend_rows:
             self._db.insert_forecast_snapshots_bulk(blend_rows)
 
+        # v0.3.0 (W0/ARC-05): the paired comparison.
+        #
+        # Same target hour, same lead offset, same measurement, blend and
+        # every source on ONE row. The rows above (v0.2.4) stay because
+        # they still feed the blend's own bucket_stats entry, which is a
+        # legitimate thing to know; what they cannot support is the
+        # comparison, for the reasons set out in const.py.
+        self._record_blend_comparison(
+            now=now,
+            latest_forecast=latest_forecast,
+            bucket_lookup=bucket_lookup,
+        )
+
         return {
             "current": current,
             "expert_weights": expert_weights,
@@ -2164,6 +2352,11 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         self.temperature_mae: Optional[dict[str, Any]] = None
         # v0.2.4 (SWF-024-005): cached for the learning-progress sensor.
         self.learning_progress: Optional[dict[str, Any]] = None
+        # v0.3.0 (W0/ARC-05): the paired blend-vs-source report, recomputed
+        # once per reconciliation cycle and cached here. Same off-loop
+        # discipline as temperature_mae above (v0.1.28, SWF-P1-007) — a
+        # sensor property must never touch SQLite from the event loop.
+        self.blend_comparison: Optional[dict[str, Any]] = None
         # v0.1.24 fix (P2-03 / P2-04): ONE lock, shared with the other
         # coordinator that writes the same tables.
         #
@@ -2286,11 +2479,96 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
             "blend_mae": round(blend_mae, 3) if blend_mae is not None else None,
             "best_source": best_source[0] if best_source else None,
             "best_source_mae": round(best_source[1], 3) if best_source else None,
-            "blend_beats_best_source": (
-                None if blend_mae is None or best_source is None
-                else blend_mae < best_source[1]
-            ),
+            # v0.3.0 (W0/ARC-05): `blend_beats_best_source` was REMOVED
+            # from this dict rather than left in place beside its
+            # replacement.
+            #
+            # It compared two sample-count-weighted averages drawn from
+            # different populations at different lead-time distributions,
+            # and credited the blend with a post-hoc debiasing the
+            # published forecast never receives. It could therefore read
+            # True while the shipped product was worse than its best
+            # input. Keeping it "for continuity" would have left a
+            # plausible-looking boolean next to the correct one, and the
+            # wrong one is the shorter name.
+            #
+            # The two figures below are kept: they are honest statements
+            # about what bucket_stats holds, and per-source MAE remains
+            # useful. What they cannot support is the comparison, which
+            # now lives in ModelALearningCoordinator.blend_comparison.
+            "superseded_by": "blend_comparison",
         }
+
+    def _reconcile_blend_comparison(
+        self, now: datetime, candidates_by_measurement: dict
+    ) -> None:
+        """Attach the observation to every comparison row whose hour has passed.
+
+        v0.3.0 (W0/ARC-05). Reuses the station observations already
+        loaded for bucket reconciliation rather than re-querying — same
+        batching discipline as the surrounding method, and it guarantees
+        the comparison is scored against exactly the observations the
+        buckets were, not a separately-fetched set that could differ at
+        the edges.
+
+        Rows older than RETRY_GIVE_UP_AGE with still no observation are
+        marked 'abandoned' rather than left pending forever, so a station
+        outage cannot make the pending count grow without bound.
+        """
+        from .models import model_a
+
+        pending = self._db.get_pending_blend_comparisons(now.isoformat())
+        if not pending:
+            return
+
+        reconciled: list[tuple[float, str, int]] = []
+        abandoned: list[int] = []
+        now_iso = now.isoformat()
+        for row in pending:
+            measurement = row["measurement"]
+            candidates = candidates_by_measurement.get(measurement)
+            valid_at = datetime.fromisoformat(row["valid_at"])
+            actual = None
+            if candidates:
+                actual = model_a.find_nearest_observation(
+                    target=valid_at, candidates=candidates
+                )
+            if actual is None:
+                if (now - valid_at) >= self.RETRY_GIVE_UP_AGE:
+                    abandoned.append(row["id"])
+                continue
+            reconciled.append((actual, now_iso, row["id"]))
+
+        if reconciled or abandoned:
+            self._db.apply_blend_comparison_batch(reconciled, abandoned)
+
+        # Bound the table independently of purge_days. See
+        # SwissWeatherDB.trim_blend_comparison for why this does not
+        # simply defer to retention like every other table.
+        self._db.trim_blend_comparison(BLEND_COMPARISON_MAX_ROWS)
+
+        _LOGGER.debug(
+            "Blend comparison: %d row(s) scored, %d abandoned, %d still pending",
+            len(reconciled), len(abandoned),
+            len(pending) - len(reconciled) - len(abandoned),
+        )
+
+    def _compute_blend_comparison_report(self) -> Optional[dict[str, Any]]:
+        """The paired verdict, as a plain dict for the sensor and diagnostics.
+
+        Returns a dict even when there is no verdict yet — with
+        total_pairs and per-cell sample counts included — so that "not
+        enough data" and "this broke" are distinguishable by the reader.
+        Returning None for both was the v0.1.28 defect (SWF-P1-007) that
+        hid a broken sensor for four releases.
+        """
+        from .models.comparison import build_report
+
+        rows = self._db.get_reconciled_blend_comparisons(
+            limit=BLEND_COMPARISON_MAX_ROWS
+        )
+        report = build_report(rows, min_samples=BLEND_COMPARISON_MIN_SAMPLES)
+        return report.as_dict()
 
     def _reconcile(self) -> datetime:
         """Synchronous — only ever called via the executor job above.
@@ -2473,8 +2751,13 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         # class as the manifest read v0.1.25 introduced and v0.1.26
         # removed. Doing it once per reconciliation cycle, off-loop, is
         # both correct and far less work.
+        # v0.3.0 (W0/ARC-05): score the paired comparison rows against the
+        # same station observations, in the same executor job.
+        self._reconcile_blend_comparison(now, candidates_by_measurement)
+
         self.temperature_mae = self._compute_temperature_mae()
         self.learning_progress = self._compute_learning_progress()
+        self.blend_comparison = self._compute_blend_comparison_report()
 
         self.last_reconciled_count = reconciled_count
         _LOGGER.debug(

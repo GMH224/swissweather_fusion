@@ -13,25 +13,49 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.2.8.** The core architecture is built and the business
-logic (bias correction, storm scoring, radar sampling) is extensively
-unit-tested — 677 tests, pyflakes clean. v0.1.24–v0.1.28 is a large remediation
-release closing 62 defects found across two external audits and one
-independent audit: see
-[swissweather_fusion_v0.2.8_release_audit.md](swissweather_fusion_v0.2.8_release_audit.md)
-for the full account, including the five places the external audits were
-themselves wrong.
+**Status: v0.3.0 — a measurement release.** 734 tests, pyflakes clean.
+
+This version adds **no forecasting capability at all**. It exists to make
+one question answerable: *does blending five sources actually beat simply
+using the best one?*
+
+Until now the integration reported an answer to that question, and the
+answer could not be trusted. `blend_beats_best_source` compared two
+averages drawn from different sets of forecasts — the blend was scored
+only at lead times up to 48 hours, each provider across its whole
+horizon — so the blend was being graded on an easier exam. It could read
+`true` while the forecast on your dashboard was worse than just using
+ICON-CH1. That attribute is gone, replaced by a paired comparison that
+scores the blend and every source on identical target hours.
+
+The honest position: **nobody knows yet whether the fusion in this
+integration earns its complexity.** v0.3.0 is the instrument, not the
+finding. Expect to run it for two to three months before the numbers mean
+anything. If the answer comes back "no", that is a useful result and the
+project should act on it.
+
+Earlier history: v0.1.24–v0.2.8 closed 62 defects found across two
+external audits and one independent audit — see
+[swissweather_fusion_v0.2.8_release_audit.md](swissweather_fusion_v0.2.8_release_audit.md),
+including the five places the external audits were themselves wrong.
+v0.3.0's own account is in
+[swissweather_fusion_v0.3.0_release_audit.md](swissweather_fusion_v0.3.0_release_audit.md).
 
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
-> **Upgrading from any earlier version?** This release rebuilds the learning
-> database (schema v3). Learned bias statistics, radar observations and
-> storm predictions are discarded and relearned, because three fixes
-> changed what those stored values *mean*. Raw forecasts and station
-> observations are preserved. You will also be asked, once, whether your
-> pressure sensor reports sea-level or station-level pressure — see
-> below.
+> **Upgrading to v0.3.0?** This release migrates to schema v4 and
+> **clears all learned bias statistics**. Raw forecasts, station
+> observations and storm history are preserved, so relearning starts
+> immediately from stored data rather than from nothing — but for the
+> first few days every source is back at cold start and the blend is a
+> plain average of raw values. **Expect a visible accuracy dip. That is
+> the reset, not a fault.**
+>
+> **Upgrading from before v0.2.8?** The v3 rebuild also applies: radar
+> observations and storm predictions are discarded, and you will be
+> asked once whether your pressure sensor reports sea-level or
+> station-level pressure — see below.
 
 
 ## Which pressure sensor to choose
@@ -143,6 +167,30 @@ Beyond the main `weather.*` entity, this integration exposes:
   `*_last_data_error`, `*_consecutive_failures`, and `*_last_auth_error`
   for SRF specifically
 - `binary_sensor.*_degraded` — one glance-able "is anything unhealthy" flag
+- `sensor.*_blend_comparison` — **new in v0.3.0**, and the one to watch.
+  Its state is how many (measurement, lead-time) cells the blend
+  currently wins. Attributes carry the verdict, the sample count behind
+  it, and a per-cell table.
+
+### Reading the blend comparison
+
+The state is a count rather than a yes/no because a count degrades
+honestly: `0` with `cells_with_verdict: 0` means *not enough data yet*,
+while `0` with `cells_with_verdict: 12` means *the blend is losing*. A
+boolean cannot tell you which of those you are looking at.
+
+Expect `verdict: null` for the first weeks. Each cell needs at least 30
+scored pairs, and a 48-hour-lead cell cannot record its first pair until
+48 hours after the forecast was made.
+
+The per-cell table is the interesting part. "The blend wins at 1 hour and
+loses at 48" is an actionable result — it would mean restricting the
+blend to short horizons — and a single overall verdict would hide it.
+
+`blend_accuracy` and `best_source_accuracy` both remain, but **do not
+chart them against each other.** They are measured over different sets of
+forecasts and the comparison flatters the blend. Both sensors now say so
+in their attributes.
 
 ## Known v0.1 limitations
 

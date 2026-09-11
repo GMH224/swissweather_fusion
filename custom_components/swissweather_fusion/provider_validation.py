@@ -116,38 +116,58 @@ def validate_forecast_value(variable: str, value: Optional[float]) -> Optional[f
     return numeric
 
 
+# Field positions shared by both accepted row shapes. Named rather than
+# inlined so the 6/8 relationship is stated once.
+_VARIABLE_INDEX = 3
+_VALUE_INDEX = 4
+_VALID_ROW_WIDTHS = (6, 8)
+
+
 def validate_forecast_rows(
     rows: Iterable[tuple[Any, ...]],
 ) -> tuple[list[tuple[Any, ...]], int]:
     """Validate a batch of forecast rows before bulk insert.
 
-    Rows are the 6-tuples every provider coordinator already builds:
-    ``(source, issued_at, valid_at, variable, value, trigger_reason)``.
+    Rows are the 6-tuples every provider coordinator builds:
+    ``(source, issued_at, valid_at, variable, value, trigger_reason)``,
+    or the v0.3.0 8-tuple with ``(run_initialised_at, lead_time_basis)``
+    appended by the Open-Meteo coordinator.
 
     Returns ``(validated_rows, rejection_count)``. Row count, order and
     shape are all preserved exactly — only out-of-bounds values are
     replaced with None. The rejection count is returned rather than
     logged here so the caller can record it as a diagnostics event with
     its own provider context attached.
+
+    **v0.3.0.** This function previously tested ``len(row) != 6`` and
+    passed anything else through untouched. When the Open-Meteo
+    coordinator started appending two columns, that branch would have
+    silently disabled physical-bounds validation for CH1, CH2 and
+    ICON-D2 — three of five sources, and the majority of stored values —
+    while every test still passed and nothing was logged. Validation by
+    POSITION rather than by exact length removes the coupling: the value
+    is field 4 in both shapes, and a future column cannot switch this
+    off by accident.
     """
     validated: list[tuple[Any, ...]] = []
     rejected = 0
 
     for row in rows:
-        # Defensive: a row that is not the expected shape is passed
+        # Defensive: a row that is not a recognised shape is passed
         # through untouched rather than being silently reshaped. Storage
         # will reject it loudly, which is the correct outcome — this
         # module's job is value sanity, not schema enforcement.
-        if len(row) != 6:
+        if len(row) not in _VALID_ROW_WIDTHS:
             validated.append(row)
             continue
 
-        source, issued_at, valid_at, variable, value, trigger_reason = row
+        variable = row[_VARIABLE_INDEX]
+        value = row[_VALUE_INDEX]
         clean = validate_forecast_value(variable, value)
         if clean is None and value is not None:
             rejected += 1
         validated.append(
-            (source, issued_at, valid_at, variable, clean, trigger_reason)
+            row[:_VALUE_INDEX] + (clean,) + row[_VALUE_INDEX + 1:]
         )
 
     return validated, rejected

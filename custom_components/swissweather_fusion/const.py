@@ -140,6 +140,134 @@ SOURCE_BLEND = "blend"
 # question is how skill varies with lead time, and six points answer it.
 BLEND_VERIFICATION_LEAD_HOURS = (1, 3, 6, 12, 24, 48)
 
+# ---------------------------------------------------------------------------
+# v0.3.0 (W0 / ARC-05): the paired blend-vs-best-source comparison
+# ---------------------------------------------------------------------------
+# **Why a second mechanism when BLEND_VERIFICATION_LEAD_HOURS above already
+# exists.** v0.2.4 recorded the blend back into forecast_snapshots as a
+# pseudo-source so it would be reconciled "like any other". That much
+# works. What does not work is the COMPARISON built on top of it, and the
+# reason is that the two sides of that comparison are not measured over
+# the same thing:
+#
+#   * a provider writes a bucket_stats sample for every reconcilable hour
+#     of every run — for CH1 at 3-hour cadence over a 33-hour horizon,
+#     roughly two hundred samples per measurement per day, spread across
+#     all three lead-time buckets;
+#   * the blend writes at six lead offsets only, none of which exceeds
+#     48 hours, so it never occupies the `long` bucket at all.
+#
+# Aggregating each side over its own sample population and comparing the
+# two means is not a comparison of skill. It is a comparison of two
+# different lead-time distributions, and since error grows with lead
+# time, it is biased in the blend's favour before any skill is involved.
+#
+# Worse, the blend pseudo-source accumulates an ema_bias of its own, so
+# its reported ema_abs_error is the error of a POST-HOC DEBIASED blend —
+# and the published forecast receives no such correction. The number
+# reported as the blend's accuracy therefore described a forecast that
+# was never shown to anyone.
+#
+# The consequence is that `blend_beats_best_source` could read True while
+# the shipped product was worse than simply using its best input. That is
+# the exact failure pattern DEVELOPER.md §7.2 warns about: a passing
+# condition satisfiable without the thing being true.
+#
+# So: same target hour, same lead offset, same measurement, for the blend
+# and every source at once, recorded as ONE row. The blend is graded on
+# the value it actually published; each source is graded on the debiased
+# value that actually entered the blend, which is the honest
+# counterfactual ("would this one source, bias-corrected, have been
+# better?"). See storage/db.py: blend_comparison.
+BLEND_COMPARISON_LEAD_HOURS = BLEND_VERIFICATION_LEAD_HOURS
+
+# Below this many reconciled pairs at a given (measurement, lead offset),
+# no verdict is reported for that cell — the sensor shows None with the
+# sample count beside it, rather than a number that reads as a finding.
+#
+# 30 is not a significance test; it is a floor beneath which a difference
+# of a few tenths of a degree is obviously noise. The report exposes
+# sample_count for every cell precisely so that the reader, not this
+# constant, decides what is enough.
+BLEND_COMPARISON_MIN_SAMPLES = 30
+
+# How many reconciled pairs to hold in the report window. At 24 target
+# hours x 6 lead offsets x 3 measurements = 432 rows/day, this is roughly
+# 120 days — comfortably longer than the 2-3 month evaluation the release
+# is built to support, and bounded so the table cannot grow without limit
+# on an installation whose purge_days is 0.
+BLEND_COMPARISON_MAX_ROWS = 55_000
+
+# ---------------------------------------------------------------------------
+# v0.3.0 (W0 / ARC-04): model run initialisation time
+# ---------------------------------------------------------------------------
+# Until v0.3.0 `issued_at` was the time this integration FIRST SAW a run,
+# and lead-time buckets were derived from it. That understates true lead
+# time by the provider's publication lag, and the lag is not the same
+# across sources. Measured live on 2026-09-10:
+#
+#   meteofrance_arome_france_hd   init 06:00Z, available 11:09Z  -> 5h09m
+#   meteoswiss_icon_ch1           init 09:00Z, available 10:56Z  -> 1h56m
+#
+# Two sources sitting in the same lead-time bucket are therefore being
+# graded at forecast horizons that differ by over three hours, and
+# bucket_stats reads that difference as a skill difference. A 24-hour-wide
+# bucket absorbs some of it; the paired comparison above, which keys on an
+# exact lead offset, does not.
+#
+# The metadata API is free (Open-Meteo documents metadata calls as not
+# counted against request limits), so this costs one cheap request per
+# model per refresh.
+#
+# **Verified live on 2026-09-10**, against two different providers so the
+# path could not be provider-scoped by coincidence:
+#
+#   .../data/meteoswiss_icon_ch1/static/meta.json  -> 200, expected shape
+#   .../data/dwd_icon_d2/static/meta.json          -> 200, expected shape
+#
+# Both fixtures are committed under tests/fixtures/. Verifying against two
+# providers rather than one is the whole point: a single confirmation
+# would not distinguish "this path is the pattern" from "this path happens
+# to work for MeteoSwiss".
+#
+# Should the path change upstream anyway, every fetch 404s,
+# run_initialised_at stays None, lead_time_basis stays 'poll', and the
+# integration behaves exactly as v0.2.8 did. That degradation is
+# deliberate: see OpenMeteoClient.async_fetch_model_metadata.
+#
+# What the same measurement showed about the CURRENT blend, recorded here
+# because it tempers the finding above: at the 15:00Z run, ICON-CH1's lag
+# was 1h52m and ICON-D2's 1h29m — a spread of 22 minutes, not hours. Among
+# the three Open-Meteo sources this integration blends today, poll-time
+# attribution therefore misfiles very little; a 24-hour-wide bucket
+# absorbs 22 minutes comfortably. The 3h13m spread that makes ARC-04
+# blocking is specifically an AROME-vs-ICON problem, and AROME is not in
+# this release. Run time is recorded now because the paired comparison
+# keys on exact lead offsets, where 22 minutes is no longer negligible,
+# and because W4 cannot start without this data already flowing.
+OPEN_METEO_METADATA_URL_TEMPLATE = "https://{host}/data/{model}/static/meta.json"
+
+# Only the Open-Meteo-served sources have a metadata endpoint. SRF and
+# meteoblue expose no run initialisation time, so they keep the 'poll'
+# basis and that fact is recorded per row rather than averaged silently
+# into buckets alongside run-relative rows.
+OPEN_METEO_METADATA_MODELS = {
+    SOURCE_CH1: "meteoswiss_icon_ch1",
+    SOURCE_CH2: "meteoswiss_icon_ch2",
+    SOURCE_ICON_D2: "dwd_icon_d2",
+}
+
+# Runs update every 3 hours; refreshing metadata hourly is comfortably
+# often enough to catch a new run and cheap enough not to matter.
+MODEL_METADATA_REFRESH_INTERVAL = timedelta(hours=1)
+
+# Recorded per forecast_snapshots row so a bucket's provenance is
+# knowable. Mixing run-relative and poll-relative lead times in one bucket
+# without recording which is which would be a new instance of exactly the
+# defect class this release exists to measure.
+LEAD_TIME_BASIS_POLL = "poll"
+LEAD_TIME_BASIS_RUN = "run"
+
 # CombiPrecip is deliberately NOT in ALL_FORECAST_SOURCES: it's ground-truth
 # radar observation, not a forecast to bias-correct, and never enters Model
 # A's bucket_stats. It's a Model B feature only. See plan doc §10.

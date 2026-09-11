@@ -92,6 +92,7 @@ async def async_setup_entry(
         BlendAccuracySensor(entry, runtime),
         BestSourceAccuracySensor(entry, runtime),
         LearningProgressSensor(entry, runtime),
+        BlendComparisonSensor(entry, runtime),
         TrustedBucketCountSensor(entry, runtime),
         # v0.2.5: the new fused parameters, on the UI as primary entities.
         BlendedValueSensor(entry, runtime, "cape", "Convective energy (CAPE)",
@@ -285,17 +286,18 @@ class ForecastAccuracySensor(_BaseSensor):
             ),
             "temperature_bucket_count": mae["bucket_count"] if mae else 0,
             "total_sample_count": mae["sample_count"] if mae else 0,
-            # v0.2.4 (SWF-024-001): the falsifiability attributes. The
-            # headline value above is the average error of the INPUTS;
-            # these say whether the blended output does better than the
-            # best of them. blend_beats_best_source is the honest
-            # scoreboard for the whole approach.
+            # v0.2.4 (SWF-024-001): the average error of the INPUTS,
+            # per source, from bucket_stats.
+            #
+            # v0.3.0 (W0/ARC-05): `blend_beats_best_source` no longer
+            # appears here. These two figures are aggregates over
+            # different sample populations and cannot be compared with
+            # each other — see the Blend comparison sensor, which grades
+            # both on identical targets.
             "blend_mae": mae.get("blend_mae") if mae else None,
             "best_source": mae.get("best_source") if mae else None,
             "best_source_mae": mae.get("best_source_mae") if mae else None,
-            "blend_beats_best_source": (
-                mae.get("blend_beats_best_source") if mae else None
-            ),
+            "verdict_moved_to": "sensor.*_blend_comparison",
         }
 
 
@@ -710,6 +712,69 @@ class _LearningStatSensor(_BaseSensor):
         coordinator = self._runtime.get("learning_coordinator")
         return getattr(coordinator, "learning_progress", None) if coordinator else None
 
+    @property
+    def _comparison(self) -> Optional[dict[str, Any]]:
+        coordinator = self._runtime.get("learning_coordinator")
+        return getattr(coordinator, "blend_comparison", None) if coordinator else None
+
+
+class BlendComparisonSensor(_LearningStatSensor):
+    """The paired blend-vs-best-source verdict (v0.3.0, W0 / ARC-05).
+
+    **The state is a count, not a boolean**, because Home Assistant
+    records long-term statistics for numeric states and this is the one
+    number worth watching accumulate: how many (measurement, lead offset)
+    cells the blend currently wins. The verdict itself, the per-cell
+    table and every sample count live in the attributes.
+
+    A count also degrades honestly. A boolean has no way to distinguish
+    "the blend loses" from "nothing has been measured yet", and that
+    exact ambiguity hid a broken accuracy sensor for four releases
+    (SWF-P1-007). Zero cells won with `cells_with_verdict: 0` and
+    `total_pairs: 0` reads as "not yet"; zero cells won with
+    `cells_with_verdict: 12` reads as a finding.
+    """
+
+    _attr_native_unit_of_measurement = "cells"
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(
+            entry, runtime, "blend_comparison", "Blend comparison (cells won)"
+        )
+
+    @property
+    def native_value(self) -> Optional[int]:
+        report = self._comparison
+        if not report:
+            return None
+        return report.get("cells_blend_wins")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        report = self._comparison or {}
+        return {
+            "verdict": report.get("overall_blend_wins"),
+            "cells_with_verdict": report.get("cells_with_verdict"),
+            "total_pairs": report.get("total_pairs"),
+            "window_start": report.get("window_start"),
+            "window_end": report.get("window_end"),
+            "min_samples_per_cell": report.get("min_samples_per_cell"),
+            # The per-cell table. Deliberately included in full rather
+            # than summarised: "the blend wins at 1h and loses at 48h" is
+            # an actionable result and a single averaged boolean destroys
+            # it. Twelve to eighteen small dicts is well within what an
+            # attribute can carry.
+            "cells": report.get("cells", []),
+            "methodology": (
+                "Per (measurement, lead offset): each source is compared "
+                "with the blend ONLY on target hours where both produced a "
+                "value, and the blend's MAE is recomputed on that source's "
+                "own subset. margin = source MAE - blend MAE on identical "
+                "targets; positive means the blend was closer. The verdict "
+                "is against the strongest single source, not the average."
+            ),
+        }
+
 
 class BlendAccuracySensor(_LearningStatSensor):
     """Mean absolute temperature error of the BLENDED output.
@@ -732,15 +797,21 @@ class BlendAccuracySensor(_LearningStatSensor):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        mae = self._mae or {}
         return {
-            "beats_best_source": mae.get("blend_beats_best_source"),
             "methodology": (
                 "EMA of |blend forecast - observed| for temperature, from "
                 "blend output recorded as a pseudo-source and reconciled "
-                "like any provider. Chart against 'Best source accuracy' "
-                "to see whether fusion is earning its complexity."
+                "like any provider."
             ),
+            # v0.3.0 (W0/ARC-05): the old advice here was to chart this
+            # against 'Best source accuracy' and read off a verdict. That
+            # advice was wrong, and the two curves are not comparable:
+            # this one is measured at six lead offsets none beyond 48h,
+            # that one across every provider hour including the long
+            # bucket. Comparing them favours the blend for reasons that
+            # have nothing to do with skill.
+            "not_comparable_with": "best_source_accuracy",
+            "use_instead": "sensor.*_blend_comparison",
         }
 
 
@@ -767,7 +838,11 @@ class BestSourceAccuracySensor(_LearningStatSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         mae = self._mae or {}
-        return {"best_source": mae.get("best_source")}
+        return {
+            "best_source": mae.get("best_source"),
+            "not_comparable_with": "blend_accuracy",
+            "use_instead": "sensor.*_blend_comparison",
+        }
 
 
 class LearningProgressSensor(_LearningStatSensor):
