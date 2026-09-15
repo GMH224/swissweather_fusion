@@ -13,7 +13,7 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.0 — a measurement release.** 734 tests, pyflakes clean.
+**Status: v0.3.1 — a measurement release, plus defect remediation.** 781 tests, pyflakes clean.
 
 This version adds **no forecasting capability at all**. It exists to make
 one question answerable: *does blending five sources actually beat simply
@@ -34,6 +34,13 @@ finding. Expect to run it for two to three months before the numbers mean
 anything. If the answer comes back "no", that is a useful result and the
 project should act on it.
 
+v0.3.1 additionally remediates an external adversarial ICS audit: 76
+findings triaged to ~47 distinct issues, 19 confirmed, 8 declined with
+reasons — including two whose proposed fix would have introduced a worse
+defect. Three of the confirmed findings were defects v0.3.0 itself
+introduced. Full account in
+[swissweather_fusion_v0.3.1_release_audit.md](swissweather_fusion_v0.3.1_release_audit.md).
+
 Earlier history: v0.1.24–v0.2.8 closed 62 defects found across two
 external audits and one independent audit — see
 [swissweather_fusion_v0.2.8_release_audit.md](swissweather_fusion_v0.2.8_release_audit.md),
@@ -44,13 +51,21 @@ v0.3.0's own account is in
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
-> **Upgrading to v0.3.0?** This release migrates to schema v4 and
-> **clears all learned bias statistics**. Raw forecasts, station
-> observations and storm history are preserved, so relearning starts
-> immediately from stored data rather than from nothing — but for the
-> first few days every source is back at cold start and the blend is a
-> plain average of raw values. **Expect a visible accuracy dip. That is
-> the reset, not a fault.**
+> **Upgrading to v0.3.1 from v0.3.0?** This release migrates to schema
+> v5 and **clears learned bias statistics again**, ten days after v0.3.0
+> did. That is not a mistake: v0.3.1 fixes a defect live since v0.1 in
+> which forecast rows for hours that had *already passed* were stored and
+> graded as short-range forecasts. Roughly a quarter of every Open-Meteo
+> poll was teaching the model that its forecast skill equalled its
+> hindsight. Every bucket learned before now is optimistic, so it goes.
+>
+> Preserved: forward forecast history, station observations, radar and
+> storm history. **Expect a visible accuracy dip for several days — that
+> is the reset, not a fault.** The evaluation window starts from this
+> deploy.
+>
+> **Upgrading from before v0.3.0?** The schema v4 migration also applies:
+> learned statistics are cleared and run-time attribution columns added.
 >
 > **Upgrading from before v0.2.8?** The v3 rebuild also applies: radar
 > observations and storm predictions are discarded, and you will be

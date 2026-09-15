@@ -274,10 +274,31 @@ class SwissWeatherFusionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required(
                     CONF_LONGITUDE, default=entry.data.get(CONF_LONGITUDE)
                 ): _LONGITUDE_VALIDATOR,
-                vol.Optional(
-                    CONF_ELEVATION_OVERRIDE,
-                    default=current_override if current_override is not None else 0.0,
-                ): _ELEVATION_VALIDATOR,
+                # v0.3.1 (SWF-ICS-001): no default at all when there is
+                # no override.
+                #
+                # This field used to default to 0.0 whenever the entry had
+                # no override, and the reconfigure step has no "clear
+                # override" control to undo it. An operator changing only
+                # the coordinates would submit the form unchanged and
+                # silently persist an explicit SEA-LEVEL override. At 471 m
+                # that is a systematic ~3 degC lapse-rate error, applied to
+                # every temperature and then LEARNED FROM — a silent
+                # model-integrity fault, not a crash, which is the harder
+                # kind to notice.
+                #
+                # vol.Optional with no default means the key is simply
+                # absent when the operator leaves the box empty, and the
+                # handler maps that back to None.
+                **(
+                    {vol.Optional(
+                        CONF_ELEVATION_OVERRIDE, default=current_override
+                    ): _ELEVATION_VALIDATOR}
+                    if current_override is not None
+                    else {vol.Optional(
+                        CONF_ELEVATION_OVERRIDE
+                    ): _ELEVATION_VALIDATOR}
+                ),
             }
         )
         return self.async_show_form(
@@ -572,12 +593,20 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                         CONF_DIAGNOSTIC_LOGGING_ENABLED, DEFAULT_DIAGNOSTIC_LOGGING_ENABLED
                     ),
                 ): selector.BooleanSelector(),
+                # v0.3.1 (SWF-ICS-003/064/059): the same validator setup
+                # and reconfigure use. This was bare vol.Coerce(float),
+                # which accepts inf, nan and 50000 — and
+                # reduce_station_pressure_to_sea_level feeds elevation
+                # straight into math.exp(), so an extreme value here was
+                # the one reachable path to a barometric overflow. Three
+                # entry points to one physical parameter, and only two of
+                # them were guarded.
                 vol.Optional(
                     CONF_ELEVATION_OVERRIDE,
                     default=current_elevation_override
                     if current_elevation_override is not None
                     else 0.0,
-                ): vol.Coerce(float),
+                ): _ELEVATION_VALIDATOR,
                 vol.Optional(
                     CONF_CLEAR_ELEVATION_OVERRIDE,
                     default=current_elevation_override is None,

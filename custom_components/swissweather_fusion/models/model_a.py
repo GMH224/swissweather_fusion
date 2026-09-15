@@ -13,6 +13,8 @@ values. This separation is what makes the module trivially unit-testable
 """
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from typing import Any, Optional
 from datetime import datetime, timedelta, timezone
@@ -365,6 +367,25 @@ def blend(contributions: list[SourceContribution]) -> float | None:
     weight_total = 0.0
     for c in usable:
         debiased = debiased_value(c)
+        # v0.3.1 (SWF-ICS-069/076): finiteness is checked at each stage,
+        # not only on the inputs.
+        #
+        # A randomized property campaign found finite inputs producing an
+        # infinite result: values around 1e306 multiplied by a large
+        # learned weight overflow IEEE-754 double precision during
+        # accumulation, and the function returned -inf without raising.
+        # Input validation cannot catch this — every input was finite.
+        #
+        # Reachability is low for provider values, which pass a physical
+        # bounds check before storage. It is NOT low for ema_bias and
+        # ema_weight, which are read back from SQLite and have never been
+        # range-checked on load: a corrupted or truncated database row is
+        # the realistic path. Dropping the contribution is right either
+        # way — a source that cannot produce a finite number has nothing
+        # to contribute, and publishing NaN into a weather entity would
+        # propagate it into every automation downstream.
+        if debiased is None or not math.isfinite(debiased):
+            continue
         if c.sample_count < MIN_SAMPLES_TO_TRUST_BUCKET:
             # v0.1.24 fix (IND-01): the cold-start weight is now drawn
             # from the same scale as the learned weights in this blend,
@@ -373,12 +394,22 @@ def blend(contributions: list[SourceContribution]) -> float | None:
             weight = reference
         else:
             weight = _clamp_learned_weight(c.ema_weight, reference)
-        weighted_sum += debiased * weight
+        if not math.isfinite(weight) or weight <= 0.0:
+            continue
+        term = debiased * weight
+        if not math.isfinite(term):
+            continue
+        weighted_sum += term
         weight_total += weight
 
     if weight_total == 0:
         return None
-    return weighted_sum / weight_total
+    result = weighted_sum / weight_total
+    # Final gate: no non-finite value crosses this function boundary,
+    # whatever happened inside it.
+    if not math.isfinite(result):
+        return None
+    return result
 
 
 def apply_lapse_rate_precorrection(

@@ -47,6 +47,7 @@ from ..const import (
     CAPE_STRONG_PROBABILITY,
     CIN_STRONG_CAP_JKG,
     LOCAL_POINT_PROBABILITY,
+    RADAR_CLOCK_SKEW_TOLERANCE,
     RADAR_FRESHNESS_LIMIT,
     RADAR_PRECIP_ACCUM_MM_THRESHOLD,
     RADAR_QUALITY_MINIMUM_CODE,
@@ -279,7 +280,16 @@ def _radar_point_is_usable(
         valid_at = point.valid_at
         if valid_at.tzinfo is None:
             valid_at = valid_at.replace(tzinfo=timezone.utc)
-        if now - valid_at > RADAR_FRESHNESS_LIMIT:
+        age = now - valid_at
+        # v0.3.1 (SWF-ICS-011): bounded on BOTH sides. `age >
+        # RADAR_FRESHNESS_LIMIT` alone let a future-dated product through,
+        # because a negative age is trivially less than any positive
+        # limit — so the more wrong the timestamp, the fresher the
+        # product looked. A small negative tolerance absorbs ordinary
+        # clock skew between the radar producer and this host; beyond
+        # that the timestamp is not believable and the reading is not
+        # used.
+        if age > RADAR_FRESHNESS_LIMIT or age < -RADAR_CLOCK_SKEW_TOLERANCE:
             return False
 
     if point.quality is not None and point.quality < RADAR_QUALITY_MINIMUM_CODE:

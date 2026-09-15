@@ -172,14 +172,23 @@ def test_validate_forecast_rows_preserves_row_count_and_shape():
     consumer already handles a None-valued row, so reusing that
     representation means no new code path anywhere — and it preserves the
     evidence that the provider did return something for that hour."""
+    # v0.3.1: timestamps are now real ISO values with valid_at AFTER
+    # issued_at. The placeholders "i"/"v1" were unparseable, which the
+    # SWF-ICS-051 guard treats as "cannot tell" and passes through — so
+    # the old fixture would still have passed while testing nothing about
+    # the new branch.
     rows = [
-        ("ch1", "i", "v1", "temperature", 20.0, "scheduled"),
-        ("ch1", "i", "v2", "temperature", 9999.0, "scheduled"),
-        ("ch1", "i", "v3", "temperature", None, "scheduled"),
+        ("ch1", "2026-09-10T00:00:00+00:00", "2026-09-10T06:00:00+00:00",
+         "temperature", 20.0, "scheduled"),
+        ("ch1", "2026-09-10T00:00:00+00:00", "2026-09-10T07:00:00+00:00",
+         "temperature", 9999.0, "scheduled"),
+        ("ch1", "2026-09-10T00:00:00+00:00", "2026-09-10T08:00:00+00:00",
+         "temperature", None, "scheduled"),
     ]
-    validated, rejected = pv.validate_forecast_rows(rows)
+    validated, rejected, dropped = pv.validate_forecast_rows(rows)
     assert len(validated) == 3
     assert rejected == 1
+    assert dropped == 0
     assert validated[0][4] == 20.0
     assert validated[1][4] is None
     assert validated[2][4] is None
@@ -188,8 +197,9 @@ def test_validate_forecast_rows_preserves_row_count_and_shape():
 
 
 def test_validate_forecast_rows_does_not_count_preexisting_none_as_rejected():
-    rows = [("ch1", "i", "v", "temperature", None, "scheduled")]
-    _, rejected = pv.validate_forecast_rows(rows)
+    rows = [("ch1", "2026-09-10T00:00:00+00:00", "2026-09-10T06:00:00+00:00",
+             "temperature", None, "scheduled")]
+    _, rejected, _dropped = pv.validate_forecast_rows(rows)
     assert rejected == 0
 
 
@@ -198,6 +208,7 @@ def test_validate_forecast_rows_passes_unexpected_shapes_through_untouched():
     malformed row is passed on so it fails loudly there rather than being
     silently reshaped here."""
     rows = [("too", "few")]
-    validated, rejected = pv.validate_forecast_rows(rows)
+    validated, rejected, dropped = pv.validate_forecast_rows(rows)
     assert validated == rows
     assert rejected == 0
+    assert dropped == 0

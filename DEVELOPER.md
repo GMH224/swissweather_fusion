@@ -2063,6 +2063,86 @@ is why `derive_lead_time_bucket` still keys off `issued_at` for now.
 AROME HD's lag is 5h09m, and that three-hour differential is what makes
 run-relative bucketing a precondition for adding it.
 
+## v0.3.1 — the defect that made the measurement wrong
+
+Full record: `swissweather_fusion_v0.3.1_release_audit.md`. Two things
+here are worth understanding before touching the learning path.
+
+### Past-hour rows were graded as short-lead forecasts (SWF-ICS-051)
+
+Live since v0.1. Missed by three audits. It was five lines.
+
+Open-Meteo's hourly series starts at 00:00 UTC *today*, not at the poll
+time. `parse_forecast_response` stored every element with no filter on
+`valid_at`, so a poll at 15:00 stored fifteen hours that had already
+happened. Then:
+
+```python
+lead_hours = (valid_at - issued_at).total_seconds() / 3600.0
+if lead_hours < LEAD_TIME_SHORT_MAX_HOURS:   # no lower bound
+    return LEAD_TIME_SHORT
+```
+
+A negative lead is trivially below 24, so those rows landed in the
+`short` bucket. They reconciled against observations of hours the model
+run had already ingested — they are hindcasts. Roughly a quarter of every
+Open-Meteo poll was teaching Model A that its short-range forecast skill
+equalled its analysis skill, and `blend_comparison` inherited it, because
+each source's debiased value is read from those buckets.
+
+**The guard is at the storage barrier, not in the bucket function.**
+`derive_lead_time_bucket` still classifies a negative lead as `short`;
+that is acceptable only because such a row can no longer reach it.
+Putting the check in the parser would have fixed Open-Meteo and left the
+next provider to rediscover it — which is not hypothetical, because
+`MeteonomiqsCoordinator` was a second path and bypassed the barrier
+entirely (SWF-ICS-014). There is now a reachability test asserting every
+writer of learnable rows validates.
+
+### Guards belong at the boundary of the irreversible thing
+
+`bucket_stats` is the only table whose corruption cannot be repaired
+forward: an EMA has no mechanism for forgetting a sample it has absorbed,
+so "notice and fix it later" is not available and the only remedy is a
+full wipe. v0.3.0 and v0.3.1 both did one, ten days apart.
+
+Several guards protect the way in — `provider_validation` bounds every
+stored value, SWF-ICS-043 blocks future observations, SWF-ICS-051 blocks
+past-hour rows. Each of those is one refactor away from being bypassed,
+and SWF-ICS-014 is what that looks like in practice.
+
+So `apply_reconciliation_batch` refuses a non-finite learned statistic at
+the point of writing to the irreversible table. It holds regardless of
+what happens upstream. Dropping an update costs one sample; accepting a
+NaN costs the bucket permanently.
+
+### Transaction ownership
+
+`_transaction()` commits on success and rolls back on any exception.
+Every multi-statement writer uses it, and a reachability test fails if a
+new method commits without rollback.
+
+The distinction that made this necessary: SQLite rolls back when the
+*process* dies — an external SIGKILL test confirmed that — and does
+**not** roll back when an exception is raised and caught inside a live
+process. There the transaction stays open, the lock is released, and the
+next successful commit writes the earlier partial work as though it had
+been intended. Passing the crash test says nothing about the second
+property.
+
+### What could still force a database reset
+
+One item, and nothing currently planned triggers it.
+`derive_lead_time_bucket` keys off `issued_at`, not model run time. If
+that ever changes, buckets learned under the two conventions cannot be
+mixed and the table has to go.
+
+It is deferred on a measurement rather than on preference: ICON-CH1's
+publication lag was 1h52m and ICON-D2's 1h29m at the 15:00Z run on
+2026-09-10 — a 22-minute spread, absorbed by a 24-hour bucket. AROME's
+is 5h09m. Adding AROME, or narrowing the lead-time buckets, makes
+run-relative attribution a precondition and forces the reset with it.
+
 ## Known gaps (the honest list, updated for v0.2.0)
 
 **Closed since v0.1.1:**
@@ -2088,6 +2168,21 @@ run-relative bucketing a precondition for adding it.
   of the retention setting, because a table that exists to answer one
   question over a fixed window must not be able to grow without limit
   just because retention is off.
+
+**Closed in v0.3.1:**
+
+- **Past-hour rows graded as short-lead forecasts** (SWF-ICS-051) — see
+  the v0.3.1 section above. The single most consequential defect found in
+  this project so far, because it made the v0.3.0 measurement wrong in a
+  direction nobody could have inferred from the output.
+- **Providers writing to `forecast_snapshots` without validation**
+  (SWF-ICS-014). Now asserted by a reachability test rather than by
+  convention.
+- **Radar products with no timestamp being treated as fresh**, and
+  future-dated radar passing the freshness gate.
+- **Unbounded provider body allocation** and an unvalidated asset origin
+  on the one client that downloads a binary file.
+- **Transactions without rollback ownership** across every writer.
 
 **Still open:**
 

@@ -699,9 +699,17 @@ def test_the_comparison_basis_is_all_or_nothing():
     poll-relative for three is not run-relative. Calling it so would
     reintroduce the undeclared mix ARC-04 is about."""
     c = coord.ModelABlendCoordinator(FakeHass(), None)
-    assert c._comparison_basis(["ch1", "ch2"]) == LEAD_TIME_BASIS_RUN
-    assert c._comparison_basis(["ch1", "srf"]) == LEAD_TIME_BASIS_POLL
-    assert c._comparison_basis(["meteoblue"]) == LEAD_TIME_BASIS_POLL
+    # v0.3.1 (SWF-ICS-049): takes the bases actually RECORDED on each
+    # contributing row, not source names. Passing names let a failed
+    # metadata fetch produce a row claiming 'run' while the forecast row
+    # it came from said 'poll'.
+    assert c._comparison_basis(
+        [LEAD_TIME_BASIS_RUN, LEAD_TIME_BASIS_RUN]
+    ) == LEAD_TIME_BASIS_RUN
+    assert c._comparison_basis(
+        [LEAD_TIME_BASIS_RUN, LEAD_TIME_BASIS_POLL]
+    ) == LEAD_TIME_BASIS_POLL
+    assert c._comparison_basis([]) == LEAD_TIME_BASIS_POLL
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +754,7 @@ def test_physical_bounds_validation_still_applies_to_the_wider_row():
         "temperature", 999.0, "scheduled",
         "2026-09-10T15:00:00+00:00", LEAD_TIME_BASIS_RUN,
     )]
-    validated, rejected = provider_validation.validate_forecast_rows(wide)
+    validated, rejected, dropped = provider_validation.validate_forecast_rows(wide)
     assert rejected == 1
     assert validated[0][4] is None
     # Shape and the trailing columns are preserved exactly.
@@ -760,7 +768,7 @@ def test_physical_bounds_validation_still_applies_to_the_narrow_row():
         "srf", "2026-09-10T17:00:00+00:00", "2026-09-10T18:00:00+00:00",
         "temperature", 999.0, "scheduled",
     )]
-    validated, rejected = provider_validation.validate_forecast_rows(narrow)
+    validated, rejected, dropped = provider_validation.validate_forecast_rows(narrow)
     assert rejected == 1
     assert validated[0][4] is None and len(validated[0]) == 6
 

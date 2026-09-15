@@ -323,12 +323,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # v0.1.24 (P2-12): named before the gather below so the auth-failure
     # cleanup path can shut down EVERY already-constructed coordinator,
     # not only the source ones.
+    # v0.3.1 (SWF-ICS-028): wetteralarm_coordinator was MISSING here.
+    #
+    # It is constructed above with everything else, is not a source
+    # coordinator, and was in neither tuple — so the auth-failure path
+    # below shut down every coordinator except that one and leaked it.
+    #
+    # The instructive part is how it happened. The comment above this
+    # tuple has said "EVERY already-constructed coordinator" since
+    # v0.1.24, and was true when written. v0.2.6 added a coordinator and
+    # did not update the tuple, silently falsifying the comment. A
+    # comment asserting completeness is not a mechanism; the reachability
+    # test in tests/test_v0_3_1_ics_remediation.py is.
     derived_coordinators_for_cleanup = (
         model_b_coordinator,
         blend_coordinator,
         learning_coordinator,
         retention_coordinator,
         storm_reconciliation_coordinator,
+        wetteralarm_coordinator,
     )
     results = await asyncio.gather(
         *(c.async_config_entry_first_refresh() for c in source_coordinators),

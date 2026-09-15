@@ -449,15 +449,24 @@ def test_migration_from_v1_reopens_recent_rows_and_archives_old_ones():
         now = datetime.now(timezone.utc)
         old_valid_at = (now - timedelta(days=30)).isoformat()  # older than the 14-day window
         recent_valid_at = (now - timedelta(hours=2)).isoformat()  # within the window
+        # v0.3.1: issued_at is now set six hours BEFORE valid_at rather
+        # than equal to it. The original fixture used one timestamp for
+        # both, which describes a zero-lead "forecast" for the hour it was
+        # issued in — an analysis, not a forecast, and exactly the row
+        # SWF-ICS-051's cleanup deletes. A fixture that cannot survive a
+        # correct data migration was describing something that should not
+        # have existed.
+        old_issued_at = (now - timedelta(days=30, hours=6)).isoformat()
+        recent_issued_at = (now - timedelta(hours=8)).isoformat()
         raw.execute(
             "INSERT INTO forecast_snapshots (source, issued_at, valid_at, variable, value) "
             "VALUES ('ch1', ?, ?, 'temperature', 20.0)",
-            (old_valid_at, old_valid_at),
+            (old_issued_at, old_valid_at),
         )
         raw.execute(
             "INSERT INTO forecast_snapshots (source, issued_at, valid_at, variable, value) "
             "VALUES ('ch1', ?, ?, 'temperature', 21.0)",
-            (recent_valid_at, recent_valid_at),
+            (recent_issued_at, recent_valid_at),
         )
         raw.execute(
             "INSERT INTO bucket_stats VALUES (12, 'JJA', 'short', 'ch1', 'temperature', 0.5, 0.5, 1.0, 10, ?)",

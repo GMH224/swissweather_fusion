@@ -14,7 +14,7 @@ These tests fix the detection at the level of the error rather than the
 level of the resulting number.
 """
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -58,9 +58,15 @@ def db(tmp_path):
 def _seed_providers(db, hpa, hour=None):
     """Provider MSL forecasts for the current hour."""
     hour = hour or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
+    # v0.3.1 (SWF-ICS-048): issued_at is now a live recent timestamp
+    # rather than a fixed date. get_reference_value bounds the median by
+    # forecast vintage, so a hard-coded issue date silently ages out of
+    # the window and the fixture would stop seeding anything — passing or
+    # failing for reasons unrelated to what it tests.
+    issued = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     for source in ("ch1", "ch2", "icon_d2", "srf", "meteoblue"):
         db.insert_forecast_snapshot(
-            source, "2026-09-02T00:00:00+00:00", f"{hour}:00:00+00:00",
+            source, issued, f"{hour}:00:00+00:00",
             "pressure", hpa,
         )
 

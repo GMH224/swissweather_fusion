@@ -198,7 +198,14 @@ def test_meteonomiqs_hourly_forecast_is_persisted_with_prefixed_variable_names(d
     since Meteonomiqs stays deliberately excluded from
     ALL_FORECAST_SOURCES).
     """
-    valid_at = datetime(2026, 7, 25, 12, 0, tzinfo=timezone.utc)
+    # v0.3.1: the fixture now uses a FUTURE target hour. It previously
+    # used a fixed date in the past, which — once SWF-ICS-051's guard
+    # reached this writer — is a row whose target has already elapsed and
+    # is correctly dropped. The old fixture was quietly asserting that a
+    # past-hour row gets persisted, which is the defect, not the feature.
+    valid_at = datetime.now(timezone.utc).replace(
+        minute=0, second=0, microsecond=0
+    ) + timedelta(hours=6)
     points = [
         HourlyForecastPoint(
             valid_at=valid_at,

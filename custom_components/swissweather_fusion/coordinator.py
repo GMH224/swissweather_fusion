@@ -51,7 +51,6 @@ from .const import (
     LEAD_TIME_BASIS_POLL,
     LEAD_TIME_BASIS_RUN,
     MODEL_METADATA_REFRESH_INTERVAL,
-    OPEN_METEO_METADATA_MODELS,
     FRESHNESS_MAX_BOOST,
     FRESHNESS_MIN_FACTOR,
     FRESHNESS_OVERDUE_FLOOR,
@@ -221,11 +220,33 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         last = self._model_metadata_fetched.get(source)
         if last is not None and (now - last) < MODEL_METADATA_REFRESH_INTERVAL:
             return self._model_metadata.get(source)
+
         metadata = await self._client.async_fetch_model_metadata(source)
         self._model_metadata_fetched[source] = now
-        if metadata is not None:
-            self._model_metadata[source] = metadata
-        return self._model_metadata.get(source)
+
+        # v0.3.1 (SWF-ICS-050), CRITICAL to get right: the FAILURE is
+        # cached too.
+        #
+        # This method used to update the fetch timestamp on every attempt
+        # while only overwriting the cached value on success. A failing
+        # endpoint therefore kept returning the previous run's
+        # initialisation time indefinitely, refreshing its own staleness
+        # clock once an hour and never clearing — and the docstring
+        # claimed it returned None when the run time was unknown. It
+        # returned a stale value presented as authoritative, which is the
+        # precise failure ARC-04 exists to prevent, reproduced inside the
+        # fix for ARC-04.
+        #
+        # Clearing on failure is the conservative direction: a row marked
+        # 'poll' understates what is known, and a row marked 'run' against
+        # a run that ended hours ago misstates it. Only one of those two
+        # errors is detectable later.
+        if metadata is None:
+            self._model_metadata.pop(source, None)
+            return None
+
+        self._model_metadata[source] = metadata
+        return metadata
 
     async def _async_update_data(self) -> dict[str, Any]:
         from .models import model_a
@@ -391,11 +412,20 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
             # v0.1.24 fix (P1-23): provider-independent physical-bounds
             # and finite check, applied to every provider immediately
             # before storage. See provider_validation.py.
-            rows, rejected = provider_validation.validate_forecast_rows(rows)
+            rows, rejected, dropped = provider_validation.validate_forecast_rows(rows)
             if rejected and self._diagnostics is not None:
                 self._diagnostics.record(
                     source=source, event_type="validation_rejected",
                     detail=f"{rejected} value(s) outside physical bounds",
+                )
+            # v0.3.1 (SWF-ICS-051): recorded, not silent. Open-Meteo
+            # returns today's already-elapsed hours on every poll, so a
+            # steady non-zero count here is normal and a count that
+            # suddenly drops to zero means the provider changed shape.
+            if dropped and self._diagnostics is not None:
+                self._diagnostics.record(
+                    source=source, event_type="past_hours_dropped",
+                    detail=f"{dropped} row(s) with valid_at <= issued_at",
                 )
 
             await self.hass.async_add_executor_job(
@@ -630,7 +660,7 @@ class SrfCoordinator(DataUpdateCoordinator):
             for p in points
         ]
         # v0.1.24 (P1-23): shared physical-bounds validation.
-        rows, rejected = provider_validation.validate_forecast_rows(rows)
+        rows, rejected, dropped = provider_validation.validate_forecast_rows(rows)
         if rejected and self._diagnostics is not None:
             self._diagnostics.record(
                 source="srf", event_type="validation_rejected",
@@ -861,7 +891,7 @@ class MeteoblueCoordinator(DataUpdateCoordinator):
                 )
 
         # v0.1.24 (P1-23): shared physical-bounds validation.
-        rows, rejected = provider_validation.validate_forecast_rows(rows)
+        rows, rejected, dropped = provider_validation.validate_forecast_rows(rows)
         if rejected and self._diagnostics is not None:
             self._diagnostics.record(
                 source="meteoblue", event_type="validation_rejected",
@@ -1560,6 +1590,31 @@ class MeteonomiqsCoordinator(DataUpdateCoordinator):
                             "scheduled",
                         )
                     )
+            # v0.3.1 (SWF-ICS-014): the shared barrier, which this write
+            # path bypassed entirely.
+            #
+            # These rows carry METEONOMIQS_HOURLY_VARIABLE_PREFIX, so they
+            # are invisible to Model A's blend, to reconciliation's
+            # measurement filter and to the station reference median — the
+            # prefix isolation is real and was verified, so this was never
+            # a learning-contamination path.
+            #
+            # It ran the barrier anyway, for two reasons. Unvalidated
+            # rows accumulate permanently: they are never reconciled, so
+            # they stay 'pending' forever, and the retention purge
+            # deliberately protects pending rows. And the isolation is a
+            # naming convention — one future caller dropping the prefix
+            # would silently turn a bypassed write into a learned one.
+            # Validating at every writer means that mistake stays cheap.
+            rows, rejected, dropped = provider_validation.validate_forecast_rows(rows)
+            if (rejected or dropped) and self._diagnostics is not None:
+                self._diagnostics.record(
+                    source="meteonomiqs", event_type="validation_rejected",
+                    detail=(
+                        f"{rejected} out-of-bounds value(s), "
+                        f"{dropped} past-hour row(s)"
+                    ),
+                )
             await self.hass.async_add_executor_job(
                 self._db.insert_forecast_snapshots_bulk, rows
             )
@@ -1803,6 +1858,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         now: datetime,
         latest_forecast: dict,
         bucket_lookup: dict,
+        basis_by_source: Optional[dict] = None,
     ) -> None:
         """Write one paired comparison row per (target, measurement, lead).
 
@@ -1819,6 +1875,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         """
         from .models import model_a
 
+        basis_by_source = basis_by_source or {}
         rows: list[tuple] = []
         for lead in BLEND_COMPARISON_LEAD_HOURS:
             target = (now + timedelta(hours=lead)).replace(
@@ -1835,15 +1892,34 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                     continue
 
                 contributors: dict[str, dict[str, Any]] = {}
+                bases: list[str] = []
                 for c in contributions:
                     debiased = model_a.debiased_value(c)
                     if debiased is None:
                         continue
+                    # v0.3.1 (SWF-ICS-049): the basis recorded on the
+                    # forecast row this contribution came from, not a
+                    # guess derived from which provider serves the source.
+                    #
+                    # _comparison_basis used to test membership in
+                    # OPEN_METEO_METADATA_MODELS — whether a source COULD
+                    # have a run time, not whether one was obtained. When
+                    # a metadata fetch failed, forecast_snapshots
+                    # correctly recorded 'poll' while the comparison row
+                    # claimed 'run'. Two rows describing the same forecast
+                    # disagreed about its provenance, and only one of them
+                    # was right.
+                    source_basis = basis_by_source.get(
+                        (c.source, measurement, target.isoformat()),
+                        LEAD_TIME_BASIS_POLL,
+                    )
+                    bases.append(source_basis)
                     contributors[c.source] = {
                         "raw": round(c.raw_value, 4),
                         "debiased": round(debiased, 4),
                         "trusted": c.sample_count >= MIN_SAMPLES_TO_TRUST_BUCKET,
                         "samples": c.sample_count,
+                        "basis": source_basis,
                     }
                 if not contributors:
                     continue
@@ -1854,7 +1930,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                         measurement,
                         int(lead),
                         now.isoformat(),
-                        self._comparison_basis(contributors.keys()),
+                        self._comparison_basis(bases),
                         blend_value,
                         json.dumps(contributors, separators=(",", ":")),
                     )
@@ -1876,8 +1952,8 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 inserted, len(rows),
             )
 
-    def _comparison_basis(self, sources) -> str:
-        """'run' only if EVERY contributing source had a known run time.
+    def _comparison_basis(self, bases) -> str:
+        """'run' only if EVERY contributing row was actually run-relative.
 
         Deliberately all-or-nothing. A row whose lead offset is
         run-relative for two sources and poll-relative for three is not
@@ -1885,11 +1961,18 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         that ARC-04 is about. Since SRF and meteoblue expose no run time
         at all, most rows will read 'poll' — and that is the honest
         label, not a failure.
+
+        v0.3.1 (SWF-ICS-049): takes the per-row bases actually recorded
+        at storage time. It previously took source NAMES and inferred the
+        basis from a constant, which was right only while every metadata
+        fetch succeeded.
         """
-        for source in sources:
-            if source not in OPEN_METEO_METADATA_MODELS:
-                return LEAD_TIME_BASIS_POLL
-        return LEAD_TIME_BASIS_RUN
+        bases = list(bases)
+        if not bases:
+            return LEAD_TIME_BASIS_POLL
+        if all(b == LEAD_TIME_BASIS_RUN for b in bases):
+            return LEAD_TIME_BASIS_RUN
+        return LEAD_TIME_BASIS_POLL
 
     def _blend_at(
         self,
@@ -2093,6 +2176,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             start_valid_at=now.isoformat(), end_valid_at=end.isoformat()
         )
         latest_forecast: dict[tuple[str, str, str], tuple[float, datetime]] = {}
+        basis_by_source: dict[tuple[str, str, str], str] = {}
         for row in raw_rows:
             if row["value"] is None:
                 continue
@@ -2100,6 +2184,14 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             if key in latest_forecast:
                 continue  # already have the freshest (rows are issued_at DESC)
             latest_forecast[key] = (row["value"], datetime.fromisoformat(row["issued_at"]))
+            # v0.3.1 (SWF-ICS-049): carry each row's RECORDED lead-time
+            # basis alongside its value, so the paired comparison can
+            # state provenance instead of inferring it. Keyed identically
+            # to latest_forecast, so the two cannot drift apart.
+            basis_by_source[key] = (
+                row["lead_time_basis"] if "lead_time_basis" in row.keys()
+                else LEAD_TIME_BASIS_POLL
+            )
 
         bucket_rows = self._db.get_all_bucket_stats()
         bucket_lookup: dict[tuple, BucketStats] = {}
@@ -2263,6 +2355,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             now=now,
             latest_forecast=latest_forecast,
             bucket_lookup=bucket_lookup,
+            basis_by_source=basis_by_source,
         )
 
         return {
@@ -2623,6 +2716,17 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         }
         for row in station_rows:
             ts = datetime.fromisoformat(row["ts"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            # v0.3.1 (SWF-ICS-043): a measurement stamped in the future
+            # cannot be ground truth for a forecast of the past. The query
+            # window deliberately extends past `now` by a tolerance, so a
+            # clock-skewed or restored row can land inside it, and
+            # find_nearest_observation would happily select it for a
+            # target near the boundary. Model B already guards this; Model
+            # A did not.
+            if ts > now:
+                continue
             candidates_by_measurement["temperature"].append((ts, row["temperature"]))
             candidates_by_measurement["humidity"].append((ts, row["humidity"]))
             candidates_by_measurement["pressure"].append((ts, row["pressure"]))

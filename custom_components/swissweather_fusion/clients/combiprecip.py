@@ -26,10 +26,19 @@ guessing further.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+
+from ..const import (
+    MAX_RADAR_DOWNLOAD_BYTES,
+    RADAR_ACCUM_MAX_MM,
+    RADAR_ACCUM_MIN_MM,
+)
+
+_LOGGER = logging.getLogger(__name__)
 
 STAC_COLLECTION = "ch.meteoschweiz.ogd-radar-precip"
 STAC_ITEMS_URL = (
@@ -399,6 +408,56 @@ def _pixel_indices(
     return math.floor(row_continuous), math.floor(col_continuous), xsize, ysize
 
 
+_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+# Hosts this client will follow an asset href to. MeteoSwiss serves both
+# its STAC catalogue and the radar files themselves from data.geo.admin.ch.
+_TRUSTED_ASSET_HOSTS = ("data.geo.admin.ch",)
+
+
+def _assert_trusted_asset_origin(href: str) -> None:
+    """Refuse an asset URL that is not HTTPS on a known MeteoSwiss host.
+
+    v0.3.1 (SWF-ICS-009). The href is read out of a provider-supplied STAC
+    document and handed straight to the HTTP session, so without this the
+    provider — or anything able to influence that document — chooses which
+    host this integration contacts and what it downloads.
+
+    An allowlist rather than a denylist, and an exact host match rather
+    than a suffix test, because `data.geo.admin.ch.example.com` ends with
+    the trusted string and is not the trusted host.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(href)
+    if parsed.scheme != "https" or parsed.hostname not in _TRUSTED_ASSET_HOSTS:
+        raise ValueError(
+            f"CombiPrecip asset href is not an allowed origin: {href!r}"
+        )
+
+
+def _finite_attr(raw: Any, name: str, *, default: float) -> float:
+    """Coerce an HDF5 calibration attribute to a finite float.
+
+    v0.3.1 (SWF-ICS-057/066/071). Falls back to the ODIM default rather
+    than raising, because a missing or broken calibration attribute is a
+    per-attribute problem and the documented defaults (gain 1.0, offset
+    0.0) are the correct interpretation of "not stated". A non-finite
+    value, by contrast, is stated and wrong, so it is logged.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value):
+        _LOGGER.warning(
+            "CombiPrecip calibration attribute %s is %r; using default %r",
+            name, value, default,
+        )
+        return default
+    return value
+
+
 def extract_values_at_points(
     *, hdf5_path: str, points: list[SamplingPoint], quality: Optional[int] = None
 ) -> list[RadarPixelValue]:
@@ -424,20 +483,76 @@ def extract_values_at_points(
         dataset = f["dataset1"]["data1"]
         data = dataset["data"]
         what = dataset["what"].attrs
-        gain = float(what.get("gain", 1.0))
-        offset = float(what.get("offset", 0.0))
+        # v0.3.1 (SWF-ICS-010/021/057/066/071): calibration coefficients
+        # are external data and get the same treatment every other
+        # external number gets. A non-finite gain or offset silently turns
+        # every pixel into NaN, and NaN compares False against both the
+        # nodata and undetect sentinels below, so it would flow straight
+        # through to radar_observations and Model B looking like a
+        # measurement.
+        gain = _finite_attr(what.get("gain", 1.0), "gain", default=1.0)
+        offset = _finite_attr(what.get("offset", 0.0), "offset", default=0.0)
         nodata = what.get("nodata")
         undetect = what.get("undetect")
 
         what_root = f["what"].attrs
         date_str = what_root.get("date")
         time_str = what_root.get("time")
-        valid_at = datetime.now(timezone.utc)
-        if date_str and time_str:
-            date_str = date_str.decode() if isinstance(date_str, bytes) else date_str
-            time_str = time_str.decode() if isinstance(time_str, bytes) else time_str
-            valid_at = datetime.strptime(date_str + time_str, "%Y%m%d%H%M%S").replace(
-                tzinfo=timezone.utc
+        # v0.3.1 (SWF-ICS-032/065/074), CRITICAL: a missing or malformed
+        # product time REJECTS the file. It used to default to
+        # datetime.now(), which converts "this product's age is unknown"
+        # into "this product was made this instant" — the single most
+        # dangerous direction to be wrong in for a freshness gate.
+        #
+        # Model B's RADAR_FRESHNESS_LIMIT exists to stop stale radar
+        # driving the storm score. A synthesised `now` defeated it
+        # completely and silently: the staler and more broken the
+        # product, the fresher it appeared.
+        #
+        # Raising here rather than returning a sentinel is deliberate.
+        # The caller wraps this whole parse in try/except -> UpdateFailed,
+        # so a bad product becomes one failed poll and the previous good
+        # reading stands. Fail closed, retry in five minutes.
+        if not date_str or not time_str:
+            raise ValueError(
+                "CombiPrecip product has no /what date+time; refusing to "
+                "assign it a synthetic timestamp"
+            )
+        date_str = date_str.decode() if isinstance(date_str, bytes) else date_str
+        time_str = time_str.decode() if isinstance(time_str, bytes) else time_str
+        try:
+            valid_at = datetime.strptime(
+                str(date_str) + str(time_str), "%Y%m%d%H%M%S"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError as err:
+            raise ValueError(
+                f"CombiPrecip product time is unparseable "
+                f"({date_str!r}{time_str!r})"
+            ) from err
+
+        # v0.3.1 (SWF-ICS-033/060/073): the declared grid and the actual
+        # array must agree before any coordinate arithmetic runs.
+        # _pixel_indices derives row/col from /where's xsize and ysize; if
+        # the file's metadata disagrees with the dataset it ships, the
+        # index is computed against one grid and read from another.
+        #
+        # This already failed closed — IndexError propagates to the
+        # coordinator's try/except and becomes a failed poll — so the
+        # change here is the ERROR, not the outcome. "Radar grid metadata
+        # disagrees with the data array" is diagnosable from a log line;
+        # a bare IndexError from inside h5py is not.
+        shape = getattr(data, "shape", None)
+        if shape is not None and len(shape) == 2:
+            declared = (where.get("ysize"), where.get("xsize"))
+            if all(d is not None for d in declared):
+                if (int(declared[0]), int(declared[1])) != tuple(shape):
+                    raise ValueError(
+                        f"CombiPrecip grid metadata {declared} disagrees with "
+                        f"the data array shape {tuple(shape)}"
+                    )
+        elif shape is not None:
+            raise ValueError(
+                f"CombiPrecip data is not a 2-D raster (shape {tuple(shape)})"
             )
 
         results: list[RadarPixelValue] = []
@@ -473,6 +588,25 @@ def extract_values_at_points(
                 continue
 
             value = float(raw_value) * gain + offset
+            # v0.3.1: the decoded result is bounded too, not just its
+            # inputs. Finite inputs can still produce a physically absurd
+            # accumulation, and `provider_validation` — which guards every
+            # FORECAST value — was never wired to the radar path.
+            # Out-of-range reads as "no data", the representation every
+            # downstream consumer already handles.
+            if not math.isfinite(value) or not (
+                RADAR_ACCUM_MIN_MM <= value <= RADAR_ACCUM_MAX_MM
+            ):
+                _LOGGER.warning(
+                    "CombiPrecip pixel %s decoded to an implausible "
+                    "accumulation (%r mm); treating as no-data",
+                    point.label, value,
+                )
+                results.append(
+                    RadarPixelValue(label=point.label, precip_accum_mm_1h=None,
+                                    valid_at=valid_at, quality=quality)
+                )
+                continue
             results.append(
                 RadarPixelValue(label=point.label, precip_accum_mm_1h=value, valid_at=valid_at, quality=quality)
             )
@@ -572,11 +706,48 @@ class CombiPrecipClient:
         # deliberately split across an executor-job boundary.
         self._last_asset_quality = latest.quality
 
+        # v0.3.1 (SWF-ICS-009): the href comes from a provider document,
+        # so it is treated as untrusted input rather than as a URL this
+        # code chose. TLS covers a network attacker; it does not cover a
+        # catalogue that has been made to point somewhere else.
+        _assert_trusted_asset_origin(latest.href)
+
         async with self._session.get(
             latest.href, timeout=aiohttp.ClientTimeout(total=60)
         ) as resp:
             resp.raise_for_status()
-            return await resp.read()
+            # v0.3.1 (SWF-ICS-008/026/070): bounded read. `resp.read()`
+            # allocates whatever arrives — and this is the one client
+            # downloading a binary file, so a truncated, mis-served or
+            # hostile response could exhaust memory on a Raspberry Pi
+            # before anything else noticed. A declared Content-Length is
+            # checked first so an oversized body is refused before a byte
+            # is read; the streaming loop then enforces the same bound on
+            # responses that declare nothing.
+            declared = resp.headers.get("Content-Length")
+            if declared is not None:
+                try:
+                    if int(declared) > MAX_RADAR_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"CombiPrecip asset declares {declared} bytes, "
+                            f"above the {MAX_RADAR_DOWNLOAD_BYTES} limit"
+                        )
+                except ValueError as err:
+                    if "above the" in str(err):
+                        raise
+                    # Unparseable header: fall through to the streaming
+                    # bound rather than trusting or rejecting it.
+            chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.content.iter_chunked(_DOWNLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > MAX_RADAR_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        "CombiPrecip asset exceeded "
+                        f"{MAX_RADAR_DOWNLOAD_BYTES} bytes; aborting download"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
 
     def write_temp_and_extract(self, data: bytes) -> list[RadarPixelValue]:
         """Synchronous — must only ever be called via

@@ -339,6 +339,36 @@ METEONOMIQS_MAX_BONUS_CALLS_PER_EVENT = 1
 #
 # This value is therefore correct as it stands and must not be "fixed" to
 # 10 minutes; doing so would halve the radar update rate for no benefit
+# v0.3.1 (SWF-ICS-010/057/066): physical bounds for a CombiPrecip
+# one-hour accumulation, applied to the DECODED value.
+#
+# The forecast path has had a bounds barrier since v0.1.24 (P1-23); the
+# radar path never did, so a corrupted calibration attribute or a garbled
+# raster could put NaN or an absurd accumulation into radar_observations
+# and from there into the storm score.
+#
+# 400 mm/h is far above any credible Swiss hourly total — the national
+# record is an order of magnitude below it — and is chosen to reject
+# decode failures rather than to second-guess meteorology. Anything at or
+# near this value is a broken file, not a cloudburst.
+# v0.3.1 (SWF-ICS-011): how far into the future a radar product's own
+# timestamp may sit before the reading is refused. Small, because the only
+# legitimate cause is clock skew between the producer and this host; a
+# genuinely future-dated measurement does not exist.
+# v0.3.1 (SWF-ICS-008/026/070): hard ceiling on the CombiPrecip binary
+# download. A CPC product is a few hundred kilobytes; 64 MB is two orders
+# of magnitude of headroom and still small enough that refusing at this
+# point protects a Raspberry Pi from an unbounded allocation.
+MAX_RADAR_DOWNLOAD_BYTES = 64 * 1024 * 1024
+
+# v0.3.1 (SWF-ICS-058): per-event cap on diagnostic detail text.
+MAX_DIAGNOSTIC_DETAIL_CHARS = 2000
+
+RADAR_CLOCK_SKEW_TOLERANCE = timedelta(minutes=5)
+
+RADAR_ACCUM_MIN_MM = 0.0
+RADAR_ACCUM_MAX_MM = 400.0
+
 # and would also corrupt RADAR_FRESHNESS_LIMIT below, which is derived
 # from it. tests/test_combiprecip.py pins this with a citation so the
 # same change cannot be reintroduced silently.

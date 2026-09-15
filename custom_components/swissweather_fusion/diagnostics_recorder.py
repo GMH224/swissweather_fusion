@@ -30,6 +30,8 @@ has explicitly asked to watch closely, not as a standing background cost.
 from __future__ import annotations
 
 from collections import deque
+
+from .const import MAX_DIAGNOSTIC_DETAIL_CHARS
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -72,6 +74,16 @@ class DiagnosticsRecorder:
     ) -> None:
         if not self._enabled:
             return
+        # v0.3.1 (SWF-ICS-058): the deque bounds the event COUNT; nothing
+        # bounded the length of a single detail string. One provider
+        # returning a multi-megabyte error body would be retained in
+        # memory until the ring wrapped around it, and would then be
+        # copied verbatim into every diagnostics download.
+        if len(detail) > MAX_DIAGNOSTIC_DETAIL_CHARS:
+            detail = (
+                detail[:MAX_DIAGNOSTIC_DETAIL_CHARS]
+                + f"... [truncated, {len(detail)} chars total]"
+            )
         self._events.append(
             DiagnosticEvent(
                 ts=datetime.now(timezone.utc).isoformat(),

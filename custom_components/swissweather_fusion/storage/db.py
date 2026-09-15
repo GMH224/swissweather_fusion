@@ -36,7 +36,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import math
 import sqlite3
+from contextlib import contextmanager
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -60,7 +62,11 @@ _LOGGER = logging.getLogger(__name__)
 # v0.3.0: bumped to 4 for the blend_comparison table and the two run-time
 # attribution columns on forecast_snapshots. See _migrate_to_v4 — that one
 # IS additive for raw data, and deliberately destructive for bucket_stats.
-SCHEMA_VERSION = 4
+# v0.3.1: bumped to 5. No shape change — this is a DATA migration. Every
+# bucket learned before v0.3.1 was contaminated by SWF-ICS-051 (past-hour
+# rows graded as short-lead forecasts), so the learned state has to go
+# even though the columns holding it are unchanged. See _migrate_to_v5.
+SCHEMA_VERSION = 5
 
 # v0.1.23: how far back the v1->v2 migration re-opens forecast_snapshots
 # rows for a fresh, correct reconciliation pass. Deliberately reuses the
@@ -69,6 +75,12 @@ SCHEMA_VERSION = 4
 # window) rather than inventing a second number that could drift out of
 # sync with it.
 MIGRATION_REOPEN_WINDOW = timedelta(days=14)
+
+# v0.3.1 (SWF-ICS-048): how recently a forecast must have been issued to
+# count toward the station cross-check reference. 24 hours keeps every
+# source represented — the slowest publishes every 3 hours — while
+# excluding the multi-day-old runs that were diluting the median.
+REFERENCE_VINTAGE_WINDOW = timedelta(hours=24)
 
 # Columns each schema version guarantees. Used by _ensure_schema to decide
 # what to migrate, on the evidence of the actual table shape rather than
@@ -87,6 +99,8 @@ _V3_REQUIRED_COLUMNS = {
 # Derived, not restated: v4 is v3 plus two columns on one table. Written
 # this way so a future v5 cannot accidentally drop a v3 requirement while
 # copying the block.
+_V5_DATA_MIGRATION_KEY = "v0_3_1_lead_time_contamination_cleared"
+
 _V4_REQUIRED_COLUMNS = {
     **_V3_REQUIRED_COLUMNS,
     "forecast_snapshots": (
@@ -342,6 +356,37 @@ class SwissWeatherDB:
         self._configure_pragmas()
         self._ensure_schema()
 
+    @contextmanager
+    def _transaction(self):
+        """Own the transaction explicitly: commit on success, roll back on
+        any exception.
+
+        **v0.3.1 (SWF-ICS-045/046/047/075).** Most multi-statement methods
+        here were written as `with self._transaction(): ...; self._conn.commit()`
+        with no exception path. That is safe against process death —
+        SQLite rolls back an uncommitted transaction on reopen, which an
+        external SIGKILL test confirmed — but it is NOT safe against an
+        exception inside a live process. sqlite3 leaves the transaction
+        open, the lock is released, and the NEXT successful call's commit
+        writes the earlier partial work as though it had been intended.
+
+        The two properties are genuinely different, and passing the crash
+        test says nothing about the second:
+
+            process dies mid-transaction  -> SQLite rolls back      OK
+            exception inside live process -> application rolls back  needs this
+
+        Nested use is not supported and not needed: every caller is a
+        single public method holding the lock for one logical write.
+        """
+        with self._lock:
+            try:
+                yield self._conn
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def _configure_pragmas(self) -> None:
         # WAL + NORMAL sync: kinder to SD-card/VM-disk storage under frequent
         # small writes than the default rollback-journal mode. busy_timeout
@@ -427,7 +472,18 @@ class SwissWeatherDB:
 
         if is_fresh or looks_current:
             # Either genuinely new (the CREATE TABLE statements above just
-            # built everything at the current shape) or already current.
+            # built everything at the current shape) or already current
+            # IN SHAPE.
+            #
+            # v0.3.1: "current in shape" is no longer the same as "current".
+            # This release's migration changes no columns — it discards
+            # learned state that the shape cannot distinguish from valid
+            # learned state. A v0.3.0 database passes every column check
+            # above and still needs it, so _migrate_to_v5 is dispatched on
+            # its own marker rather than on the table shape. Skipping it
+            # here would leave the contaminated buckets in place on exactly
+            # the installations that already upgraded.
+            self._migrate_to_v5()
             self._conn.executescript(_INDEX_SQL)
             self._write_schema_version()
             self._conn.commit()
@@ -447,6 +503,7 @@ class SwissWeatherDB:
         if not looks_v3:
             self._migrate_to_v3()
         self._migrate_to_v4()
+        self._migrate_to_v5()
         self._conn.executescript(_INDEX_SQL)
         self._write_schema_version()
         self._conn.commit()
@@ -483,6 +540,59 @@ class SwissWeatherDB:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(SCHEMA_VERSION),),
         )
+
+    def _migrate_to_v5(self) -> None:
+        """v0.3.1: discard learned state contaminated by SWF-ICS-051.
+
+        **No column changes.** This is a data migration, dispatched on its
+        own marker in schema_meta rather than on the table shape, because
+        the shape cannot tell a contaminated bucket from a sound one —
+        that is precisely what made the defect survive three audits.
+
+        **What was wrong.** `parse_forecast_response` stored every hour a
+        provider returned, and Open-Meteo's series begins at 00:00 UTC
+        today. A poll at 15:00 therefore stored fifteen hours whose target
+        time had already passed. `derive_lead_time_bucket` computed a
+        negative lead and returned `short`, because its first test is
+        `lead_hours < 24` with no lower bound. Those rows reconciled
+        against observations of hours the model run had already ingested —
+        they are hindcasts, and roughly a quarter of every Open-Meteo
+        poll's rows were being graded as short-lead forecast skill.
+
+        Every `short` bucket since v0.1 is therefore optimistic, and
+        `blend_comparison` inherits it because each source's debiased value
+        is read from those buckets.
+
+        **Why the raw rows go too.** Unlike v0.3.0's wipe, this migration
+        also deletes the already-reconciled past-hour snapshots. Leaving
+        them would be harmless for the blend but would let a future
+        re-reconciliation reintroduce exactly the contamination being
+        cleared. Forward-dated history is kept.
+        """
+        if self._get_meta(_V5_DATA_MIGRATION_KEY) == "done":
+            return
+
+        _LOGGER.warning(
+            "SwissWeather Fusion v0.3.1: clearing learned statistics "
+            "contaminated by past-hour forecast rows (SWF-ICS-051). Every "
+            "source restarts at cold start and the blend averages raw "
+            "values until buckets refill — expected, not a fault. Forward "
+            "forecast history, station observations and Model B history "
+            "are preserved."
+        )
+        with self._transaction():
+            self._conn.execute("DELETE FROM bucket_stats")
+            self._conn.execute("DELETE FROM blend_comparison")
+            # Past-hour rows: valid_at at or before the poll that stored
+            # them. Deleted rather than merely marked, so no future
+            # reconciliation pass can fold them back in.
+            self._conn.execute(
+                "DELETE FROM forecast_snapshots WHERE valid_at <= issued_at"
+            )
+            self._conn.execute(
+                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                (_V5_DATA_MIGRATION_KEY, "done"),
+            )
 
     def _migrate_to_v4(self) -> None:
         """v0.3.0: run-time attribution columns, and a deliberate wipe of
@@ -694,13 +804,12 @@ class SwissWeatherDB:
         humidity: Optional[float],
         pressure: Optional[float],
     ) -> None:
-        with self._lock:
+        with self._transaction():
             self._conn.execute(
                 "INSERT INTO station_observations (ts, temperature, humidity, pressure) "
                 "VALUES (?, ?, ?, ?)",
                 (ts, temperature, humidity, pressure),
             )
-            self._conn.commit()
 
     def get_station_observations_since(self, since_ts: str) -> list[sqlite3.Row]:
         with self._lock:
@@ -764,14 +873,13 @@ class SwissWeatherDB:
         form is kept as a test-setup convenience (see tests/test_db.py and
         tests/test_learning_integration.py, which exercise it directly)
         rather than removed as dead production code."""
-        with self._lock:
+        with self._transaction():
             self._conn.execute(
                 "INSERT INTO forecast_snapshots "
                 "(source, issued_at, valid_at, variable, value, trigger_reason) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (source, issued_at, valid_at, variable, value, trigger_reason),
             )
-            self._conn.commit()
 
     def insert_forecast_snapshots_bulk(
         self, rows: Iterable[tuple]
@@ -801,7 +909,11 @@ class SwissWeatherDB:
             )
         wide = [r for r in rows if len(r) == 8]
         narrow = [r for r in rows if len(r) == 6]
-        with self._lock:
+        # v0.3.1 (SWF-ICS-045): explicit transaction ownership. A failure
+        # partway through the two executemany calls below used to leave
+        # the transaction open, so a later successful write committed the
+        # half-inserted poll along with itself.
+        with self._transaction():
             if narrow:
                 self._conn.executemany(
                     "INSERT INTO forecast_snapshots "
@@ -817,7 +929,6 @@ class SwissWeatherDB:
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     wide,
                 )
-            self._conn.commit()
 
     def get_reference_value(
         self, variable: str, hour_prefix: str
@@ -838,14 +949,33 @@ class SwissWeatherDB:
         Median rather than mean, so one absurd provider value cannot drag
         the reference far enough to mask a genuine station error.
         """
+        vintage_cutoff = (
+            datetime.now(timezone.utc) - REFERENCE_VINTAGE_WINDOW
+        ).isoformat()
         with self._lock:
             cur = self._conn.execute(
+                # v0.3.1 (SWF-ICS-048): bounded by forecast VINTAGE.
+                #
+                # This had no issued_at filter, so the median mixed every
+                # run that ever covered this hour — a 48-hour-old forecast
+                # weighted equally with one made an hour ago. That widens
+                # the reference, and a wider reference is more willing to
+                # accept a station reading it should have flagged. The
+                # cross-check exists to catch a badly-sited sensor; a
+                # diluted reference quietly stops catching it, and the bad
+                # readings then teach Model A.
+                #
+                # A window rather than "latest run per source", because
+                # the sources publish on different cadences and picking
+                # the latest per source would silently weight whichever
+                # provider happens to poll most often.
                 "SELECT value FROM forecast_snapshots "
                 "WHERE variable = ? AND value IS NOT NULL "
                 "AND source != 'blend' "
                 "AND substr(valid_at, 1, 13) = ? "
+                "AND issued_at >= ? "
                 "ORDER BY value",
-                (variable, hour_prefix),
+                (variable, hour_prefix, vintage_cutoff),
             )
             values = [row["value"] for row in cur.fetchall()]
         if not values:
@@ -957,16 +1087,21 @@ class SwissWeatherDB:
         rather than one UPDATE per row, matching the project's existing
         bulk-operation convention (v0.1.13) for the same performance reason.
         """
-        assert status in ("reconciled", "skipped"), f"invalid status: {status!r}"
+        # v0.3.1 (SWF-ICS-017): was `assert`, which python -O strips
+        # entirely. Nobody runs Home Assistant under -O, so this was never
+        # live — but a validation whose existence depends on an
+        # interpreter flag is not a validation, and the cost of being
+        # explicit is one line.
+        if status not in ("reconciled", "skipped"):
+            raise ValueError(f"invalid reconciliation status: {status!r}")
         ids = list(ids)
         if not ids:
             return
-        with self._lock:
+        with self._transaction():
             self._conn.executemany(
                 "UPDATE forecast_snapshots SET reconciliation_status = ? WHERE id = ?",
                 [(status, i) for i in ids],
             )
-            self._conn.commit()
 
     def get_forecast_snapshots_in_window(
         self, *, start_valid_at: str, end_valid_at: str
@@ -1016,13 +1151,12 @@ class SwissWeatherDB:
         value is millimetres accumulated over the preceding hour, which is
         what MeteoSwiss's CPC product actually reports.
         """
-        with self._lock:
+        with self._transaction():
             self._conn.execute(
                 "INSERT INTO radar_observations "
                 "(ts, precip_accum_mm_1h, precip_type, quality) VALUES (?, ?, ?, ?)",
                 (ts, precip_accum_mm_1h, precip_type, quality),
             )
-            self._conn.commit()
 
     def get_radar_observations_between(
         self, start_ts: str, end_ts: str
@@ -1081,7 +1215,7 @@ class SwissWeatherDB:
         sample_count: int,
         last_updated: str,
     ) -> None:
-        with self._lock:
+        with self._transaction():
             self._conn.execute(
                 "INSERT INTO bucket_stats "
                 "(hour_of_day, season, lead_time_bucket, source, measurement, "
@@ -1106,7 +1240,6 @@ class SwissWeatherDB:
                     last_updated,
                 ),
             )
-            self._conn.commit()
 
     def apply_reconciliation_batch(
         self,
@@ -1142,6 +1275,36 @@ class SwissWeatherDB:
         """
         if not bucket_updates and not reconciled_ids and not skipped_ids:
             return
+
+        # v0.3.1: a non-finite learned statistic can never enter the
+        # database.
+        #
+        # This is the "never reset again" guard. bucket_stats is the one
+        # table whose corruption cannot be repaired forward: an EMA has no
+        # mechanism for forgetting a sample it has absorbed, so a single
+        # NaN or Inf written here poisons that bucket permanently and the
+        # only remedy is another full wipe. The input path is now guarded
+        # in several places — provider_validation bounds every stored
+        # value, SWF-ICS-043 blocks future observations, SWF-ICS-051
+        # blocks past-hour rows — but those are guards on the way IN, and
+        # each of them is one refactor away from being bypassed.
+        #
+        # This one sits at the boundary of the irreversible table, so it
+        # holds regardless of what happens upstream. Dropping the update
+        # costs one sample; accepting it costs the bucket.
+        clean_updates = []
+        for update in bucket_updates:
+            key, bias, abs_error, weight, count, ts = update
+            if not all(math.isfinite(v) for v in (bias, abs_error, weight)):
+                _LOGGER.error(
+                    "Refusing a non-finite learned statistic for %s/%s "
+                    "(bias=%r, abs_error=%r, weight=%r); the bucket keeps "
+                    "its previous value", key.source, key.measurement,
+                    bias, abs_error, weight,
+                )
+                continue
+            clean_updates.append(update)
+        bucket_updates = clean_updates
 
         with self._lock:
             try:
@@ -1225,7 +1388,11 @@ class SwissWeatherDB:
         rows = list(rows)
         if not rows:
             return 0
-        with self._lock:
+        # v0.3.1 (SWF-ICS-046): same ownership fix as the forecast bulk
+        # insert. apply_blend_comparison_batch below already rolled back
+        # correctly; this one did not, in the same module and the same
+        # release.
+        with self._transaction():
             cur = self._conn.executemany(
                 "INSERT OR IGNORE INTO blend_comparison "
                 "(valid_at, measurement, lead_hours, issued_at, "
@@ -1233,8 +1400,7 @@ class SwissWeatherDB:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
-            self._conn.commit()
-            return cur.rowcount or 0
+        return cur.rowcount or 0
 
     def get_pending_blend_comparisons(self, until_ts: str) -> list[sqlite3.Row]:
         """Comparison rows whose target hour has passed and which have no
@@ -1314,15 +1480,14 @@ class SwissWeatherDB:
         combination — measurement table plus retention disabled — is
         exactly the reporting installation this release was built for.
         """
-        with self._lock:
+        with self._transaction():
             cur = self._conn.execute(
                 "DELETE FROM blend_comparison WHERE id NOT IN ("
                 "  SELECT id FROM blend_comparison ORDER BY valid_at DESC LIMIT ?"
                 ")",
                 (max_rows,),
             )
-            self._conn.commit()
-            return cur.rowcount or 0
+        return cur.rowcount or 0
 
     # -- storm events (Model B ground truth) -------------------------------------
 
@@ -1335,14 +1500,13 @@ class SwissWeatherDB:
         peak_precip_rate: Optional[float],
         notes: Optional[str] = None,
     ) -> int:
-        with self._lock:
+        with self._transaction():
             cur = self._conn.execute(
                 "INSERT INTO storm_events "
                 "(start_ts, end_ts, peak_pressure_drop, peak_temp_drop, peak_precip_rate, notes) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (start_ts, end_ts, peak_pressure_drop, peak_temp_drop, peak_precip_rate, notes),
             )
-            self._conn.commit()
             return cur.lastrowid
 
     def get_all_storm_events(self) -> list[sqlite3.Row]:
@@ -1355,12 +1519,11 @@ class SwissWeatherDB:
     def insert_storm_prediction(
         self, ts: str, probability: float, features: dict[str, Any]
     ) -> None:
-        with self._lock:
+        with self._transaction():
             self._conn.execute(
                 "INSERT INTO storm_predictions (ts, probability, features) VALUES (?, ?, ?)",
                 (ts, probability, json.dumps(features)),
             )
-            self._conn.commit()
 
     def get_storm_predictions_since(self, since_ts: str) -> list[sqlite3.Row]:
         with self._lock:
@@ -1394,7 +1557,12 @@ class SwissWeatherDB:
         instead of the row aging out through the normal 'skipped' path.
         """
         deleted: dict[str, int] = {}
-        with self._lock:
+        # v0.3.1 (SWF-ICS-047): a failure partway through the table-by-
+        # table cleanup below used to leave the earlier DELETEs staged and
+        # the transaction open, so the next successful write committed a
+        # partial purge — and the returned counts described rows that had
+        # not actually been deleted yet.
+        with self._transaction():
             cur = self._conn.execute(
                 "DELETE FROM forecast_snapshots "
                 "WHERE valid_at < ? AND reconciliation_status != 'pending'",
@@ -1421,7 +1589,6 @@ class SwissWeatherDB:
                     f"DELETE FROM {table} WHERE {ts_col} < ?", (cutoff_ts,)
                 )
                 deleted[table] = cur.rowcount
-            self._conn.commit()
         return deleted
 
     # -- durable runtime state (v0.1.23 fixes L-06/L-05/L-04/L-07/L-08/L-09) -----
@@ -1439,13 +1606,12 @@ class SwissWeatherDB:
             return row["value"] if row else None
 
     def _set_meta(self, key: str, value: str) -> None:
-        with self._lock:
+        with self._transaction():
             self._conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES (?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, value),
             )
-            self._conn.commit()
 
     def get_provider_run_fingerprint(self, source: str) -> Optional[str]:
         """Fixes L-06 (Open-Meteo's dedup fingerprint was memory-only) and
@@ -1491,11 +1657,10 @@ class SwissWeatherDB:
             )
             try:
                 self._set_meta(key, "")
-                with self._lock:
+                with self._transaction():
                     self._conn.execute(
                         "DELETE FROM schema_meta WHERE key = ?", (key,)
                     )
-                    self._conn.commit()
             except sqlite3.Error:  # pragma: no cover - defensive
                 pass
             return None
@@ -1628,13 +1793,12 @@ class SwissWeatherDB:
         """
         if not ids:
             return
-        with self._lock:
+        with self._transaction():
             placeholders = ",".join("?" for _ in ids)
             self._conn.execute(
                 f"UPDATE storm_predictions SET reconciled = 1 WHERE id IN ({placeholders})",
                 tuple(ids),
             )
-            self._conn.commit()
 
     # -- database size telemetry (v0.1.24, IND-06) -----------------------------
 

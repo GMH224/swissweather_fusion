@@ -35,6 +35,8 @@ evidence that the provider did return something for that hour.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import math
 from typing import Any, Iterable, Optional
 
@@ -118,6 +120,8 @@ def validate_forecast_value(variable: str, value: Optional[float]) -> Optional[f
 
 # Field positions shared by both accepted row shapes. Named rather than
 # inlined so the 6/8 relationship is stated once.
+_ISSUED_AT_INDEX = 1
+_VALID_AT_INDEX = 2
 _VARIABLE_INDEX = 3
 _VALUE_INDEX = 4
 _VALID_ROW_WIDTHS = (6, 8)
@@ -133,7 +137,9 @@ def validate_forecast_rows(
     or the v0.3.0 8-tuple with ``(run_initialised_at, lead_time_basis)``
     appended by the Open-Meteo coordinator.
 
-    Returns ``(validated_rows, rejection_count)``. Row count, order and
+    Returns ``(validated_rows, rejection_count, dropped_count)``.
+    v0.3.1 added the third element; row count is no longer preserved,
+    because SWF-ICS-051 rows are removed rather than nulled. Row count, order and
     shape are all preserved exactly — only out-of-bounds values are
     replaced with None. The rejection count is returned rather than
     logged here so the caller can record it as a diagnostics event with
@@ -151,6 +157,7 @@ def validate_forecast_rows(
     """
     validated: list[tuple[Any, ...]] = []
     rejected = 0
+    dropped = 0
 
     for row in rows:
         # Defensive: a row that is not a recognised shape is passed
@@ -159,6 +166,30 @@ def validate_forecast_rows(
         # module's job is value sanity, not schema enforcement.
         if len(row) not in _VALID_ROW_WIDTHS:
             validated.append(row)
+            continue
+
+        # v0.3.1 (SWF-ICS-051), BEFORE the value check: a row whose target
+        # hour is at or before the moment it was issued is not a forecast.
+        #
+        # Open-Meteo's hourly series starts at 00:00 UTC today, so a poll
+        # at 15:00 returns fifteen hours that have already happened. Those
+        # rows were stored, reconciled against observations of hours the
+        # model run had already ingested, and — because
+        # derive_lead_time_bucket tests `lead_hours < 24` with no lower
+        # bound — filed in the SHORT bucket. Roughly a quarter of every
+        # Open-Meteo poll was teaching the learning model that its
+        # short-range skill equalled its analysis skill.
+        #
+        # Dropped rather than nulled: a null value still creates a bucket
+        # row, and the defect is the row's existence, not its number.
+        # Enforced here rather than in the Open-Meteo parser so it covers
+        # every provider, including ones not yet written — a fix applied
+        # only where the bug was found is a fix that waits for the next
+        # provider to rediscover it.
+        issued_at = row[_ISSUED_AT_INDEX]
+        valid_at = row[_VALID_AT_INDEX]
+        if _is_not_a_forecast(issued_at, valid_at):
+            dropped += 1
             continue
 
         variable = row[_VARIABLE_INDEX]
@@ -170,4 +201,23 @@ def validate_forecast_rows(
             row[:_VALUE_INDEX] + (clean,) + row[_VALUE_INDEX + 1:]
         )
 
-    return validated, rejected
+    return validated, rejected, dropped
+
+
+def _is_not_a_forecast(issued_at: Any, valid_at: Any) -> bool:
+    """True when the target hour is at or before the issue time.
+
+    Unparseable timestamps return False — storage rejects them loudly,
+    and silently dropping a row because its timestamp could not be read
+    would hide a provider regression behind a data-quality filter.
+    """
+    try:
+        issued = datetime.fromisoformat(str(issued_at))
+        valid = datetime.fromisoformat(str(valid_at))
+    except (TypeError, ValueError):
+        return False
+    if issued.tzinfo is None:
+        issued = issued.replace(tzinfo=timezone.utc)
+    if valid.tzinfo is None:
+        valid = valid.replace(tzinfo=timezone.utc)
+    return valid <= issued
