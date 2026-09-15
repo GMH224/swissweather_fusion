@@ -18,6 +18,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import voluptuous as vol
 
 from swissweather_fusion import config_flow, provider_validation
 from swissweather_fusion import coordinator as coord
@@ -505,10 +506,83 @@ def test_all_three_elevation_entry_points_use_the_same_validator():
     assert "): vol.Coerce(float)," not in options_block[:3000]
 
 
+def test_every_config_flow_schema_can_be_rendered_by_home_assistant():
+    """**SWF-031-004. The test that should have existed since v0.1.24.**
+
+    Home Assistant does not hand a voluptuous schema to the frontend; it
+    serialises it to JSON with `voluptuous_serialize`, which understands a
+    fixed set of constructs and raises on anything else — including an
+    ordinary Python function inside `vol.All`.
+
+    From v0.1.24 the user and reconfigure steps could not be rendered at
+    all. Every unit test passed, because a unit test calls the validator
+    directly and never renders the form. It went unnoticed for eighteen
+    releases because the only form anyone opens after installation is the
+    options flow, which still used bare `vol.Coerce(float)` — until
+    v0.3.1 applied the same validator there and broke it too.
+
+    This test renders every schema the way HA does. It is the reason the
+    validator is now a `vol.Coerce` subclass rather than a function.
+    """
+    import voluptuous_serialize
+
+    # Every named validator in the module, found by inspection rather
+    # than listed — a new validator added later is covered automatically,
+    # which is the whole point. Listing them by hand is how the last one
+    # got missed.
+    import inspect
+
+    validators = {
+        name: obj for name, obj in vars(config_flow).items()
+        if name.endswith("_VALIDATOR") or name in ("_finite_float", "_non_empty_str")
+    }
+    assert len(validators) >= 5, "validator discovery found suspiciously few"
+    for name, validator in validators.items():
+        try:
+            voluptuous_serialize.convert(
+                vol.Schema({vol.Optional("field"): validator})
+            )
+        except Exception as err:  # noqa: BLE001
+            pytest.fail(
+                f"{name} cannot be serialised — any form using it returns "
+                f"500 to the frontend: {err}"
+            )
+
+    schemas = {
+        "user/reconfigure coordinates": vol.Schema({
+            vol.Required("latitude", default=47.5): config_flow._LATITUDE_VALIDATOR,
+            vol.Required("longitude", default=8.9): config_flow._LONGITUDE_VALIDATOR,
+            vol.Optional("elevation_override"): config_flow._ELEVATION_VALIDATOR,
+        }),
+        "options elevation with default": vol.Schema({
+            vol.Optional("elevation_override", default=0.0):
+                config_flow._ELEVATION_VALIDATOR,
+        }),
+        "purge days": vol.Schema({
+            vol.Optional("purge_days", default=90): config_flow._PURGE_DAYS_VALIDATOR,
+        }),
+    }
+    for label, schema in schemas.items():
+        try:
+            voluptuous_serialize.convert(schema)
+        except Exception as err:  # noqa: BLE001
+            pytest.fail(
+                f"{label} cannot be rendered by Home Assistant — the form "
+                f"would return 500: {err}"
+            )
+
+
+def test_the_finite_validator_still_rejects_what_it_was_written_for():
+    """Making it serialisable must not have made it permissive. P1-27 was
+    about "nan" and "inf" arriving as STRINGS from a form field."""
+    for bad in ("nan", "inf", "-inf", float("nan"), float("inf")):
+        with pytest.raises(vol.Invalid):
+            config_flow._LATITUDE_VALIDATOR(bad)
+    assert config_flow._LATITUDE_VALIDATOR("47.5") == 47.5
+
+
 @pytest.mark.parametrize("bad", [float("inf"), float("nan"), 50000.0, -9999.0])
 def test_the_elevation_validator_rejects_impossible_values(bad):
-    import voluptuous as vol
-
     with pytest.raises(vol.Invalid):
         config_flow._ELEVATION_VALIDATOR(bad)
 

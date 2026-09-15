@@ -56,7 +56,7 @@ CONF_CLEAR_ELEVATION_OVERRIDE = "clear_elevation_override"
 # ---------------------------------------------------------------------------
 # Field validators (v0.1.24: P1-27, P1-28, P1-30)
 # ---------------------------------------------------------------------------
-def _finite_float(value: Any) -> float:
+class _FiniteFloat(vol.Coerce):
     """Coerce to float and reject NaN/Infinity.
 
     **v0.1.24 fix (P1-27).** The coordinate and elevation fields used bare
@@ -65,17 +65,45 @@ def _finite_float(value: Any) -> float:
     non-finite latitude propagates into the LV95 coordinate transform, the
     STAC query and every provider URL, failing far from where it was
     entered and in ways that look like a provider outage.
+
+    **v0.3.1 fix (SWF-031-004): this is now a vol.Coerce SUBCLASS rather
+    than a plain function.**
+
+    Home Assistant renders a config form by serialising its schema to JSON
+    with `voluptuous_serialize`, which understands a fixed set of
+    voluptuous constructs and raises `ValueError: Unable to convert
+    schema` on anything else — including an ordinary Python function
+    inside `vol.All`. So from v0.1.24 the user and reconfigure steps
+    could not be rendered at all: the frontend showed
+    "Config flow could not be loaded: 500 Internal Server Error".
+
+    It went unnoticed for eighteen releases because the only flow anyone
+    opens after installation is the OPTIONS flow, and that one still used
+    bare `vol.Coerce(float)`. v0.3.1 applied this validator there too, to
+    close SWF-ICS-003/064 — and broke the last working form.
+
+    Subclassing `vol.Coerce` keeps the validation and makes the schema
+    serialisable, because `voluptuous_serialize` dispatches on
+    `isinstance(schema, vol.Coerce)` and reads `.type`. The test
+    `test_every_config_flow_schema_can_be_rendered_by_home_assistant`
+    now serialises every form exactly as HA does, so no validator can
+    reach a form again without being renderable.
     """
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as err:
-        raise vol.Invalid("must be a number") from err
-    if not math.isfinite(result):
-        raise vol.Invalid("must be a finite number")
-    return result
+
+    def __init__(self) -> None:
+        super().__init__(float)
+
+    def __call__(self, value: Any) -> float:
+        result = super().__call__(value)
+        if not math.isfinite(result):
+            raise vol.Invalid("must be a finite number")
+        return result
 
 
-def _non_empty_str(value: Any) -> str:
+_finite_float = _FiniteFloat()
+
+
+class _NonEmptyStr(vol.Coerce):
     """Reject an empty or whitespace-only credential.
 
     **v0.1.24 fix (P1-30).** vol.Required only requires that the KEY be
@@ -83,13 +111,28 @@ def _non_empty_str(value: Any) -> str:
     empty secret therefore saved cleanly and failed later at request
     time, surfacing as an authentication error rather than as the
     data-entry mistake it actually was.
+
+    **v0.3.1 fix (SWF-031-004).** Was a plain function, which
+    `voluptuous_serialize` cannot convert — so every form containing a
+    credential field returned 500 to the frontend. Since this one is used
+    in the OPTIONS flow, that is the form an operator actually opens, and
+    it has been un-renderable since v0.1.24. See _FiniteFloat above for
+    the full account.
     """
-    if value is None:
-        raise vol.Invalid("must not be empty")
-    stripped = str(value).strip()
-    if not stripped:
-        raise vol.Invalid("must not be empty")
-    return stripped
+
+    def __init__(self) -> None:
+        super().__init__(str)
+
+    def __call__(self, value: Any) -> str:
+        if value is None:
+            raise vol.Invalid("must not be empty")
+        stripped = str(value).strip()
+        if not stripped:
+            raise vol.Invalid("must not be empty")
+        return stripped
+
+
+_non_empty_str = _NonEmptyStr()
 
 
 _LATITUDE_VALIDATOR = vol.All(_finite_float, vol.Range(min=-90.0, max=90.0))

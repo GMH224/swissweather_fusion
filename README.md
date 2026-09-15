@@ -13,7 +13,12 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.1 — a measurement release, plus defect remediation.** 781 tests, pyflakes clean.
+**Status: v0.3.2 — a measurement release, plus defect remediation.** 795 tests, pyflakes clean.
+
+> **If you have ever seen "Config flow could not be loaded: 500 Internal
+> Server Error"** when opening setup, reconfigure or Configure — that was
+> real, and it affected every version from v0.1.24 to v0.3.1. Fixed in
+> v0.3.2.
 
 This version adds **no forecasting capability at all**. It exists to make
 one question answerable: *does blending five sources actually beat simply
@@ -51,6 +56,9 @@ v0.3.0's own account is in
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
+> **Upgrading to v0.3.2?** No database migration and no learning reset —
+> v0.3.2 is a display and forms fix. Learned statistics are preserved.
+>
 > **Upgrading to v0.3.1 from v0.3.0?** This release migrates to schema
 > v5 and **clears learned bias statistics again**, ten days after v0.3.0
 > did. That is not a mistake: v0.3.1 fixes a defect live since v0.1 in

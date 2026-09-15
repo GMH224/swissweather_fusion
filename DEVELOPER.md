@@ -2143,6 +2143,63 @@ publication lag was 1h52m and ICON-D2's 1h29m at the 15:00Z run on
 is 5h09m. Adding AROME, or narrowing the lead-time buckets, makes
 run-relative attribution a precondition and forces the reset with it.
 
+## v0.3.2 — the runtime-surface defect class
+
+Full record: `swissweather_fusion_v0.3.2_release_audit.md`. One idea here
+is worth more than the two fixes.
+
+### Unit tests do not exercise Home Assistant
+
+For eighteen releases every configuration form in this integration
+returned 500 to the frontend, and the suite was green the entire time.
+
+The cause: HA serialises a config schema to JSON with
+`voluptuous_serialize` before sending it, and that library raises on a
+plain Python function inside `vol.All`. `_finite_float` and
+`_non_empty_str` were plain functions. A unit test calls a validator
+directly and never performs the serialisation step, so nothing failed.
+
+Nobody noticed because the only form opened after installation is
+Configure, and nobody had opened it.
+
+**The class is broader than schemas.** Anything that only executes inside
+HA's own machinery is invisible to ordinary unit tests:
+
+| Surface | Framework step | Failure mode |
+| --- | --- | --- |
+| Config flow schemas | `voluptuous_serialize.convert` | 500, form unopenable |
+| Diagnostics payload | `json.dumps` | 500, download fails |
+| Translations | key lookup in `strings.json` | raw keys in the UI |
+| Entity attributes | HA's `Forecast` contract | silently dropped fields |
+
+The first two are now tested by reproducing the framework's own step.
+The last two are not, and `tests/test_v0_3_2_runtime_surfaces.py` says so
+in its docstring rather than implying coverage that does not exist.
+
+**When adding a validator**, subclass something `voluptuous_serialize`
+understands — `vol.Coerce` is usually right. A plain function will pass
+every unit test and break the form.
+
+### A daily high is only a high if the samples contain one
+
+`aggregate_daily_forecast` grouped hours into calendar days and took
+max/min with no coverage check. Sources have different horizons, so the
+series stops partway through the final day — leaving only the coldest
+early-morning hours, whose maximum is the overnight minimum. The last
+forecast day collapsed by eight to ten degrees, every day, visibly, for
+the entire life of the project.
+
+The rule is now about WHICH hours are present, not how many: a day is
+published only if its samples reach the local afternoon window. Three
+afternoon samples describe a daily maximum; twelve overnight ones do not.
+Today is exempt, being partial by construction.
+
+The same reasoning applies to precipitation, but the other way round: a
+SUM over a thinly-sampled day is not a daily total, and past the shorter
+horizons the series is three-hourly. Below 75% coverage no total is
+published. `None` is honest; tripling the sum on an assumption about
+whether a three-hourly value is a rate or an accumulation would not be.
+
 ## Known gaps (the honest list, updated for v0.2.0)
 
 **Closed since v0.1.1:**

@@ -17,6 +17,12 @@ def test_aggregate_daily_forecast_uses_local_timezone_not_utc():
         _hourly_entry("2026-07-25T22:00:00+00:00", 15.0, 0.0),  # 00:00 CEST on the 26th
         _hourly_entry("2026-07-25T23:00:00+00:00", 14.0, 0.0),  # 01:00 CEST on the 26th
         _hourly_entry("2026-07-26T10:00:00+00:00", 25.0, 1.0),  # 12:00 CEST on the 26th
+        # v0.3.2: an afternoon sample so BOTH days remain publishable
+        # under the SWF-032-001 coverage rule. Without it the 26th holds
+        # only a 10:00 UTC hour, which cannot contain a daily maximum and
+        # is now correctly withheld — which would make this test about
+        # coverage rather than about timezone grouping.
+        _hourly_entry("2026-07-26T13:00:00+00:00", 26.0, 0.0),  # 15:00 CEST
     ]
     daily_utc = model_a.aggregate_daily_forecast(hourly)  # default: UTC grouping
     daily_local = model_a.aggregate_daily_forecast(hourly, local_tz=cest)
@@ -26,10 +32,10 @@ def test_aggregate_daily_forecast_uses_local_timezone_not_utc():
     day1_utc = daily_utc[0]
     assert day1_utc["native_temperature"] == 15.0  # only the 22:00 UTC hour
 
-    # Under correct local (CEST) grouping, all three hours are actually
+    # Under correct local (CEST) grouping, all four hours are actually
     # the same local calendar day (the 26th) — one bucket, not two.
     assert len(daily_local) == 1
-    assert daily_local[0]["native_temperature"] == 25.0  # max across all 3 hours
+    assert daily_local[0]["native_temperature"] == 26.0  # max across all 4 hours
     assert daily_local[0]["native_templow"] == 14.0
 
 
@@ -80,7 +86,14 @@ def test_aggregate_daily_forecast_groups_by_day_and_sums_precip():
 
     assert day2["native_temperature"] == 22.0
     assert day2["native_templow"] == 14.0
-    assert day2["native_precipitation"] == 0.0
+    # v0.3.2 (SWF-032-002): day 2 carries only two samples, so no daily
+    # TOTAL is published. A sum over a thinly-sampled day is not a daily
+    # total — past the shorter sources' horizons the series drops to
+    # three-hourly, and summing those as though they were hourly
+    # understates the day by roughly a factor of three. The temperature
+    # range is still reported, because max/min over available samples is
+    # a real statement about those samples in a way a SUM is not.
+    assert day2["native_precipitation"] is None
     assert day2["condition"] == "sunny"
 
 

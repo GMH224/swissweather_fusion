@@ -493,6 +493,57 @@ def _majority(values: list) -> Optional[float]:
     return max(v for v, c in counts.items() if c == best)
 
 
+# Local hours in which a daily temperature maximum is normally reached.
+# A day whose samples miss this window entirely cannot report a high.
+DAILY_MAXIMUM_WINDOW = (12, 18)
+
+# Minimum fraction of a day's hours that must carry a precipitation value
+# before a daily TOTAL is published. See _daily_precipitation.
+DAILY_PRECIP_MIN_COVERAGE = 0.75
+
+
+def _covers_daily_maximum(entries: list[dict[str, Any]], local_tz: Any) -> bool:
+    """True if any entry with a temperature falls in the afternoon window."""
+    start, end = DAILY_MAXIMUM_WINDOW
+    for entry in entries:
+        if entry.get("native_temperature") is None:
+            continue
+        hour = datetime.fromisoformat(entry["datetime"]).astimezone(local_tz).hour
+        if start <= hour < end:
+            return True
+    return False
+
+
+def _daily_precipitation(
+    entries: list[dict[str, Any]], *, expected_hours: int
+) -> Optional[float]:
+    """Daily precipitation total, or None when the day is too thinly sampled.
+
+    **v0.3.2 (SWF-032-002).** This was a plain sum over whatever entries
+    existed, which is only a daily total when the day is sampled hourly.
+    Past the shorter sources' horizons the series drops to three-hourly,
+    and summing eight three-hourly samples as though they were
+    twenty-four hourly ones understates the day by roughly a factor of
+    three.
+
+    Reporting None rather than a corrected estimate is deliberate. Whether
+    a three-hourly value is an hourly rate or a three-hour accumulation is
+    a per-provider question this project has not established, and
+    multiplying by three on an assumption would replace a visibly-low
+    number with a confidently-wrong one. A missing total is honest and
+    the card renders it as no data.
+    """
+    values = [
+        e.get("native_precipitation") for e in entries
+        if e.get("native_precipitation") is not None
+    ]
+    if not values:
+        return None
+    if len(values) < expected_hours * DAILY_PRECIP_MIN_COVERAGE:
+        return None
+    return sum(values)
+
+
 def aggregate_daily_forecast(
     hourly_forecast: list[dict[str, Any]], *, local_tz: timezone = timezone.utc
 ) -> list[dict[str, Any]]:
@@ -515,8 +566,39 @@ def aggregate_daily_forecast(
         by_day.setdefault(local_dt.date(), []).append(entry)
 
     results: list[dict[str, Any]] = []
-    for day in sorted(by_day):
+    days = sorted(by_day)
+    for index, day in enumerate(days):
         entries = by_day[day]
+
+        # v0.3.2 (SWF-032-001): a day is only reported if its samples
+        # can actually contain a daily maximum.
+        #
+        # **The defect.** Sources have different horizons, so the hourly
+        # series stops partway through the final calendar day — typically
+        # a few hours after local midnight. This function then took
+        # max()/min() over whatever survived. Those hours are the coldest
+        # of the day, so the reported "high" was really the overnight
+        # minimum, and the last day of the forecast collapsed by eight to
+        # ten degrees every single time.
+        #
+        # Observed 2026-09-15: the final day held exactly three entries —
+        # 02:00, 05:00 and 08:00 local, at 12.0, 11.0 and 11.4 degC — and
+        # was published as 12 deg high / 11 deg low against a genuine
+        # forecast in the low twenties.
+        #
+        # **The rule.** A daily high is only a high if the samples reach
+        # into the part of the day when the maximum occurs. Requiring a
+        # sample in the local afternoon window is a direct statement of
+        # that, and it is not a heuristic about how MANY hours are
+        # needed — three hourly samples spanning the afternoon describe a
+        # daily maximum; twelve overnight samples do not.
+        #
+        # The FIRST day is exempt. It is inherently partial — the
+        # forecast starts at `now` — and Home Assistant's daily forecast
+        # is expected to include today even at 23:00. Its high is
+        # understood to mean "the rest of today".
+        if index > 0 and not _covers_daily_maximum(entries, local_tz):
+            continue
         # v0.2.4 fix (SWF-024-004): .get(), not direct indexing.
         #
         # v0.2.1 rewrote the hourly forecast builder to strip keys whose
@@ -529,11 +611,11 @@ def aggregate_daily_forecast(
             e.get("native_temperature") for e in entries
             if e.get("native_temperature") is not None
         ]
-        precips = [
-            e.get("native_precipitation") for e in entries
-            if e.get("native_precipitation") is not None
-        ]
-        total_precip = sum(precips) if precips else None
+        # v0.3.2 (SWF-032-002): coverage-aware. The first day is partial
+        # by construction (the forecast starts at `now`), so its expected
+        # hour count is the hours remaining, not 24.
+        expected_hours = len(entries) if index == 0 else 24
+        total_precip = _daily_precipitation(entries, expected_hours=expected_hours)
         # v0.1.24 (P2-10): needed by derive_condition's "cloudy" branch.
         humidities = [e.get("humidity") for e in entries if e.get("humidity") is not None]
         # v0.2.2 (SWF-021-002/003): stated evidence for resolve_condition.
