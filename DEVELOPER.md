@@ -2200,6 +2200,67 @@ horizons the series is three-hourly. Below 75% coverage no total is
 published. `None` is honest; tripling the sum on an assumption about
 whether a three-hourly value is a rate or an accumulation would not be.
 
+## v0.3.3 — solar radiation, and two ways an upgrade can quietly hurt a trial
+
+v0.3.3 adds location-level solar radiation (GHI, DNI, DHI; hourly
+averages and instants) for a downstream solar layer, exposes snow depth,
+and exposes SRF's irradiance on its own. The feature is small. The
+interesting part is what it had to avoid, because it shipped in the
+middle of the Class A accuracy trial.
+
+**1. A new variable can change a run's identity.** Open-Meteo runs are
+deduplicated by a content fingerprint over the mapped variables
+(`_compute_run_fingerprint`). Adding radiation to that map would have
+changed every model's fingerprint at upgrade; the first poll would have
+re-stored each model's current run with a fresh `issued_at`, and the
+learning loop would have folded those forecast errors into `bucket_stats`
+a second time. So radiation is parsed through `_PARSED_VARIABLE_NAME_MAP`
+but kept out of `_VARIABLE_NAME_MAP`, and a test pins the fingerprint to
+the v0.3.2 algorithm. The cost: radiation appears with the next new
+upstream run after upgrade (≤3 h CH1/D2, ≤6 h CH2), not immediately.
+
+**2. The optional-variable fallback was too eager, and global.** Since
+v0.2.2 any "data"-class error on a request carrying optional variables
+dropped them until restart — and "data" includes HTTP 503 and timeouts,
+which the owner's diagnostics show on all three models. Each one silently
+removed UV index; with radiation in the optional set it would have removed
+radiation too. And the flag was one bool, although the comment above it
+said "that source". v0.3.3: only an HTTP 400 (`OpenMeteoRequestRejected`,
+raised for every 400 with or without a readable reason) triggers it, and
+only for the model that refused.
+
+**Why radiation is fused as a triple.** Within one model,
+GHI = DHI + DNI·cos(zenith), and the zenith is the same for every model at
+one place and time. A mean over the same set of models preserves that; a
+median does not (the medians of the three components generally come from
+different models), and neither does a mean over different subsets per
+component. `_fuse_radiation` therefore uses only sources that supply a
+complete triple from a single model run (identical `issued_at`), and
+radiation never reaches the per-parameter `_fuse_class_b` path.
+
+**Why the output is keyed by hour start.** Open-Meteo labels an average
+at the END of its hour. The `solar.hourly` series pairs, for the hour
+starting at T, the average labelled T + 1 h with the instant labelled T,
+and says so in `period_start` / `period_end`. Consumers never see the
+provider's convention, which is the classic one-hour solar-curve shift.
+
+**What is deliberately not here.** No GTI and no panel geometry (owner
+decision: arrays change, the weather model must not). No 15-minute data
+(ICON-CH1/CH2 publish hourly; only ICON-D2 is native sub-hourly, and one
+native source among interpolated ones would be false precision). No bias
+correction (needs inverter output as ground truth — the solar layer's
+job).
+
+**Backlog items 19 + 20.** The coordinator owning each source's
+`SourceHealth` was written down twice — `sensor._get_health` and the
+diagnostics loop — and v0.2.6 updated neither for Wetter-Alarm. Its four
+health sensors could only ever read `unknown` / `0`, and the diagnostics
+export omitted it, while it polled correctly. Both now read
+`const.SOURCE_HEALTH_OWNER`; a test fails if any telemetry source lacks an
+owner. The same pass found that the diagnostics "smoke test" a comment had
+cited since v0.1.22 never existed — nothing had ever called the export end
+to end. It does now.
+
 ## Known gaps (the honest list, updated for v0.2.0)
 
 **Closed since v0.1.1:**

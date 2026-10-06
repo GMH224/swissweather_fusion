@@ -13,7 +13,7 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.2 — a measurement release, plus defect remediation.** 795 tests, pyflakes clean.
+**Status: v0.3.3 — solar radiation for a downstream solar layer, on top of the v0.3.x measurement release.** 826 tests, package pyflakes clean.
 
 > **If you have ever seen "Config flow could not be loaded: 500 Internal
 > Server Error"** when opening setup, reconfigure or Configure — that was
@@ -56,6 +56,20 @@ v0.3.0's own account is in
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
+> **Upgrading to v0.3.3?** No database migration and no learning reset —
+> the running accuracy trial is untouched (see
+> [swissweather_fusion_v0.3.3_release_audit.md](swissweather_fusion_v0.3.3_release_audit.md),
+> §3). Solar radiation appears with the **next new model run** after the
+> upgrade, not immediately: within about 3 hours for ICON-CH1/ICON-D2 and 6
+> hours for ICON-CH2. That delay is deliberate — it is what keeps the
+> upgrade from re-storing the current run and double-counting it in the
+> learning.
+>
+> Also in v0.3.3: the four `wetteralarm_*` health sensors (last success,
+> last poll duration, last data error, consecutive failures) now show
+> real values. Since v0.2.6 they could only read `unknown` / `0`, even
+> though Wetter-Alarm itself was polling correctly.
+>
 > **Upgrading to v0.3.2?** No database migration and no learning reset —
 > v0.3.2 is a display and forms fix. Learned statistics are preserved.
 >
@@ -194,6 +208,48 @@ Beyond the main `weather.*` entity, this integration exposes:
   Its state is how many (measurement, lead-time) cells the blend
   currently wins. Attributes carry the verdict, the sample count behind
   it, and a per-cell table.
+
+### Solar radiation (new in v0.3.3)
+
+Location-level radiation for a separate solar-forecast layer. **No panel
+geometry is applied here**: the solar layer owns tilt and azimuth and
+computes tilted irradiance (GTI) itself, so adding or changing an array
+never touches this integration.
+
+| Entity (default ID) | Meaning |
+|---|---|
+| `sensor.swissweather_fusion_solar_irradiance_ghi_hour_average` | Global horizontal irradiance, average over the current hour. **Carries the full hourly series** in its `hourly_forecast` attribute. |
+| `sensor.swissweather_fusion_solar_irradiance_dni_hour_average` | Direct normal irradiance, current-hour average |
+| `sensor.swissweather_fusion_solar_irradiance_dhi_hour_average` | Diffuse horizontal irradiance, current-hour average |
+| `sensor.swissweather_fusion_solar_irradiance_{ghi,dni,dhi}_instant` | The same three, instantaneous at the start of the current hour |
+| `sensor.swissweather_fusion_srf_global_irradiance` | SRF's own global irradiance, separate and unfused |
+| `sensor.swissweather_fusion_snow_depth` | Fused snow depth on the ground (m) |
+
+How to read the `hourly_forecast` series:
+
+- One entry per hour, keyed by `period_start` / `period_end` (UTC).
+  `ghi`, `dni`, `dhi` are **averages over that hour**; `ghi_instant`,
+  `dni_instant`, `dhi_instant` are values **at `period_start`**. Open-Meteo
+  itself labels averages at the *end* of the hour; this series has already
+  converted that, so do not shift it again.
+- Values are W/m², hourly only. ICON-CH1/CH2 publish hourly; finer steps
+  would be interpolation, which this integration does not do.
+- Fused as a **mean over the models that supply a complete GHI/DNI/DHI
+  triple from one model run** (`sources` says how many — 3 near-term,
+  falling to 1 beyond ~48 h). That keeps GHI = DHI + DNI·cos(zenith)
+  intact, so any transposition model can use the triple directly.
+- **Not bias-corrected.** Nothing learns radiation yet; that needs
+  inverter output as ground truth, which belongs to the solar layer.
+- The series attribute is excluded from the recorder (it would otherwise
+  be stored again on every update). Read it live; do not expect history.
+
+SRF's irradiance is exposed separately because it is the only radiation
+source outside the ICON model family, and because SRF supplies one value
+with no direct/diffuse split — mixing it into the triple would break the
+identity above. SRF documents it only as "Global irradiance in W/m²":
+whether it is an average or instantaneous, and which end of the hour it is
+labelled at, is not documented, so it is passed through at SRF's own
+timestamps. It is 3-hourly beyond SRF's hourly window.
 
 ### Reading the blend comparison
 
