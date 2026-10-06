@@ -123,7 +123,49 @@ HOURLY_VARIABLES = (
 # once without the optional set if a request fails permanently. Same
 # reasoning as the v0.1.28 CombiPrecip lesson — do not let an unverified
 # assumption about a provider take out a working path.
-OPTIONAL_HOURLY_VARIABLES = ("uv_index",)
+# v0.3.3: solar radiation, for the downstream solar layer.
+#
+# Location-level and panel-agnostic on purpose. Global tilted irradiance
+# (GTI) is NOT requested: it depends on a panel's tilt and azimuth, and
+# that geometry belongs to the solar layer, not to the weather model.
+# Adding or changing an array must never require touching this
+# integration (owner decision, v0.3.3). GHI/DNI/DHI is the standard
+# triple any transposition model needs; "direct on the horizontal" is
+# derivable as GHI - DHI and is therefore not requested separately.
+#
+# Averages are over the PRECEDING hour, labelled at the hour's end (the
+# 14:00 value covers 13:00-14:00). The _instant variants are the value at
+# the labelled time. Both are documented Open-Meteo variables for the
+# MeteoSwiss ICON-CH and DWD ICON models; hourly only — ICON-CH1/CH2 are
+# published at 1 h resolution, so finer steps would be interpolation.
+#
+# Optional, like uv_index: a model rejecting one of these must not take
+# temperature/humidity/pressure offline mid-trial.
+RADIATION_HOURLY_VARIABLES = (
+    "shortwave_radiation",
+    "direct_normal_irradiance",
+    "diffuse_radiation",
+    "shortwave_radiation_instant",
+    "direct_normal_irradiance_instant",
+    "diffuse_radiation_instant",
+)
+OPTIONAL_HOURLY_VARIABLES = ("uv_index",) + RADIATION_HOURLY_VARIABLES
+
+
+class OpenMeteoRequestRejected(ValueError):
+    """Open-Meteo answered HTTP 400: the request itself was refused.
+
+    v0.3.3. The ONLY error that justifies dropping the optional variable
+    set. A 400 is deterministic (an unsupported variable for that model);
+    a 503 or a timeout is transient and says nothing about the variables.
+    Before v0.3.3 any non-auth error triggered the fallback, so a single
+    transient 503 silently removed UV index until Home Assistant restarted.
+
+    Subclasses ValueError so every existing handler, and the health
+    classifier ("data" error), treats it exactly as before.
+    """
+
+    status = 400
 
 
 def _base_url(path: str, api_key: Optional[str]) -> str:
@@ -249,6 +291,23 @@ _VARIABLE_NAME_MAP = {
     "wind_speed_10m": "wind_speed",
 }
 
+# v0.3.3: radiation names. Kept OUT of _VARIABLE_NAME_MAP deliberately,
+# because _compute_run_fingerprint hashes exactly that map's variables.
+# Adding these to it would change every model's fingerprint at upgrade,
+# make the current upstream run look new, store it a second time and fold
+# the same forecast errors into the Class A learning twice — mid-trial.
+# Parsed and stored like any other variable; just not part of run
+# identity (a new upstream run always changes the core variables too).
+_RADIATION_VARIABLE_NAME_MAP = {
+    "shortwave_radiation": "ghi",
+    "direct_normal_irradiance": "dni",
+    "diffuse_radiation": "dhi",
+    "shortwave_radiation_instant": "ghi_instant",
+    "direct_normal_irradiance_instant": "dni_instant",
+    "diffuse_radiation_instant": "dhi_instant",
+}
+_PARSED_VARIABLE_NAME_MAP = {**_VARIABLE_NAME_MAP, **_RADIATION_VARIABLE_NAME_MAP}
+
 
 def _compute_run_fingerprint(hourly: dict[str, Any]) -> str:
     """A deterministic identity for "this specific set of hourly values",
@@ -315,7 +374,7 @@ def parse_forecast_response(payload: dict[str, Any]) -> ParsedForecast:
 
     points: list[ForecastPoint] = []
     mismatches: list[str] = []
-    for open_meteo_key, internal_name in _VARIABLE_NAME_MAP.items():
+    for open_meteo_key, internal_name in _PARSED_VARIABLE_NAME_MAP.items():
         values = hourly.get(open_meteo_key)
         if values is None:
             continue
@@ -492,10 +551,23 @@ class OpenMeteoClient:
                 # Read the body before raise_for_status discards it — this
                 # is what should have caught the v0.1.1 wrong-model-name
                 # bug immediately instead of a bare "400 Bad Request".
-                error_payload = await resp.json()
-                reason = extract_error_reason(error_payload)
-                if reason:
-                    raise ValueError(f"Open-Meteo rejected the request: {reason}")
+                #
+                # v0.3.3: always raises OpenMeteoRequestRejected for a
+                # 400, with or without a readable reason, so the
+                # coordinator can tell "variable refused" from "server
+                # briefly unavailable". A non-JSON 400 body used to escape
+                # as an unrelated JSON decode error.
+                try:
+                    error_payload = await resp.json()
+                except Exception:  # noqa: BLE001 - body is optional detail
+                    error_payload = {}
+                reason = (
+                    extract_error_reason(error_payload)
+                    if isinstance(error_payload, dict) else None
+                )
+                raise OpenMeteoRequestRejected(
+                    f"Open-Meteo rejected the request: {reason or 'HTTP 400'}"
+                )
             resp.raise_for_status()
             payload = await resp.json()
         return parse_forecast_response(payload)

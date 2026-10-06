@@ -32,7 +32,11 @@ from homeassistant.util import dt as dt_util
 from .clients.combiprecip import CombiPrecipClient
 from .clients.meteoblue import BonusCallTracker, MeteoblueClient, should_fire_scheduled_call
 from .clients.meteonomiqs import AnnualCallBudget, MeteonomiqsClient, needs_keepalive_call
-from .clients.open_meteo import OPTIONAL_HOURLY_VARIABLES, OpenMeteoClient
+from .clients.open_meteo import (
+    OPTIONAL_HOURLY_VARIABLES,
+    OpenMeteoClient,
+    OpenMeteoRequestRejected,
+)
 from .clients.srf import SrfClient
 from .clients.wetteralarm import (
     WeatherWarning,
@@ -43,6 +47,7 @@ from .clients.wetteralarm import (
 )
 from .health import SourceHealth, classify_exception
 from .const import (
+    SOURCE_SRF,
     MIN_SAMPLES_TO_TRUST_BUCKET,
     BLEND_COMPARISON_LEAD_HOURS,
     BLEND_COMPARISON_MAX_ROWS,
@@ -95,6 +100,7 @@ from .const import (
 from .models import model_b
 from .redaction import redact_secret_values
 from . import provider_validation, unit_conversion
+from .forecast_parameters import RADIATION_TRIPLES
 from .storage.db import SwissWeatherDB
 
 _LOGGER = logging.getLogger(__name__)
@@ -148,7 +154,14 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
         # v0.2.1: uv_index is requested opt-out. If a source rejects the
         # optional variable set we stop asking that source for it, rather
         # than letting one nice-to-have variable take the source offline.
-        self._include_optional_variables = True
+        #
+        # v0.3.3: now genuinely PER SOURCE, as the sentence above always
+        # said. It was a single bool, so one model refusing the optional
+        # set removed it from all three. With solar radiation in the
+        # optional set, one model lacking a radiation field would have
+        # silently cost every model its radiation. Missing keys default to
+        # True (a source not yet seen still asks for the optional set).
+        self._include_optional_variables: dict[str, bool] = {}
         self._client = OpenMeteoClient(async_get_clientsession(hass), api_key=api_key)
         self._last_issued_at: dict[str, datetime] = {}
         # v0.1.19 fix (DEF-02): issued_at alone couldn't detect an
@@ -266,7 +279,7 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                         source=source,
                         latitude=self._latitude,
                         longitude=self._longitude,
-                        include_optional=self._include_optional_variables,
+                        include_optional=self._include_optional_variables.get(source, True),
                     )
             except Exception as err:  # noqa: BLE001
                 duration_ms = (time.monotonic() - start) * 1000
@@ -295,20 +308,35 @@ class OpenMeteoCoordinator(DataUpdateCoordinator):
                 # if a model rejected uv_index, all three Open-Meteo
                 # sources simply failed forever.
                 #
-                # A "data" classification on a request carrying optional
-                # variables is the signature of a rejected variable name
-                # (Open-Meteo answers 400 with a message rather than a
-                # transport error). Drop the optional set once and keep
-                # the core seventeen variables working; UV is a
-                # nice-to-have and three sources are not.
-                if kind == "data" and self._include_optional_variables:
+                # A rejected request (HTTP 400) while carrying optional
+                # variables is the signature of a refused variable name.
+                # Drop the optional set for THAT source and keep its core
+                # variables working.
+                #
+                # v0.3.3 fix: this used to trigger on any "data"
+                # classification — which includes HTTP 503 and timeouts.
+                # The user's own diagnostics show 503s on all three
+                # models; each one permanently removed UV index until
+                # Home Assistant restarted, and would now have removed
+                # solar radiation too. Transient errors say nothing about
+                # the variables, so only a 400 counts.
+                if (
+                    isinstance(err, OpenMeteoRequestRejected)
+                    and self._include_optional_variables.get(source, True)
+                ):
                     _LOGGER.warning(
                         "Open-Meteo rejected the request for %s while optional "
-                        "variables (%s) were included; retrying without them "
-                        "from now on. UV index will be unavailable.",
-                        source, ", ".join(OPTIONAL_HOURLY_VARIABLES),
+                        "variables (%s) were included; retrying %s without them "
+                        "from now on. UV index and solar radiation from this "
+                        "model will be unavailable until Home Assistant restarts.",
+                        source, ", ".join(OPTIONAL_HOURLY_VARIABLES), source,
                     )
-                    self._include_optional_variables = False
+                    self._include_optional_variables[source] = False
+                    if self._diagnostics is not None:
+                        self._diagnostics.record(
+                            source=source, event_type="optional_variables_dropped",
+                            detail=safe_err,
+                        )
                 continue
             duration_ms = (time.monotonic() - start) * 1000
             self.health[source].record_success(duration_ms=duration_ms)
@@ -1803,6 +1831,14 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         "predictability",
     )
     CATEGORICAL_MEASUREMENTS = ("weather_code",)
+    # v0.3.3: solar radiation. Deliberately NOT part of MEASUREMENTS: it
+    # does not belong in Home Assistant's weather Forecast contract, and
+    # its averages are labelled at the END of their hour, unlike every
+    # other parameter here. It gets its own output, "solar", built by
+    # _compute_solar_forecast with explicit period semantics.
+    RADIATION_MEASUREMENTS = tuple(
+        name for triple in RADIATION_TRIPLES for name in triple
+    )
     # Everything queried from storage in one pass.
     MEASUREMENTS = LEARNED_MEASUREMENTS + FUSED_MEASUREMENTS + CATEGORICAL_MEASUREMENTS
     # 7 days rather than 2 — needed for meaningful daily/twice-daily
@@ -2104,6 +2140,15 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             return self._resolve_categorical(
                 measurement, target_hour, latest_forecast
             )
+        # v0.3.3: radiation is never fused one parameter at a time. Kept
+        # out of MEASUREMENTS (it has its own output path, see
+        # _compute_solar_forecast), but routed here defensively so that a
+        # future caller can never reach the per-parameter path with it.
+        if measurement in self.RADIATION_MEASUREMENTS:
+            fused = self._fuse_radiation(
+                self._radiation_triple_for(measurement), target_hour, latest_forecast
+            )
+            return fused[measurement] if fused else None
         return self._fuse_class_b(measurement, target_hour, latest_forecast)
 
     def _fuse_class_b(
@@ -2162,6 +2207,146 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             counts[value] = counts.get(value, 0) + 1
         best = max(counts.values())
         return max(v for v, c in counts.items() if c == best)
+
+    @staticmethod
+    def _radiation_triple_for(measurement: str) -> tuple[str, str, str]:
+        for triple in RADIATION_TRIPLES:
+            if measurement in triple:
+                return triple
+        raise ValueError(f"not a radiation parameter: {measurement!r}")
+
+    def _fuse_radiation(
+        self,
+        triple: tuple[str, str, str],
+        label_time: datetime,
+        latest_forecast: dict,
+    ) -> Optional[dict[str, Any]]:
+        """Fuse one (GHI, DNI, DHI) triple at one labelled time.
+
+        **v0.3.3.** The three components are physically linked:
+        GHI = DHI + DNI * cos(solar zenith). Every model satisfies that
+        identity within itself, and the zenith is the same for every
+        model at a given place and time, so an arithmetic MEAN taken over
+        the same set of models preserves it. Two rules keep that true:
+
+        1. **Complete triples only.** A source contributes at this hour
+           only if it supplies all three components. Averaging GHI over
+           three models but DNI over two would produce a triple no model
+           forecast and no physics allows.
+        2. **One model run per triple.** All three components must come
+           from the same run (identical issued_at). The freshest-row
+           selection works per variable, so a run with a gap in one
+           component would otherwise be patched with an older run's value.
+
+        A median would violate the identity even over complete triples,
+        which is why radiation never goes through _fuse_class_b.
+
+        Returns the three fused values plus ``source_count``, or None
+        when no source supplies a complete, same-run triple.
+        """
+        from . import forecast_parameters as fp
+
+        label_iso = label_time.replace(minute=0, second=0, microsecond=0).isoformat()
+        complete: list[list[float]] = []
+        for source in ALL_FORECAST_SOURCES:
+            members = [latest_forecast.get((source, name, label_iso)) for name in triple]
+            if any(member is None for member in members):
+                continue
+            if len({member[1] for member in members}) != 1:
+                continue
+            values = [
+                fp.PARAMETERS[name].validate(member[0])
+                for name, member in zip(triple, members)
+            ]
+            if any(value is None for value in values):
+                continue
+            complete.append(values)
+        if not complete:
+            return None
+        count = len(complete)
+        fused: dict[str, Any] = {
+            name: sum(row[index] for row in complete) / count
+            for index, name in enumerate(triple)
+        }
+        fused["source_count"] = count
+        return fused
+
+    def _compute_solar_forecast(
+        self, now: datetime, latest_forecast: dict
+    ) -> dict[str, Any]:
+        """Location-level solar radiation for the downstream solar layer.
+
+        **v0.3.3.** One entry per hour, keyed by the hour's START, with
+        explicit semantics so no consumer has to know provider labelling:
+
+        - ``ghi``/``dni``/``dhi``: average over [period_start, period_end).
+          Open-Meteo labels an average at the END of its hour, so the
+          value for the hour starting at T is the one labelled T + 1 h.
+          Getting this wrong shifts every solar curve by an hour.
+        - ``ghi_instant``/``dni_instant``/``dhi_instant``: value at
+          period_start exactly.
+        - ``sources`` / ``instant_sources``: how many models supplied a
+          complete triple. Fewer further out: ICON-CH1 ends ~33 h,
+          ICON-D2 ~48 h, ICON-CH2 ~120 h.
+
+        No tilted irradiance: panel geometry belongs to the solar layer.
+        """
+        averaged_triple, instant_triple = RADIATION_TRIPLES
+        hours: list[dict[str, Any]] = []
+        for offset in range(self.FORECAST_HOURS_AHEAD):
+            start = now + timedelta(hours=offset)
+            end = start + timedelta(hours=1)
+            averaged = self._fuse_radiation(averaged_triple, end, latest_forecast)
+            instant = self._fuse_radiation(instant_triple, start, latest_forecast)
+            if averaged is None and instant is None:
+                continue
+            entry: dict[str, Any] = {
+                "period_start": start.isoformat(),
+                "period_end": end.isoformat(),
+            }
+            if averaged is not None:
+                entry.update({name: round(averaged[name], 1) for name in averaged_triple})
+                entry["sources"] = averaged["source_count"]
+            if instant is not None:
+                entry.update({name: round(instant[name], 1) for name in instant_triple})
+                entry["instant_sources"] = instant["source_count"]
+            hours.append(entry)
+        current = (
+            hours[0] if hours and hours[0]["period_start"] == now.isoformat() else {}
+        )
+        return {"current": current, "hourly": hours}
+
+    def _compute_srf_irradiance(
+        self, now: datetime, latest_forecast: dict
+    ) -> dict[str, Any]:
+        """SRF's own global irradiance, as a separate single-source series.
+
+        **v0.3.3.** Stored since v0.2.0 (as srf_irradiance) and never read.
+        Exposed on its own, NOT fused into the GHI triple: SRF supplies one
+        value with no direct/diffuse split, so mixing it in would break the
+        triple's physical consistency. Its value is that it is the one
+        radiation source outside the ICON model family.
+
+        SRF documents the field only as "Global irradiance in W/m2". Whether
+        it is an hourly average or instantaneous, and which end of the hour
+        it is labelled at, is NOT documented — so values are passed through
+        at SRF's own timestamps, uninterpreted. Beyond SRF's hourly window
+        the data is 3-hourly.
+        """
+        series: list[dict[str, Any]] = []
+        for offset in range(self.FORECAST_HOURS_AHEAD + 1):
+            label = now + timedelta(hours=offset)
+            row = latest_forecast.get((SOURCE_SRF, "srf_irradiance", label.isoformat()))
+            if row is None:
+                continue
+            value = provider_validation.validate_forecast_value("srf_irradiance", row[0])
+            if value is None:
+                continue
+            series.append({"time": label.isoformat(), "value": round(value, 1)})
+        current = (
+            series[0]["value"] if series and series[0]["time"] == now.isoformat() else None
+        )
+        return {"current": current, "hourly": series}
 
     def _compute_blend(self) -> dict[str, Any]:
         from .models import model_a
@@ -2362,6 +2547,11 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             "current": current,
             "expert_weights": expert_weights,
             "hourly_forecast": hourly_forecast,
+            # v0.3.3: solar radiation for the downstream solar layer, and
+            # SRF's independent irradiance. Built from the same
+            # latest_forecast dict — no extra database access.
+            "solar": self._compute_solar_forecast(now, latest_forecast),
+            "srf_irradiance": self._compute_srf_irradiance(now, latest_forecast),
             # Built from the same hourly data above — no extra DB access,
             # just reshaped, per the request to have precipitation (mm)
             # available at daily and twice-daily granularity too, not just

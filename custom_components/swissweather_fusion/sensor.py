@@ -32,13 +32,10 @@ from .const import (
     MIN_SAMPLES_TO_TRUST_BUCKET,
     ALL_FORECAST_SOURCES,
     DOMAIN,
-    SOURCE_CH1,
-    SOURCE_CH2,
     SOURCE_COMBIPRECIP,
-    SOURCE_ICON_D2,
-    SOURCE_METEOBLUE,
     SOURCE_METEONOMIQS,
     SOURCE_WETTERALARM,
+    SOURCE_HEALTH_OWNER,
     SOURCE_SRF,
 )
 from .device import build_device_info
@@ -60,18 +57,18 @@ def _get_health(runtime: dict[str, Any], source: str) -> Optional[SourceHealth]:
     coordinator owns it. CH1/CH2/ICON-D2 share one coordinator (all three
     are Open-Meteo) but get independent health entries within it, since
     one model can fail while the others succeed.
+
+    v0.3.3 (backlog item 20): driven by const.SOURCE_HEALTH_OWNER instead
+    of a hand-written if-chain. The chain had no Wetter-Alarm branch, so
+    its four telemetry sensors fell through to None — permanently
+    "unknown" / 0 — while the coordinator itself worked.
     """
-    if source in (SOURCE_CH1, SOURCE_CH2, SOURCE_ICON_D2):
-        return runtime["open_meteo_coordinator"].health.get(source)
-    if source == SOURCE_SRF:
-        return runtime["srf_coordinator"].health
-    if source == SOURCE_METEOBLUE:
-        return runtime["meteoblue_coordinator"].health
-    if source == SOURCE_COMBIPRECIP:
-        return runtime["combiprecip_coordinator"].health
-    if source == SOURCE_METEONOMIQS:
-        return runtime["meteonomiqs_coordinator"].health
-    return None
+    owner = SOURCE_HEALTH_OWNER.get(source)
+    coordinator = runtime.get(owner) if owner else None
+    health = getattr(coordinator, "health", None) if coordinator is not None else None
+    if isinstance(health, dict):
+        return health.get(source)
+    return health
 
 
 async def async_setup_entry(
@@ -108,6 +105,12 @@ async def async_setup_entry(
         BlendedValueSensor(entry, runtime, "predictability",
                            "Forecast confidence (meteoblue)", "%",
                            icon="mdi:check-decagram-outline", diagnostic=True),
+        # v0.3.3: fused since v0.2.0, never exposed until now.
+        BlendedValueSensor(entry, runtime, "snow_depth", "Snow depth", "m",
+                           icon="mdi:snowflake-variant"),
+        # v0.3.3: location-level solar radiation for the solar layer.
+        *(SolarIrradianceSensor(entry, runtime, key) for key in SOLAR_SENSOR_KEYS),
+        SrfIrradianceSensor(entry, runtime),
         ConvectiveRiskSensor(entry, runtime),
         OfficialWarningSensor(entry, runtime),
     ]
@@ -949,6 +952,127 @@ class BlendedValueSensor(_BaseSensor):
         if coordinator is None or not coordinator.data:
             return None
         return (coordinator.data.get("current") or {}).get(self._measurement)
+
+
+# v0.3.3: one sensor per fused radiation value. The GHI average sensor
+# also carries the full hourly series (all six values) as an attribute.
+SOLAR_SENSOR_KEYS = (
+    "ghi", "dni", "dhi", "ghi_instant", "dni_instant", "dhi_instant",
+)
+_SOLAR_SENSOR_NAMES = {
+    "ghi": "Solar irradiance GHI (hour average)",
+    "dni": "Solar irradiance DNI (hour average)",
+    "dhi": "Solar irradiance DHI (hour average)",
+    "ghi_instant": "Solar irradiance GHI (instant)",
+    "dni_instant": "Solar irradiance DNI (instant)",
+    "dhi_instant": "Solar irradiance DHI (instant)",
+}
+_SOLAR_SERIES_SEMANTICS = (
+    "One entry per hour, keyed by period_start (UTC). ghi/dni/dhi are "
+    "averages over [period_start, period_end); *_instant values are at "
+    "period_start. Location-level only: no panel tilt or azimuth is "
+    "applied. Fused as a mean over models supplying a complete GHI/DNI/DHI "
+    "triple from one model run (sources = how many); not bias-corrected."
+)
+
+
+class SolarIrradianceSensor(_BaseSensor):
+    """One fused solar radiation value for the current hour.
+
+    **v0.3.3.** For the downstream solar layer, which owns panel geometry
+    and computes tilted irradiance itself — adding or changing an array
+    never touches this integration.
+
+    Hour-average sensors report the average over the CURRENT hour (now to
+    the next full hour); instant sensors report the value at the start of
+    the current hour. Both read the same per-hour entry, so they never
+    disagree about which hour "current" means.
+    """
+
+    _attr_device_class = SensorDeviceClass.IRRADIANCE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "W/m²"
+    _attr_icon = "mdi:weather-sunny"
+    # The hourly series is up to ~120 entries of 9 fields. Kept out of the
+    # recorder: the database would store a fresh copy on every update.
+    _unrecorded_attributes = frozenset({"hourly_forecast"})
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], key: str) -> None:
+        super().__init__(entry, f"solar_{key}", _SOLAR_SENSOR_NAMES[key])
+        self._runtime = runtime
+        self._key = key
+
+    def _solar(self) -> dict[str, Any]:
+        coordinator = self._runtime.get("blend_coordinator")
+        if coordinator is None or not coordinator.data:
+            return {}
+        return coordinator.data.get("solar") or {}
+
+    @property
+    def native_value(self) -> Optional[float]:
+        return (self._solar().get("current") or {}).get(self._key)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        solar = self._solar()
+        current = solar.get("current") or {}
+        instant = self._key.endswith("_instant")
+        attrs: dict[str, Any] = {
+            "basis": (
+                "instant value at the start of the current hour" if instant
+                else "average over the current hour"
+            ),
+            "period_start": current.get("period_start"),
+            "period_end": current.get("period_end"),
+            "sources": current.get("instant_sources" if instant else "sources"),
+        }
+        if self._key == "ghi":
+            attrs["hourly_forecast"] = solar.get("hourly") or []
+            attrs["semantics"] = _SOLAR_SERIES_SEMANTICS
+        return attrs
+
+
+class SrfIrradianceSensor(_BaseSensor):
+    """SRF's own global irradiance — a separate, single-source value.
+
+    **v0.3.3.** Not fused with the ICON radiation triple (SRF gives no
+    direct/diffuse split). Its use is as an independent comparison: it is
+    the only radiation source outside the ICON model family.
+    """
+
+    _attr_device_class = SensorDeviceClass.IRRADIANCE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "W/m²"
+    _attr_icon = "mdi:weather-sunny-alert"
+    _unrecorded_attributes = frozenset({"hourly_forecast"})
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, "srf_irradiance", "SRF global irradiance")
+        self._runtime = runtime
+
+    def _srf(self) -> dict[str, Any]:
+        coordinator = self._runtime.get("blend_coordinator")
+        if coordinator is None or not coordinator.data:
+            return {}
+        return coordinator.data.get("srf_irradiance") or {}
+
+    @property
+    def native_value(self) -> Optional[float]:
+        return self._srf().get("current")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "hourly_forecast": self._srf().get("hourly") or [],
+            "semantics": (
+                "SRF documents this only as 'Global irradiance in W/m2'. "
+                "Whether it is an hourly average or instantaneous, and "
+                "which end of the hour a value is labelled at, is not "
+                "documented; values are passed through at SRF's own "
+                "timestamps, uninterpreted. 3-hourly beyond SRF's hourly "
+                "window. Not fused with the ICON GHI/DNI/DHI triple."
+            ),
+        }
 
 
 class ConvectiveRiskSensor(_BaseSensor):

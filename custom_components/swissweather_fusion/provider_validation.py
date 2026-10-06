@@ -90,6 +90,13 @@ def _build_bounds() -> dict[str, tuple[float, float]]:
 
 PHYSICAL_BOUNDS: dict[str, tuple[float, float]] = _build_bounds()
 
+# v0.3.3: provider-namespaced variables that are now READ by an entity
+# (not just stored) also get storage bounds. SRF's global irradiance has
+# been stored since v0.2.0 under its srf_ name and was finite-checked
+# only, because nothing consumed it. Same last-line-of-defence bound as
+# the fused radiation parameters.
+PHYSICAL_BOUNDS["srf_irradiance"] = (0.0, 1500.0)
+
 
 def validate_forecast_value(variable: str, value: Optional[float]) -> Optional[float]:
     """Return the value if it is storable, otherwise None.

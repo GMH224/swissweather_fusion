@@ -261,7 +261,46 @@ PARAMETERS: dict[str, ForecastParameter] = {
     "predictability": _p("predictability", ParameterClass.FUSED, "%",
                          fuse_mean, 0, 100,
                          desc="provider-reported forecast confidence"),
+
+    # -- v0.3.3: solar radiation (location-level, panel-agnostic) ----------
+    # GHI = global horizontal, DNI = direct normal, DHI = diffuse
+    # horizontal. Plain names are averages over the PRECEDING hour; the
+    # _instant names are values at the labelled time.
+    #
+    # Registered here for bounds and Class B membership only. They are
+    # NOT fused one at a time: the three are physically linked
+    # (GHI = DHI + DNI * cos(zenith)), so the coordinator fuses them as a
+    # triple — see RADIATION_TRIPLES and ModelABlendCoordinator.
+    # _fuse_radiation. A per-parameter median would break that identity.
+    #
+    # Bounds are a last line of defence, not a climatology: the solar
+    # constant is ~1361 W/m2 and cloud-edge enhancement can briefly push
+    # GHI above clear-sky values, so 1500 rejects only nonsense.
+    "ghi": _p("ghi", ParameterClass.FUSED, "W/m²", fuse_mean, 0, 1500,
+              desc="global horizontal irradiance, preceding-hour average"),
+    "dni": _p("dni", ParameterClass.FUSED, "W/m²", fuse_mean, 0, 1500,
+              desc="direct normal irradiance, preceding-hour average"),
+    "dhi": _p("dhi", ParameterClass.FUSED, "W/m²", fuse_mean, 0, 1500,
+              desc="diffuse horizontal irradiance, preceding-hour average"),
+    "ghi_instant": _p("ghi_instant", ParameterClass.FUSED, "W/m²", fuse_mean,
+                      0, 1500, desc="global horizontal irradiance, instant"),
+    "dni_instant": _p("dni_instant", ParameterClass.FUSED, "W/m²", fuse_mean,
+                      0, 1500, desc="direct normal irradiance, instant"),
+    "dhi_instant": _p("dhi_instant", ParameterClass.FUSED, "W/m²", fuse_mean,
+                      0, 1500, desc="diffuse horizontal irradiance, instant"),
 }
+
+# v0.3.3: the radiation parameters that must be fused together. Each tuple
+# is (GHI, DNI, DHI) for one time basis. A source contributes to a triple
+# at a given hour only if it supplies all three members from the same
+# model run; see ModelABlendCoordinator._fuse_radiation.
+RADIATION_TRIPLES: tuple[tuple[str, str, str], ...] = (
+    ("ghi", "dni", "dhi"),
+    ("ghi_instant", "dni_instant", "dhi_instant"),
+)
+RADIATION_PARAMETERS: frozenset[str] = frozenset(
+    name for triple in RADIATION_TRIPLES for name in triple
+)
 
 
 def get(name: str) -> Optional[ForecastParameter]:

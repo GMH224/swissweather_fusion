@@ -797,3 +797,31 @@ WETTERALARM_MAX_POI_DISTANCE_KM = 25.0
 # documentation; 6 hours covers that without showing warnings so far out
 # they are not yet actionable.
 WETTERALARM_LOOKAHEAD = timedelta(hours=6)
+
+
+# ---------------------------------------------------------------------------
+# v0.3.3 (backlog items 19 + 20): which runtime coordinator owns each
+# source's SourceHealth — the ONE place this is written down.
+#
+# Before v0.3.3 the mapping lived in two hand-written copies: sensor.py's
+# _get_health() and diagnostics.py's source_health loop. v0.2.6 added
+# Wetter-Alarm to the list of sources that GET telemetry sensors, but to
+# neither copy — so its four health sensors could only ever show
+# "unknown" / 0, and the diagnostics export omitted it entirely, while
+# the coordinator itself was polling successfully. Both now read this
+# mapping, and tests/test_v0_3_3_solar.py fails if any telemetry source
+# is missing from it.
+#
+# Open-Meteo's three models share one coordinator whose `health` is a
+# dict keyed by source; every other owner holds a single SourceHealth.
+# ---------------------------------------------------------------------------
+SOURCE_HEALTH_OWNER: dict[str, str] = {
+    SOURCE_CH1: "open_meteo_coordinator",
+    SOURCE_CH2: "open_meteo_coordinator",
+    SOURCE_ICON_D2: "open_meteo_coordinator",
+    SOURCE_SRF: "srf_coordinator",
+    SOURCE_METEOBLUE: "meteoblue_coordinator",
+    SOURCE_COMBIPRECIP: "combiprecip_coordinator",
+    SOURCE_METEONOMIQS: "meteonomiqs_coordinator",
+    SOURCE_WETTERALARM: "wetteralarm_coordinator",
+}

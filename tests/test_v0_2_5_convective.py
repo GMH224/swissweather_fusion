@@ -162,7 +162,17 @@ def test_all_new_parameters_reach_the_blend():
     registered but not wired."""
     from swissweather_fusion.coordinator import ModelABlendCoordinator
 
-    missing = set(fp.fused_parameters()) - set(ModelABlendCoordinator.MEASUREMENTS)
+    # v0.3.3: solar radiation is fused on its own path (as complete
+    # GHI/DNI/DHI triples), not through MEASUREMENTS. It still counts as
+    # reached, but only if that path covers exactly the radiation set —
+    # behaviour of the path itself is tested in test_v0_3_3_solar.py.
+    radiation = set(ModelABlendCoordinator.RADIATION_MEASUREMENTS)
+    assert radiation == set(fp.RADIATION_PARAMETERS)
+    missing = (
+        set(fp.fused_parameters())
+        - set(ModelABlendCoordinator.MEASUREMENTS)
+        - radiation
+    )
     assert not missing, f"registered but never fused: {sorted(missing)}"
 
 

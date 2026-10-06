@@ -48,6 +48,7 @@ from .const import (
     CONF_SRF_CONSUMER_KEY,
     CONF_SRF_CONSUMER_SECRET,
     DOMAIN,
+    SOURCE_HEALTH_OWNER,
 )
 from .redaction import redact_coordinate_strings, redact_secret_values, redact_sensitive_keys
 
@@ -211,9 +212,11 @@ async def async_get_config_entry_diagnostics(
     # `ast.parse`-based syntax checks can't catch this (duplicate
     # function names are syntactically legal), and the fast unit suite
     # only exercised the smaller helper functions, never this top-level
-    # one directly — see tests/test_diagnostics.py's new
-    # test_async_get_config_entry_diagnostics_smoke for why that gap is
-    # now closed.
+    # one directly. (v0.3.3 correction: the smoke test this comment used
+    # to cite, tests/test_diagnostics.py::
+    # test_async_get_config_entry_diagnostics_smoke, never existed. The
+    # gap is actually closed by tests/test_v0_3_3_solar.py::
+    # test_diagnostics_export_end_to_end_includes_every_source.)
     # v0.1.24 fix (P1-04): collect BOTH the options-stored and
     # data-stored value for every credential, not just entry.data.
     #
@@ -250,8 +253,17 @@ async def async_get_config_entry_diagnostics(
     redacted_options = redact_sensitive_keys(dict(entry.options or {}))
 
     source_health: dict[str, Any] = {}
-    for name in ("station", "srf", "meteoblue", "combiprecip", "meteonomiqs"):
-        coordinator = runtime.get(f"{name}_coordinator")
+    # v0.3.3 (backlog item 19): derived from const.SOURCE_HEALTH_OWNER
+    # instead of a hand-written tuple, which never received Wetter-Alarm
+    # when v0.2.6 added it — the export silently omitted the source. The
+    # station (not a forecast source) is listed explicitly; Open-Meteo's
+    # shared coordinator is reported as one grouped entry below, as before.
+    single_owner_sources = tuple(
+        source for source, owner in SOURCE_HEALTH_OWNER.items()
+        if owner != "open_meteo_coordinator"
+    )
+    for name in ("station",) + single_owner_sources:
+        coordinator = runtime.get(SOURCE_HEALTH_OWNER.get(name, "station_coordinator"))
         health = getattr(coordinator, "health", None) if coordinator is not None else None
         source_health[name] = _health_summary(
             health, latitude=latitude, longitude=longitude, secrets=secrets
