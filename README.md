@@ -13,7 +13,7 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.3 — solar radiation for a downstream solar layer, on top of the v0.3.x measurement release.** 826 tests, package pyflakes clean.
+**Status: v0.3.4 — for the solar layer: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 893 tests, package pyflakes clean.
 
 > **If you have ever seen "Config flow could not be loaded: 500 Internal
 > Server Error"** when opening setup, reconfigure or Configure — that was
@@ -56,6 +56,26 @@ v0.3.0's own account is in
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
+> **Upgrading to v0.3.4?** No database migration and no learning reset —
+> the running accuracy trial is untouched (see
+> [swissweather_fusion_v0.3.4_release_audit.md](swissweather_fusion_v0.3.4_release_audit.md)).
+> The cloud layers appear in the hourly forecast with the **next new model
+> run** after the upgrade (within about 3 hours for ICON-CH1/ICON-D2, 6
+> hours for ICON-CH2), for the same reason as radiation in v0.3.3.
+>
+> **New in v0.3.4 — reference station.** Measured 10-minute data from the
+> nearest MeteoSwiss station that measures solar radiation (Tänikon for a
+> Frauenfeld location) appear within 10 minutes of the upgrade: eleven new
+> sensors plus the usual four health sensors for the new source, see
+> "Reference station" below. Observation only — it does not
+> touch the learning.
+>
+> **Changed in v0.3.4 — SRF irradiance is one hour earlier than in
+> v0.3.3**, now correctly: its series is keyed by `period_start` /
+> `period_end` like the solar series (the `time` key is gone). If
+> anything reads `sensor.swissweather_fusion_srf_global_irradiance`'s
+> `hourly_forecast`, see [SOLAR_TEAM_v0.3.4.md](SOLAR_TEAM_v0.3.4.md).
+>
 > **Upgrading to v0.3.3?** No database migration and no learning reset —
 > the running accuracy trial is untouched (see
 > [swissweather_fusion_v0.3.3_release_audit.md](swissweather_fusion_v0.3.3_release_audit.md),
@@ -246,10 +266,91 @@ How to read the `hourly_forecast` series:
 SRF's irradiance is exposed separately because it is the only radiation
 source outside the ICON model family, and because SRF supplies one value
 with no direct/diffuse split — mixing it into the triple would break the
-identity above. SRF documents it only as "Global irradiance in W/m²":
-whether it is an average or instantaneous, and which end of the hour it is
-labelled at, is not documented, so it is passed through at SRF's own
-timestamps. It is 3-hourly beyond SRF's hourly window.
+identity above. SRF documents it only as "Global irradiance in W/m²"; the
+labelling at the end of the interval was established by measurement
+(v0.3.4, see below). Its series uses the same `period_start` /
+`period_end` keys as the solar series: 1-hour periods in SRF's hourly
+window, 3-hour periods beyond it.
+
+### Cloud cover by layer (new in v0.3.4)
+
+Every entry of the weather entity's hourly forecast now carries, next to
+the standard `cloud_coverage`:
+
+| Field | Meaning |
+|---|---|
+| `cloud_coverage_low` | low cloud, surface to ~2 km — includes fog and stratus |
+| `cloud_coverage_mid` | mid-level cloud, ~2–6 km |
+| `cloud_coverage_high` | high cloud, above ~6 km (cirrus) |
+
+Read them with the standard service:
+
+```yaml
+action: weather.get_forecasts
+target:
+  entity_id: weather.swissweather_fusion_<entry_id>_weather
+data:
+  type: hourly
+```
+
+- Percent, valid **at** the hour shown (like `cloud_coverage`), mean of the
+  ICON models that supply them (CH1, CH2, D2). meteoblue's basic package
+  and SRF have no layer split.
+- The three layers do **not** add up to the total: seen from the ground,
+  layers overlap. 60 % low and 60 % high can be 70 % total.
+- A field is **absent** when no model has a value for that hour (beyond
+  ICON's ~5-day horizon), never `0` — a 0 % low layer that nobody forecast
+  would read as "no fog".
+- Hourly forecast only. Not part of Home Assistant's standard forecast
+  fields, so weather cards ignore them; they are for automations and the
+  solar layer. The daily and twice-daily forecasts are unchanged.
+- Not bias-corrected and not verified: there is no local measurement of
+  cloud layers. Low cloud and fog are where weather models are weakest —
+  treat a high `cloud_coverage_low` as a warning sign for the solar
+  forecast, not as a measurement.
+
+**SRF irradiance timing (fixed in v0.3.4).** Compared with the Tänikon
+pyranometer (6–11 Oct 2026), SRF labels its global irradiance at the **end**
+of the interval: SRF's 14:00 value describes 13:00–14:00. v0.3.3 passed the
+label through, so the sensor showed each hour's value one hour late (hourly
+error 98 W/m²; 66 W/m² when read correctly). v0.3.4 keys the series by
+period like the solar series; the sensor's state is the value for the
+current hour.
+
+### Reference station (new in v0.3.4)
+
+Live measurements from a MeteoSwiss SwissMetNet station, refreshed every 10
+minutes (MeteoSwiss publishes about 10–20 minutes after the measurement).
+
+**Which station.** By default the nearest station within 50 km that
+measures global radiation (many SwissMetNet sites only measure rain). For a
+Frauenfeld location that is Tänikon (TAE, ~8 km). To choose another one,
+enter its three-letter code under **Configure → MeteoSwiss reference
+station**; leave it blank for automatic.
+
+| Entity (default ID) | Meaning |
+|---|---|
+| `sensor.swissweather_fusion_reference_station` | Time of the newest record. **Attributes carry the complete dataset**: `values` (every parameter by MeteoSwiss short name), `parameters` (English description and unit of each), `station` (code, name, coordinates, distance), `age_minutes`, `stale` |
+| `sensor.swissweather_fusion_reference_station_temperature` | Air temperature 2 m (°C) |
+| `…_humidity` | Relative humidity (%) |
+| `…_pressure_sea_level` | Pressure reduced to sea level, QFF (hPa) |
+| `…_global_radiation` | Global radiation, 10-minute mean (W/m²) |
+| `…_sunshine_10_min` | Sunshine in the last 10 minutes (min) |
+| `…_longwave_radiation_from_the_sky` | Incoming longwave radiation (W/m²) — high values with little sun mean a cloud deck |
+| `…_wind_speed`, `…_wind_gust`, `…_wind_direction` | 10-minute wind (m/s, °) |
+| `…_precipitation_10_min` | Precipitation in the last 10 minutes (mm) |
+
+- Times are UTC. 10-minute means and sums cover the 10 minutes **ending**
+  at the record time; instantaneous values are taken at it.
+- The value sensors read **unknown** when the newest record is more than
+  60 minutes old — an old reading is not shown as current.
+- Everything else the station reports (e.g. at Tänikon: diffuse radiation,
+  reflected shortwave, longwave out, snow depth, soil temperatures, station
+  and QNH pressure) is in the dataset sensor's `values`. Those attributes
+  are not stored in the recorder; the eleven sensors have history.
+- **Observation only.** The station never enters the learning or the
+  blend; your own station remains the reference of the accuracy trial.
+- Source: MeteoSwiss open government data.
 
 ### Reading the blend comparison
 

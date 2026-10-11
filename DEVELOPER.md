@@ -2200,6 +2200,81 @@ horizons the series is three-hourly. Below 75% coverage no total is
 published. `None` is honest; tripling the sum on an assumption about
 whether a three-hourly value is a rate or an accumulation would not be.
 
+## v0.3.4 — cloud cover by layer
+
+Requested by the solar layer: total cloud cover cannot tell a thin high
+veil from a closed low deck, and low cloud/fog is what breaks a solar
+forecast. ICON-CH1/CH2 and ICON-D2 output the WMO layer split natively;
+Open-Meteo serves it as `cloud_cover_low/_mid/_high`.
+
+Same pattern as radiation in v0.3.3, for the same reasons:
+
+- **Optional variables** (`CLOUD_LAYER_HOURLY_VARIABLES`, part of
+  `OPTIONAL_HOURLY_VARIABLES`): a model refusing them (HTTP 400) drops the
+  optional set for that model only; Class A stays online.
+- **Not part of run identity**: parsed through `_PARSED_VARIABLE_NAME_MAP`
+  via `_CLOUD_LAYER_VARIABLE_NAME_MAP`, kept out of `_VARIABLE_NAME_MAP`.
+  Tests pin the fingerprint to the v0.3.3 algorithm.
+- **Class B, mean, bounds 0–100 %** in `forecast_parameters` — so storage
+  validation derives from the registry, and `_fuse_class_b` fuses them.
+  No closure between layers and total: layers overlap seen from the ground.
+- **Output**: three extra keys on each hourly forecast entry
+  (`cloud_coverage_low/_mid/_high`). Not members of HA's Forecast
+  TypedDict; `weather.get_forecasts` returns the entity's dicts with extra
+  keys intact, so the solar layer reads them there. Omitted when no source
+  has a value, like every other key. The condition still derives from
+  total cover only, and the daily aggregations are unchanged.
+
+**SRF irradiance re-keyed by period.** v0.3.3 published SRF's
+`srf_irradiance` at SRF's own labels, convention undocumented. Owner data
+(6–11 Oct 2026) against the MeteoSwiss Tänikon pyranometer showed SRF
+labels the END of the interval: its daily peak sat an hour after solar
+noon every day, best lag correlation was at -1 h (0.96 vs 0.92), and read
+as end-labelled its hourly MAE fell from 98 to 66 W/m². So
+`_compute_srf_irradiance` now emits `period_start = label - span`,
+`period_end = label`, span = gap to SRF's previous label (1 h hourly, 3 h
+beyond), first label from the gap to the next, capped at 3 h so a data
+gap is never averaged over; intervals ending at or before now are dropped.
+Same keys as `data["solar"]`. The `time` key is gone — a deliberate break
+for consumers, announced in SOLAR_TEAM_v0.3.4.md. Not Class A; SRF
+temperature/precipitation are untouched (precipitation labelled at the end
+is already the Open-Meteo convention, so the blend stays consistent).
+
+**Reference station (MeteoSwiss SwissMetNet).** New source
+`reference_station`, owned by `ReferenceStationCoordinator` (10-minute
+poll, no database). Client `clients/meteoswiss_smn.py`: pure parsers
+(`parse_stations`, `parse_parameters`, `parse_latest`, `header_has`) plus
+an HTTPS-only, data.geo.admin.ch-only, size-capped, chunked fetch.
+
+- Station choice once per load: configured three-letter code, else the
+  nearest stations within 50 km probed in distance order for a `gre000z0`
+  column (precipitation-only sites are common); the probe's download is
+  reused for the first poll. A failed resolution leaves `station` None so
+  the next poll retries.
+- `parse_latest` takes the row with the newest timestamp (file order is not
+  guaranteed) and every parameter column; empty fields stay None and are
+  never filled from an older row, so every value shares one timestamp.
+- `parse_parameters` locates columns by name and skips any row whose field
+  count differs from the header (a stray `;` would otherwise put a
+  description under "unit").
+- Sensors: ten key values with units and long-term statistics
+  (`REFERENCE_VALUE_SENSORS`), unknown beyond `REFERENCE_STATION_MAX_AGE`;
+  one dataset sensor whose `values`/`parameters`/`station` attributes are
+  unrecorded. Health telemetry via `SOURCE_HEALTH_OWNER`.
+- Wiring: the coordinator is in every lifecycle list (construction guard,
+  auth-failure cleanup, first refresh, `_noop` listener, platform-failure
+  cleanup, runtime, `_all_coordinators`). A new test asserts the listener
+  loop covers every runtime coordinator except the blend — the v0.1.16
+  failure mode, now checked generally.
+- Never read by the blend, learning or station coordinators (tested by
+  source inspection and by the absence of a `db` parameter).
+
+Residual risk: the optional set is one unit per model. If a model ever
+refused only a layer variable, that model would also lose radiation and UV
+until the next restart. Open-Meteo documents the layers for all three
+models; a refusal would show as a logged HTTP 400 and the existing
+`optional_variables_dropped` diagnostics event.
+
 ## v0.3.3 — solar radiation, and two ways an upgrade can quietly hurt a trial
 
 v0.3.3 adds location-level solar radiation (GHI, DNI, DHI; hourly
