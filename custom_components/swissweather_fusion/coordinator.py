@@ -38,6 +38,7 @@ from .clients.open_meteo import (
     OpenMeteoRequestRejected,
 )
 from .clients.srf import SrfClient
+from .clients import meteoswiss_smn as smn
 from .clients.wetteralarm import (
     WeatherWarning,
     parse_all_alarms,
@@ -66,6 +67,11 @@ from .const import (
     WETTERALARM_LOOKAHEAD,
     WETTERALARM_MAX_POI_DISTANCE_KM,
     WETTERALARM_POLL_INTERVAL,
+    REFERENCE_STATION_CANDIDATES,
+    REFERENCE_STATION_MAX_DISTANCE_KM,
+    REFERENCE_STATION_META_REFRESH,
+    REFERENCE_STATION_POLL_INTERVAL,
+    SOURCE_REFERENCE_STATION,
     PRESSURE_PLAUSIBLE_MAX_HPA,
     PRESSURE_PLAUSIBLE_MIN_HPA,
     STATION_REFERENCE_TOLERANCES,
@@ -1817,6 +1823,8 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         "precip_probability", "wind_speed", "wind_gust_speed",
         "wind_bearing", "dew_point", "apparent_temperature",
         "cloud_coverage", "visibility",
+        # v0.3.4: cloud cover by layer, for the solar layer.
+        "cloud_coverage_low", "cloud_coverage_mid", "cloud_coverage_high",
         # v0.2.2 fix (SWF-021-010 / SWF-021-011): uv_index and
         # sunshine_duration were registered, requested, mapped and
         # published on the entity — but omitted from this tuple, which is
@@ -2322,18 +2330,28 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         """SRF's own global irradiance, as a separate single-source series.
 
         **v0.3.3.** Stored since v0.2.0 (as srf_irradiance) and never read.
-        Exposed on its own, NOT fused into the GHI triple: SRF supplies one
+        Exposed on its own, NOT fused with the GHI triple: SRF supplies one
         value with no direct/diffuse split, so mixing it in would break the
         triple's physical consistency. Its value is that it is the one
         radiation source outside the ICON model family.
 
-        SRF documents the field only as "Global irradiance in W/m2". Whether
-        it is an hourly average or instantaneous, and which end of the hour
-        it is labelled at, is NOT documented — so values are passed through
-        at SRF's own timestamps, uninterpreted. Beyond SRF's hourly window
-        the data is 3-hourly.
+        **v0.3.4: keyed by period, like the solar series.** v0.3.3 passed
+        SRF's timestamps through uninterpreted, because SRF does not
+        document its convention. Measured against the MeteoSwiss Taenikon
+        pyranometer (6-11 Oct 2026, 61 daylight hours) SRF labels each value
+        at the END of the interval it describes: read as such, its hourly
+        error fell from 98 to 66 W/m2 and its correlation rose from 0.70 to
+        0.84; its daily peak sat an hour after solar noon every day before.
+        So a value labelled T describes [T - span, T), exactly the
+        convention Open-Meteo uses for its radiation averages, and the
+        series now carries the same period_start / period_end keys as
+        data["solar"]. Consumers must not shift it again.
+
+        span is the gap to SRF's previous label: 1 h inside SRF's hourly
+        window, 3 h beyond it. The first label of the window falls back to
+        the gap to the next label (SRF's grid is regular), else 1 h.
         """
-        series: list[dict[str, Any]] = []
+        labelled: list[tuple[datetime, float]] = []
         for offset in range(self.FORECAST_HOURS_AHEAD + 1):
             label = now + timedelta(hours=offset)
             row = latest_forecast.get((SOURCE_SRF, "srf_irradiance", label.isoformat()))
@@ -2342,10 +2360,30 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             value = provider_validation.validate_forecast_value("srf_irradiance", row[0])
             if value is None:
                 continue
-            series.append({"time": label.isoformat(), "value": round(value, 1)})
-        current = (
-            series[0]["value"] if series and series[0]["time"] == now.isoformat() else None
-        )
+            labelled.append((label, value))
+
+        series: list[dict[str, Any]] = []
+        for i, (label, value) in enumerate(labelled):
+            if i > 0:
+                span = label - labelled[i - 1][0]
+            elif len(labelled) > 1:
+                span = labelled[1][0] - label
+            else:
+                span = timedelta(hours=1)
+            span = min(span, timedelta(hours=3))  # never stretch across a data gap
+            period_start = label - span
+            if label <= now:
+                continue  # interval already over: not part of the forecast
+            series.append({
+                "period_start": period_start.isoformat(),
+                "period_end": label.isoformat(),
+                "value": round(value, 1),
+            })
+        current = None
+        if series:
+            first_start = datetime.fromisoformat(series[0]["period_start"])
+            if first_start <= now:
+                current = series[0]["value"]
         return {"current": current, "hourly": series}
 
     def _compute_blend(self) -> dict[str, Any]:
@@ -2480,6 +2518,16 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 "native_wind_gust_speed": values.get("wind_gust_speed"),
                 "wind_bearing": values.get("wind_bearing"),
                 "cloud_coverage": values.get("cloud_coverage"),
+                # v0.3.4: cloud cover by layer. NOT members of Home
+                # Assistant's Forecast TypedDict, so cards ignore them;
+                # weather.get_forecasts passes extra keys through
+                # unchanged, which is where the solar layer reads them.
+                # Same percent scale and same "at the labelled hour"
+                # meaning as cloud_coverage. Dropped like every other key
+                # when no source has a value (ICON horizon ~5 days).
+                "cloud_coverage_low": values.get("cloud_coverage_low"),
+                "cloud_coverage_mid": values.get("cloud_coverage_mid"),
+                "cloud_coverage_high": values.get("cloud_coverage_high"),
                 "uv_index": values.get("uv_index"),
                 # v0.2.1: resolve_condition prefers the provider's own WMO
                 # code and explicit snowfall over inference — see
@@ -3802,3 +3850,175 @@ class WetterAlarmCoordinator(DataUpdateCoordinator):
                 ),
             )
         return self.warning
+
+
+class ReferenceStationCoordinator(DataUpdateCoordinator):
+    """Measured 10-minute weather from a MeteoSwiss SwissMetNet station.
+
+    **v0.3.4.** For the downstream solar layer: measured global radiation,
+    sunshine, the sky's longwave radiation (a direct sign of a cloud deck),
+    air temperature and wind (panel-temperature model), and every other
+    parameter the station reports.
+
+    **Observation only.** Nothing here reaches the Class A learning or the
+    blend; the user's own station remains the reference of the accuracy
+    trial. Using this station as a second verification reference is a
+    v0.4.0 decision, deliberately not taken mid-trial.
+
+    **Station choice.** A configured SMN abbreviation is used as given.
+    Otherwise the nearest stations (up to REFERENCE_STATION_CANDIDATES,
+    within REFERENCE_STATION_MAX_DISTANCE_KM) are probed in distance order
+    and the first whose 10-minute file carries global radiation is chosen
+    — many SMN sites are precipitation-only, and a reference without
+    radiation would not serve the solar layer. The choice is made once and
+    kept until reload; a failed resolution is retried on the next poll.
+    """
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        latitude: float,
+        longitude: float,
+        *,
+        station_abbr: Optional[str] = None,
+        diagnostics: Any = None,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name="swissweather_fusion_reference_station",
+            update_interval=REFERENCE_STATION_POLL_INTERVAL,
+        )
+        self._latitude = latitude
+        self._longitude = longitude
+        self._configured = (station_abbr or "").strip().upper() or None
+        self._diagnostics = diagnostics
+        self._client = smn.SmnClient(async_get_clientsession(hass))
+        self.health = SourceHealth()
+        self.station: Optional[dict[str, Any]] = None
+        self._parameters: dict[str, smn.ParameterMeta] = {}
+        self._parameters_fetched_at: Optional[datetime] = None
+        self._last_measured_at: Optional[datetime] = None
+
+    async def _async_resolve_station(self) -> Optional[str]:
+        """Pick the station once. Returns the 'now' file text fetched while
+        probing, so the first poll does not download it twice."""
+        stations: list[smn.StationMeta] = []
+        try:
+            stations = smn.parse_stations(
+                await self._client.async_fetch_text(smn.META_STATIONS_URL)
+            )
+        except Exception as err:  # noqa: BLE001 - metadata is optional for a configured station
+            if self._configured is None:
+                raise
+            _LOGGER.debug("SMN station metadata unavailable: %s", err)
+
+        if self._configured is not None:
+            meta = next((s for s in stations if s.abbr == self._configured), None)
+            self.station = self._station_dict(meta, self._configured, "configured")
+            return None
+
+        ranked = [
+            (meta, dist) for meta, dist in smn.stations_by_distance(
+                stations, self._latitude, self._longitude
+            )
+            if dist <= REFERENCE_STATION_MAX_DISTANCE_KM
+        ][:REFERENCE_STATION_CANDIDATES]
+        for meta, dist in ranked:
+            try:
+                text = await self._client.async_fetch_text(smn.now_url(meta.abbr))
+            except Exception as err:  # noqa: BLE001 - try the next candidate
+                _LOGGER.debug("SMN candidate %s not usable: %s", meta.abbr, err)
+                continue
+            if smn.header_has(text, smn.REQUIRED_PARAMETER):
+                self.station = self._station_dict(meta, meta.abbr, "nearest with radiation")
+                _LOGGER.info(
+                    "Reference station: %s (%s), %.1f km away",
+                    meta.name, meta.abbr, dist,
+                )
+                return text
+        raise ValueError(
+            "no MeteoSwiss station measuring global radiation within "
+            f"{REFERENCE_STATION_MAX_DISTANCE_KM:.0f} km "
+            f"({len(ranked)} candidate(s) checked)"
+        )
+
+    def _station_dict(
+        self, meta: Optional[smn.StationMeta], abbr: str, selection: str
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {"abbr": abbr, "selection": selection}
+        if meta is not None:
+            result.update(
+                name=meta.name,
+                latitude=meta.latitude,
+                longitude=meta.longitude,
+                elevation_m=meta.elevation_m,
+                distance_km=round(smn.distance_km(
+                    self._latitude, self._longitude, meta.latitude, meta.longitude
+                ), 1),
+            )
+        return result
+
+    async def _async_refresh_parameters(self) -> None:
+        now = datetime.now(timezone.utc)
+        if (
+            self._parameters_fetched_at is not None
+            and now - self._parameters_fetched_at < REFERENCE_STATION_META_REFRESH
+        ):
+            return
+        self._parameters_fetched_at = now  # also on failure: retry in a day, not every poll
+        try:
+            parsed = smn.parse_parameters(
+                await self._client.async_fetch_text(smn.META_PARAMETERS_URL)
+            )
+        except Exception as err:  # noqa: BLE001 - descriptions are optional
+            _LOGGER.debug("SMN parameter descriptions unavailable: %s", err)
+            return
+        if parsed:
+            self._parameters = parsed
+
+    async def _async_update_data(self) -> dict[str, Any]:
+        start = time.monotonic()
+        try:
+            # Generous: resolution may probe several candidate stations.
+            async with asyncio.timeout(120):
+                text = None
+                if self.station is None:
+                    text = await self._async_resolve_station()
+                if text is None:
+                    text = await self._client.async_fetch_text(
+                        smn.now_url(self.station["abbr"])
+                    )
+                observation = smn.parse_latest(text)
+                if observation is None:
+                    raise ValueError("10-minute file has no parsable record")
+                await self._async_refresh_parameters()
+        except Exception as err:  # noqa: BLE001
+            kind = self.health.record_error(err)
+            if self._diagnostics is not None:
+                self._diagnostics.record(
+                    source=SOURCE_REFERENCE_STATION, event_type="poll_failure",
+                    detail=str(err)[:200],
+                )
+            raise UpdateFailed(
+                f"MeteoSwiss reference station fetch failed ({kind} error): {err}"
+            ) from None
+
+        self.health.record_success(duration_ms=(time.monotonic() - start) * 1000)
+        if observation.measured_at != self._last_measured_at and self._diagnostics is not None:
+            self._diagnostics.record(
+                source=SOURCE_REFERENCE_STATION, event_type="poll_success",
+                detail=f"{self.station['abbr']} {observation.measured_at.isoformat()}",
+            )
+        self._last_measured_at = observation.measured_at
+        parameters = {
+            name: {"description": meta.description, "unit": meta.unit}
+            for name, meta in self._parameters.items()
+            if name in observation.values
+        }
+        return {
+            "station": dict(self.station),
+            "measured_at": observation.measured_at.isoformat(),
+            "values": observation.values,
+            "parameters": parameters,
+        }

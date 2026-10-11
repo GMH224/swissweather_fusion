@@ -149,7 +149,25 @@ RADIATION_HOURLY_VARIABLES = (
     "direct_normal_irradiance_instant",
     "diffuse_radiation_instant",
 )
-OPTIONAL_HOURLY_VARIABLES = ("uv_index",) + RADIATION_HOURLY_VARIABLES
+# v0.3.4: cloud cover by layer, for the downstream solar layer (feedback
+# from the solar team: low cloud and fog are what break a solar forecast,
+# and total cover cannot tell a thin high veil from a closed low deck).
+#
+# ICON-CH1/CH2 and ICON-D2 compute these layers natively (Open-Meteo's
+# MeteoSwiss model page lists them as direct model output). Standard WMO
+# layer split: low = surface to ~2 km, mid = ~2-6 km, high = above ~6 km.
+# Percent, valid AT the labelled hour, like cloud_cover itself.
+#
+# Optional for the same reason as radiation: a model refusing one of them
+# must not take Class A temperature/humidity/pressure offline mid-trial.
+CLOUD_LAYER_HOURLY_VARIABLES = (
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+)
+OPTIONAL_HOURLY_VARIABLES = (
+    ("uv_index",) + RADIATION_HOURLY_VARIABLES + CLOUD_LAYER_HOURLY_VARIABLES
+)
 
 
 class OpenMeteoRequestRejected(ValueError):
@@ -306,7 +324,20 @@ _RADIATION_VARIABLE_NAME_MAP = {
     "direct_normal_irradiance_instant": "dni_instant",
     "diffuse_radiation_instant": "dhi_instant",
 }
-_PARSED_VARIABLE_NAME_MAP = {**_VARIABLE_NAME_MAP, **_RADIATION_VARIABLE_NAME_MAP}
+# v0.3.4: cloud layers. Kept out of _VARIABLE_NAME_MAP for exactly the
+# reason the radiation names are: that map defines run identity, and
+# extending it would make the current upstream run of every model look
+# new at upgrade and double-count it in the Class A learning.
+_CLOUD_LAYER_VARIABLE_NAME_MAP = {
+    "cloud_cover_low": "cloud_coverage_low",
+    "cloud_cover_mid": "cloud_coverage_mid",
+    "cloud_cover_high": "cloud_coverage_high",
+}
+_PARSED_VARIABLE_NAME_MAP = {
+    **_VARIABLE_NAME_MAP,
+    **_RADIATION_VARIABLE_NAME_MAP,
+    **_CLOUD_LAYER_VARIABLE_NAME_MAP,
+}
 
 
 def _compute_run_fingerprint(hourly: dict[str, Any]) -> str:

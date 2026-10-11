@@ -34,6 +34,7 @@ from .const import (
     CONF_METEONOMIQS_API_KEY,
     CONF_OPEN_METEO_API_KEY,
     CONF_PURGE_DAYS,
+    CONF_REFERENCE_STATION,
     CONF_SRF_CONSUMER_KEY,
     CONF_SRF_CONSUMER_SECRET,
     CONF_STATION_HUMIDITY_ENTITY,
@@ -146,6 +147,17 @@ _ELEVATION_VALIDATOR = vol.All(_finite_float, vol.Range(min=-430.0, max=9000.0))
 # a negative value silently became a second spelling of forever rather
 # than the error it looks like.
 _PURGE_DAYS_VALIDATOR = vol.All(vol.Coerce(int), vol.Range(min=0))
+
+
+def normalize_reference_station(value: Any) -> tuple[str, bool]:
+    """v0.3.4: '' (automatic) or a SwissMetNet abbreviation, upper case.
+
+    Returns (normalised value, valid). SwissMetNet abbreviations are three
+    letters (TAE, KLO, SMA, ...)."""
+    text = ("" if value is None else str(value)).strip().upper()
+    if text == "":
+        return "", True
+    return text, len(text) == 3 and text.isascii() and text.isalpha()
 
 
 def _location_unique_id(latitude: float, longitude: float) -> str:
@@ -535,6 +547,7 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
             CONF_ELEVATION_OVERRIDE, self._config_entry.data.get(CONF_ELEVATION_OVERRIDE)
         )
 
+        errors: dict[str, str] = {}
         if user_input is not None:
             # v0.1.2 fix: credential fields were entirely missing from
             # this flow — there was no way to view or change them after
@@ -584,7 +597,16 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
             # else: result[CONF_ELEVATION_OVERRIDE] already holds whatever
             # numeric value the form submitted, including 0.0.
 
-            return self.async_create_entry(title="", data=result)
+            # v0.3.4: reference station. Blank = nearest MeteoSwiss station
+            # with global radiation; otherwise a SwissMetNet abbreviation
+            # (three letters, e.g. TAE). Validated here rather than with a
+            # schema validator, so the form schema stays serialisable.
+            station, valid = normalize_reference_station(result.get(CONF_REFERENCE_STATION))
+            if not valid:
+                errors[CONF_REFERENCE_STATION] = "invalid_reference_station"
+            else:
+                result[CONF_REFERENCE_STATION] = station
+                return self.async_create_entry(title="", data=result)
 
         text_password = selector.TextSelector(
             selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
@@ -671,6 +693,11 @@ class SwissWeatherFusionOptionsFlow(config_entries.OptionsFlow):
                         ),
                     ),
                 ): selector.BooleanSelector(),
+                # v0.3.4: MeteoSwiss reference station; blank = nearest.
+                vol.Optional(
+                    CONF_REFERENCE_STATION,
+                    default=current.get(CONF_REFERENCE_STATION, ""),
+                ): selector.TextSelector(),
             }
         )
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)

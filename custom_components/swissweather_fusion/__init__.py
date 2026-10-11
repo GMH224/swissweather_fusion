@@ -23,6 +23,7 @@ from .const import (
     CONF_METEONOMIQS_API_KEY,
     CONF_OPEN_METEO_API_KEY,
     CONF_PURGE_DAYS,
+    CONF_REFERENCE_STATION,
     CONF_SRF_CONSUMER_KEY,
     CONF_SRF_CONSUMER_SECRET,
     CONF_STATION_HUMIDITY_ENTITY,
@@ -39,6 +40,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from .coordinator import (
     StormEventReconciliationCoordinator,
     WetterAlarmCoordinator,
+    ReferenceStationCoordinator,
     CombiPrecipCoordinator,
     MeteoblueCoordinator,
     MeteonomiqsCoordinator,
@@ -276,6 +278,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         wetteralarm_coordinator = WetterAlarmCoordinator(
             hass, latitude, longitude, diagnostics=diagnostics_recorder
         )
+        # v0.3.4: measured 10-minute data from the nearest MeteoSwiss
+        # station with global radiation (or the configured one). Observation
+        # only — nothing reads it into the learning or the blend.
+        reference_station_coordinator = ReferenceStationCoordinator(
+            hass, latitude, longitude,
+            station_abbr=options.get(CONF_REFERENCE_STATION) or None,
+            diagnostics=diagnostics_recorder,
+        )
     except Exception:
         # Nothing is registered yet at this point, so closing the
         # connection is the whole of the required cleanup.
@@ -342,6 +352,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         retention_coordinator,
         storm_reconciliation_coordinator,
         wetteralarm_coordinator,
+        reference_station_coordinator,
     )
     results = await asyncio.gather(
         *(c.async_config_entry_first_refresh() for c in source_coordinators),
@@ -382,13 +393,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     derived_coordinators = (
         model_b_coordinator, blend_coordinator, learning_coordinator,
         retention_coordinator, storm_reconciliation_coordinator,
-        wetteralarm_coordinator,
+        wetteralarm_coordinator, reference_station_coordinator,
     )
     derived_labels = (
         "Model B scoring", "Model A blend computation",
         "Model A learning reconciliation", "retention purge",
         "storm event reconciliation",
         "official weather warnings",
+        "reference station",
     )
     derived_results = await asyncio.gather(
         *(c.async_config_entry_first_refresh() for c in derived_coordinators),
@@ -418,6 +430,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "retention_coordinator": retention_coordinator,
         "storm_reconciliation_coordinator": storm_reconciliation_coordinator,
         "wetteralarm_coordinator": wetteralarm_coordinator,
+        "reference_station_coordinator": reference_station_coordinator,
         "diagnostics_recorder": diagnostics_recorder,
     }
 
@@ -512,6 +525,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # still not being populated.
         storm_reconciliation_coordinator,
         wetteralarm_coordinator,
+        reference_station_coordinator,
     ):
         entry.async_on_unload(coordinator.async_add_listener(_noop))
 
@@ -539,6 +553,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             retention_coordinator,
             storm_reconciliation_coordinator,
             wetteralarm_coordinator,
+            reference_station_coordinator,
         ):
             await coordinator.async_shutdown()
         await hass.async_add_executor_job(db.close)
@@ -581,6 +596,7 @@ def _all_coordinators(runtime: dict) -> list:
         "retention_coordinator",
         "storm_reconciliation_coordinator",
         "wetteralarm_coordinator",
+        "reference_station_coordinator",
     )
     return [runtime[k] for k in keys if k in runtime]
 

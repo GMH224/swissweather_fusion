@@ -216,6 +216,19 @@ PARAMETERS: dict[str, ForecastParameter] = {
                                desc="feels-like temperature"),
     "cloud_coverage": _p("cloud_coverage", ParameterClass.FUSED, "%", fuse_mean,
                          0, 100, desc="total cloud cover"),
+    # v0.3.4: cover by layer (ICON native output; meteoblue's basic
+    # package and SRF have no layer split, so these fuse the ICON models
+    # only). Mean, like total cover: a cover fraction is continuous and
+    # no layer is "worse" in a way that would justify max or min.
+    # The three layers do NOT sum to the total — layers overlap when
+    # seen from the ground — so no closure is enforced between them.
+    "cloud_coverage_low": _p("cloud_coverage_low", ParameterClass.FUSED, "%",
+                             fuse_mean, 0, 100,
+                             desc="low cloud cover (surface to ~2 km), incl. fog/stratus"),
+    "cloud_coverage_mid": _p("cloud_coverage_mid", ParameterClass.FUSED, "%",
+                             fuse_mean, 0, 100, desc="mid cloud cover (~2-6 km)"),
+    "cloud_coverage_high": _p("cloud_coverage_high", ParameterClass.FUSED, "%",
+                              fuse_mean, 0, 100, desc="high cloud cover (above ~6 km)"),
     "visibility": _p("visibility", ParameterClass.FUSED, "m", fuse_min,
                      0, 100_000,
                      desc="horizontal visibility; fused with min, since the "

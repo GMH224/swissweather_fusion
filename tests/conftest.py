@@ -176,7 +176,10 @@ def _install_homeassistant_stubs() -> None:
         {"TIMESTAMP": "timestamp", "DURATION": "duration",
          "TEMPERATURE": "temperature", "ATMOSPHERIC_PRESSURE": "atmospheric_pressure",
          # v0.3.3: mirrors homeassistant.components.sensor.SensorDeviceClass.
-         "IRRADIANCE": "irradiance"},
+         "IRRADIANCE": "irradiance",
+         # v0.3.4: reference station sensors.
+         "HUMIDITY": "humidity", "WIND_SPEED": "wind_speed",
+         "PRECIPITATION": "precipitation"},
     )
     sensor_component.SensorStateClass = type(
         "SensorStateClass",

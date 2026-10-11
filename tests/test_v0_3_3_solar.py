@@ -419,8 +419,11 @@ def test_srf_irradiance_is_passed_through_and_never_fused(db, monkeypatch):
         for h, v in srf_values.items()
     ])
     data = asyncio.run(_blend(db)._async_update_data())
-    assert data["srf_irradiance"]["current"] == 640.0
-    assert [e["value"] for e in data["srf_irradiance"]["hourly"]] == list(srf_values.values())
+    # v0.3.4: SRF labels the END of its interval, so the value labelled
+    # NOW (640) describes the hour already past and the current hour is
+    # the value labelled NOW + 1 h. (v0.3.3 asserted the pass-through.)
+    assert data["srf_irradiance"]["current"] == 655.0
+    assert [e["value"] for e in data["srf_irradiance"]["hourly"]] == [655.0, 500.0, 410.0]
     for entry in data["solar"]["hourly"]:
         h = int((datetime.fromisoformat(entry["period_start"]) - NOW).total_seconds() // 3600)
         if "ghi" in entry:
@@ -534,7 +537,9 @@ def test_every_owner_is_a_real_runtime_key():
 def _health_runtime():
     shared = {s: SourceHealth() for s in ("ch1", "ch2", "icon_d2")}
     runtime = {"open_meteo_coordinator": SimpleNamespace(health=shared)}
-    for name in ("station", "srf", "meteoblue", "combiprecip", "meteonomiqs", "wetteralarm"):
+    # v0.3.4: reference_station added with its new telemetry source.
+    for name in ("station", "srf", "meteoblue", "combiprecip", "meteonomiqs", "wetteralarm",
+                 "reference_station"):
         runtime[f"{name}_coordinator"] = SimpleNamespace(
             health=SourceHealth(), update_interval=timedelta(minutes=20),
             last_update_success=True,

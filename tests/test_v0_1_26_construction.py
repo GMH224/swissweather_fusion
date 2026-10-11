@@ -187,6 +187,15 @@ def test_wetteralarm_coordinator_constructs(hass, db):
     assert c.warning is not None and not c.warning.is_active
 
 
+def test_reference_station_coordinator_constructs(hass, db):
+    """v0.3.4: no database, no network in __init__ — the station is
+    resolved on the first refresh, so construction cannot fail on I/O."""
+    auto = coord.ReferenceStationCoordinator(hass, LAT, LON, diagnostics=None)
+    assert auto.station is None and auto._configured is None
+    fixed = coord.ReferenceStationCoordinator(hass, LAT, LON, station_abbr=" tae ")
+    assert fixed._configured == "TAE"
+
+
 def test_storm_reconciliation_coordinator_constructs(hass, db):
     """P2-08's new coordinator — new code has no prior call site to
     validate it against, so constructing it is the only check there is."""

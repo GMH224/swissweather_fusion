@@ -82,9 +82,13 @@
           "elevation_override": "Elevation override (m) — set the number to change it, or check the box below to clear it and revert to automatic lookup",
           "clear_elevation_override": "Clear elevation override (revert to automatic lookup)",
           "clear_open_meteo_api_key": "Clear the Open-Meteo API key (return to the free tier)",
-          "station_pressure_is_sea_level": "My pressure sensor already reports sea-level pressure"
+          "station_pressure_is_sea_level": "My pressure sensor already reports sea-level pressure",
+          "reference_station": "MeteoSwiss reference station (three-letter code, e.g. TAE; leave blank for the nearest station that measures solar radiation)"
         }
       }
+    },
+    "error": {
+      "invalid_reference_station": "Enter a three-letter MeteoSwiss station code (e.g. TAE), or leave the field blank."
     }
   }
 }

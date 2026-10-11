@@ -36,6 +36,8 @@ from .const import (
     SOURCE_METEONOMIQS,
     SOURCE_WETTERALARM,
     SOURCE_HEALTH_OWNER,
+    SOURCE_REFERENCE_STATION,
+    REFERENCE_STATION_MAX_AGE,
     SOURCE_SRF,
 )
 from .device import build_device_info
@@ -49,6 +51,8 @@ from .storage.db import SwissWeatherDB
 # can fail silently is one whose failures are discovered late.
 ALL_TELEMETRY_SOURCES = ALL_FORECAST_SOURCES + (
     SOURCE_COMBIPRECIP, SOURCE_METEONOMIQS, SOURCE_WETTERALARM,
+    # v0.3.4: MeteoSwiss reference station (observations, not a forecast)
+    SOURCE_REFERENCE_STATION,
 )
 
 
@@ -111,6 +115,9 @@ async def async_setup_entry(
         # v0.3.3: location-level solar radiation for the solar layer.
         *(SolarIrradianceSensor(entry, runtime, key) for key in SOLAR_SENSOR_KEYS),
         SrfIrradianceSensor(entry, runtime),
+        # v0.3.4: measured data from the MeteoSwiss reference station.
+        ReferenceStationSensor(entry, runtime),
+        *(ReferenceValueSensor(entry, runtime, spec) for spec in REFERENCE_VALUE_SENSORS),
         ConvectiveRiskSensor(entry, runtime),
         OfficialWarningSensor(entry, runtime),
     ]
@@ -1065,12 +1072,145 @@ class SrfIrradianceSensor(_BaseSensor):
         return {
             "hourly_forecast": self._srf().get("hourly") or [],
             "semantics": (
-                "SRF documents this only as 'Global irradiance in W/m2'. "
-                "Whether it is an hourly average or instantaneous, and "
-                "which end of the hour a value is labelled at, is not "
-                "documented; values are passed through at SRF's own "
-                "timestamps, uninterpreted. 3-hourly beyond SRF's hourly "
-                "window. Not fused with the ICON GHI/DNI/DHI triple."
+                "Average global irradiance (W/m2) over [period_start, "
+                "period_end), UTC - the same convention as the solar "
+                "radiation series. SRF labels values at the END of their "
+                "interval (measured against the Taenikon pyranometer, "
+                "v0.3.4); the series is already keyed by period, do not "
+                "shift it again. 1-hour periods in SRF's hourly window, "
+                "3-hour periods beyond it. Not fused with the ICON "
+                "GHI/DNI/DHI triple."
+            ),
+        }
+
+
+def _reference_data(runtime: dict[str, Any]) -> dict[str, Any]:
+    coordinator = runtime.get("reference_station_coordinator")
+    if coordinator is None or not coordinator.data:
+        return {}
+    return coordinator.data
+
+
+def _reference_age(data: dict[str, Any], now: Optional[datetime] = None) -> Optional[timedelta]:
+    measured = data.get("measured_at")
+    if not measured:
+        return None
+    try:
+        when = datetime.fromisoformat(measured)
+    except ValueError:
+        return None
+    return (now or datetime.now(timezone.utc)) - when
+
+
+# v0.3.4: the key values of the reference station, as sensors with units
+# and long-term statistics. Everything else the station reports is in the
+# dataset sensor's attributes. (key, MeteoSwiss parameter, name, unit,
+# device class, state class, icon)
+REFERENCE_VALUE_SENSORS: tuple[tuple[str, str, str, str, Optional[str], Optional[str], str], ...] = (
+    ("temperature", "tre200s0", "Reference station temperature", "°C",
+     SensorDeviceClass.TEMPERATURE, SensorStateClass.MEASUREMENT, "mdi:thermometer"),
+    ("humidity", "ure200s0", "Reference station humidity", "%",
+     SensorDeviceClass.HUMIDITY, SensorStateClass.MEASUREMENT, "mdi:water-percent"),
+    ("pressure", "pp0qffs0", "Reference station pressure (sea level)", "hPa",
+     SensorDeviceClass.ATMOSPHERIC_PRESSURE, SensorStateClass.MEASUREMENT, "mdi:gauge"),
+    ("global_radiation", "gre000z0", "Reference station global radiation", "W/m²",
+     SensorDeviceClass.IRRADIANCE, SensorStateClass.MEASUREMENT, "mdi:white-balance-sunny"),
+    ("sunshine", "sre000z0", "Reference station sunshine (10 min)", "min",
+     SensorDeviceClass.DURATION, SensorStateClass.MEASUREMENT, "mdi:weather-sunny"),
+    ("longwave_in", "oli000z0", "Reference station longwave radiation from the sky", "W/m²",
+     SensorDeviceClass.IRRADIANCE, SensorStateClass.MEASUREMENT, "mdi:weather-cloudy"),
+    ("wind_speed", "fkl010z0", "Reference station wind speed", "m/s",
+     SensorDeviceClass.WIND_SPEED, SensorStateClass.MEASUREMENT, "mdi:weather-windy"),
+    ("wind_gust", "fkl010z1", "Reference station wind gust", "m/s",
+     SensorDeviceClass.WIND_SPEED, SensorStateClass.MEASUREMENT, "mdi:weather-windy-variant"),
+    ("wind_direction", "dkl010z0", "Reference station wind direction", "°",
+     None, None, "mdi:compass-outline"),
+    ("precipitation", "rre150z0", "Reference station precipitation (10 min)", "mm",
+     SensorDeviceClass.PRECIPITATION, SensorStateClass.MEASUREMENT, "mdi:weather-rainy"),
+)
+
+
+class ReferenceValueSensor(_BaseSensor):
+    """One measured value of the MeteoSwiss reference station.
+
+    **v0.3.4.** Unknown when the station's newest record is older than
+    REFERENCE_STATION_MAX_AGE: an hour-old reading must not pose as "now".
+    10-minute means and sums cover the 10 minutes ENDING at measured_at.
+    """
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any], spec: tuple) -> None:
+        key, parameter, name, unit, device_class, state_class, icon = spec
+        super().__init__(entry, f"reference_station_{key}", name)
+        self._runtime = runtime
+        self._parameter = parameter
+        self._attr_native_unit_of_measurement = unit
+        self._attr_device_class = device_class
+        self._attr_state_class = state_class
+        self._attr_icon = icon
+
+    @property
+    def native_value(self) -> Optional[float]:
+        data = _reference_data(self._runtime)
+        age = _reference_age(data)
+        if age is None or age > REFERENCE_STATION_MAX_AGE:
+            return None
+        return (data.get("values") or {}).get(self._parameter)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = _reference_data(self._runtime)
+        station = data.get("station") or {}
+        return {
+            "measured_at": data.get("measured_at"),
+            "station": station.get("abbr"),
+            "meteoswiss_parameter": self._parameter,
+        }
+
+
+class ReferenceStationSensor(_BaseSensor):
+    """The complete current dataset of the MeteoSwiss reference station.
+
+    **v0.3.4.** State: time of the newest record. Attributes: every
+    parameter the station reported in that record (MeteoSwiss short names),
+    with English descriptions and units from MeteoSwiss's parameter list,
+    plus the station's identity and distance. The dataset attributes are
+    excluded from the recorder; the key values have their own sensors with
+    history.
+    """
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_icon = "mdi:radio-tower"
+    _unrecorded_attributes = frozenset({"values", "parameters", "station"})
+
+    def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
+        super().__init__(entry, "reference_station", "Reference station")
+        self._runtime = runtime
+
+    @property
+    def native_value(self) -> Optional[datetime]:
+        measured = _reference_data(self._runtime).get("measured_at")
+        try:
+            return datetime.fromisoformat(measured) if measured else None
+        except ValueError:
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = _reference_data(self._runtime)
+        age = _reference_age(data)
+        return {
+            "station": data.get("station") or {},
+            "age_minutes": None if age is None else round(age.total_seconds() / 60, 1),
+            "stale": None if age is None else age > REFERENCE_STATION_MAX_AGE,
+            "values": data.get("values") or {},
+            "parameters": data.get("parameters") or {},
+            "semantics": (
+                "MeteoSwiss SwissMetNet 10-minute data, UTC. Values are the "
+                "station's newest record; 10-minute means and sums (names "
+                "ending in z0/z1/z3) cover the 10 minutes ending at the "
+                "sensor state, instantaneous values (s0) are taken at it. "
+                "Empty fields are null, never filled from older records. "
+                "Source: MeteoSwiss."
             ),
         }
 

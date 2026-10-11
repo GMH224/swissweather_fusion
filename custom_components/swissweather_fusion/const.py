@@ -815,6 +815,27 @@ WETTERALARM_LOOKAHEAD = timedelta(hours=6)
 # Open-Meteo's three models share one coordinator whose `health` is a
 # dict keyed by source; every other owner holds a single SourceHealth.
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# v0.3.4: reference station — measured 10-minute data from the nearest
+# MeteoSwiss SwissMetNet station that measures global radiation (Taenikon
+# for the owner's site), exposed for the solar layer. Observation only:
+# it never enters the Class A learning, whose reference stays the user's
+# own station.
+# ---------------------------------------------------------------------------
+SOURCE_REFERENCE_STATION = "reference_station"
+CONF_REFERENCE_STATION = "reference_station"   # SMN abbreviation; empty = nearest
+REFERENCE_STATION_POLL_INTERVAL = timedelta(minutes=10)
+# MeteoSwiss publishes within ~10-20 minutes. Older than this, the values
+# are no longer "current" and the key sensors report unknown rather than
+# an hour-old reading presented as now.
+REFERENCE_STATION_MAX_AGE = timedelta(minutes=60)
+# Nearest stations probed (in distance order) for global radiation, and
+# the distance beyond which "nearest" stops being a meaningful reference.
+REFERENCE_STATION_CANDIDATES = 5
+REFERENCE_STATION_MAX_DISTANCE_KM = 50.0
+# Station metadata and parameter descriptions change rarely.
+REFERENCE_STATION_META_REFRESH = timedelta(hours=24)
+
 SOURCE_HEALTH_OWNER: dict[str, str] = {
     SOURCE_CH1: "open_meteo_coordinator",
     SOURCE_CH2: "open_meteo_coordinator",
@@ -824,4 +845,5 @@ SOURCE_HEALTH_OWNER: dict[str, str] = {
     SOURCE_COMBIPRECIP: "combiprecip_coordinator",
     SOURCE_METEONOMIQS: "meteonomiqs_coordinator",
     SOURCE_WETTERALARM: "wetteralarm_coordinator",
+    SOURCE_REFERENCE_STATION: "reference_station_coordinator",
 }
