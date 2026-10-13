@@ -1176,11 +1176,22 @@ class ReferenceStationSensor(_BaseSensor):
     plus the station's identity and distance. The dataset attributes are
     excluded from the recorder; the key values have their own sensors with
     history.
+
+    **v0.3.5.** `recent_values`: every 10-minute record of the last six
+    hours as MeteoSwiss published it, oldest first, each
+    {"time": end of interval (UTC ISO), "values": {...}}. Requested by the
+    solar layer, which builds measured hours from it (5 of 6 records): a
+    poll every 10 minutes against a feed published with a varying delay
+    sees only some records as "newest". Read from the station file on
+    every poll, so it is complete again at the first update after a
+    restart. Unrecorded: a working list, not history.
     """
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
     _attr_icon = "mdi:radio-tower"
-    _unrecorded_attributes = frozenset({"values", "parameters", "station"})
+    _unrecorded_attributes = frozenset(
+        {"values", "parameters", "station", "recent_values"}
+    )
 
     def __init__(self, entry: ConfigEntry, runtime: dict[str, Any]) -> None:
         super().__init__(entry, "reference_station", "Reference station")
@@ -1204,12 +1215,16 @@ class ReferenceStationSensor(_BaseSensor):
             "stale": None if age is None else age > REFERENCE_STATION_MAX_AGE,
             "values": data.get("values") or {},
             "parameters": data.get("parameters") or {},
+            "recent_values": data.get("recent") or [],
             "semantics": (
                 "MeteoSwiss SwissMetNet 10-minute data, UTC. Values are the "
                 "station's newest record; 10-minute means and sums (names "
                 "ending in z0/z1/z3) cover the 10 minutes ending at the "
                 "sensor state, instantaneous values (s0) are taken at it. "
                 "Empty fields are null, never filled from older records. "
+                "recent_values: every record of the last 6 hours, oldest "
+                "first, time = end of the 10-minute interval; a record "
+                "MeteoSwiss has not published is absent, not filled. "
                 "Source: MeteoSwiss."
             ),
         }

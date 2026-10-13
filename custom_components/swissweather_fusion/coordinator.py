@@ -70,6 +70,7 @@ from .const import (
     REFERENCE_STATION_CANDIDATES,
     REFERENCE_STATION_MAX_DISTANCE_KM,
     REFERENCE_STATION_META_REFRESH,
+    REFERENCE_STATION_RECENT_WINDOW,
     REFERENCE_STATION_POLL_INTERVAL,
     SOURCE_REFERENCE_STATION,
     PRESSURE_PLAUSIBLE_MAX_HPA,
@@ -3992,6 +3993,9 @@ class ReferenceStationCoordinator(DataUpdateCoordinator):
                 observation = smn.parse_latest(text)
                 if observation is None:
                     raise ValueError("10-minute file has no parsable record")
+                # v0.3.5: every record of the last 6 hours from the same
+                # download, for the solar layer's hourly 5-of-6 rule.
+                records = smn.parse_records(text, REFERENCE_STATION_RECENT_WINDOW)
                 await self._async_refresh_parameters()
         except Exception as err:  # noqa: BLE001
             kind = self.health.record_error(err)
@@ -4021,4 +4025,8 @@ class ReferenceStationCoordinator(DataUpdateCoordinator):
             "measured_at": observation.measured_at.isoformat(),
             "values": observation.values,
             "parameters": parameters,
+            "recent": [
+                {"time": record.measured_at.isoformat(), "values": record.values}
+                for record in records
+            ],
         }

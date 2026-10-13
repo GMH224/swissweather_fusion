@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 _LOGGER = logging.getLogger(__name__)
@@ -197,30 +197,26 @@ class Observation:
     values: dict[str, Optional[float]] = field(default_factory=dict)
 
 
-def parse_latest(text: str) -> Optional[Observation]:
-    """The newest record in a 10-minute file, every parameter column.
-
-    Uses the row with the latest timestamp (not the last line: order is
-    not guaranteed). Parameters empty in that row are reported as None —
-    never filled from an older row, so every value shares one timestamp.
-    """
+def _parse_rows(text: str) -> tuple[list[str], int, Optional[int], list[tuple[datetime, list[str]]]]:
+    """Header, timestamp and station column indices, and every row with a
+    parsable timestamp, in file order."""
     header, rows = split_csv(text)
     if TIMESTAMP_COLUMN not in header:
-        return None
+        return header, -1, None, []
     i_ts = header.index(TIMESTAMP_COLUMN)
     i_st = header.index(STATION_COLUMN) if STATION_COLUMN in header else None
-    newest: Optional[tuple[datetime, list[str]]] = None
+    timed = []
     for p in rows:
         if len(p) <= i_ts:
             continue
         ts = parse_timestamp(p[i_ts])
-        if ts is None:
-            continue
-        if newest is None or ts > newest[0]:
-            newest = (ts, p)
-    if newest is None:
-        return None
-    ts, p = newest
+        if ts is not None:
+            timed.append((ts, p))
+    return header, i_ts, i_st, timed
+
+
+def _observation(header: list[str], i_ts: int, i_st: Optional[int],
+                 ts: datetime, p: list[str]) -> Observation:
     values: dict[str, Optional[float]] = {}
     for i, name in enumerate(header):
         if i in (i_ts, i_st) or not name:
@@ -228,6 +224,52 @@ def parse_latest(text: str) -> Optional[Observation]:
         values[name] = _float(p[i]) if i < len(p) else None
     station = p[i_st].strip().upper() if i_st is not None and i_st < len(p) else ""
     return Observation(station=station, measured_at=ts, values=values)
+
+
+def parse_latest(text: str) -> Optional[Observation]:
+    """The newest record in a 10-minute file, every parameter column.
+
+    Uses the row with the latest timestamp (not the last line: order is
+    not guaranteed). Parameters empty in that row are reported as None —
+    never filled from an older row, so every value shares one timestamp.
+    Of two rows with the same timestamp the first in the file is used.
+    """
+    header, i_ts, i_st, timed = _parse_rows(text)
+    newest: Optional[tuple[datetime, list[str]]] = None
+    for ts, p in timed:
+        if newest is None or ts > newest[0]:
+            newest = (ts, p)
+    if newest is None:
+        return None
+    return _observation(header, i_ts, i_st, *newest)
+
+
+def parse_records(text: str, window: timedelta) -> list[Observation]:
+    """v0.3.5: every 10-minute record of the last `window`, oldest first.
+
+    The "now" file holds every record from yesterday 12 UTC to the
+    present (MeteoSwiss download documentation), so a record that a
+    10-minute poll never saw as the newest one is still in it. The
+    window is anchored on the newest record, not on the clock: the list
+    always ends with the record `parse_latest` returns.
+
+    Nothing is invented: a record absent from the file stays absent, an
+    empty field is None. Rows off the 10-minute grid are skipped (none
+    are expected in a 10-minute file). Of two rows with the same
+    timestamp the first in the file is kept, the same rule as
+    parse_latest, so the last entry always equals the `values` record.
+    """
+    header, i_ts, i_st, timed = _parse_rows(text)
+    if not timed:
+        return []
+    newest = max(ts for ts, _ in timed)
+    start = newest - window
+    chosen: dict[datetime, list[str]] = {}
+    for ts, p in timed:
+        if ts <= start or ts.minute % 10 or ts in chosen:
+            continue
+        chosen[ts] = p
+    return [_observation(header, i_ts, i_st, ts, chosen[ts]) for ts in sorted(chosen)]
 
 
 def header_has(text: str, parameter: str) -> bool:

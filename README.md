@@ -13,7 +13,7 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.4 — for the solar layer: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 893 tests, package pyflakes clean.
+**Status: v0.3.5 — the reference station now also publishes every 10-minute record of the last 6 hours (`recent_values`). v0.3.4 — for the solar layer: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 913 tests, package pyflakes clean.
 
 > **If you have ever seen "Config flow could not be loaded: 500 Internal
 > Server Error"** when opening setup, reconfigure or Configure — that was
@@ -56,6 +56,13 @@ v0.3.0's own account is in
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
+> **Upgrading to v0.3.5?** No database migration and no learning reset —
+> nothing changes except one new attribute, `recent_values`, on
+> `sensor.swissweather_fusion_reference_station`, filled at the first
+> update after the restart (see
+> [swissweather_fusion_v0.3.5_release_audit.md](swissweather_fusion_v0.3.5_release_audit.md)
+> and [SOLAR_TEAM_v0.3.5.md](SOLAR_TEAM_v0.3.5.md)).
+>
 > **Upgrading to v0.3.4?** No database migration and no learning reset —
 > the running accuracy trial is untouched (see
 > [swissweather_fusion_v0.3.4_release_audit.md](swissweather_fusion_v0.3.4_release_audit.md)).
@@ -330,7 +337,7 @@ station**; leave it blank for automatic.
 
 | Entity (default ID) | Meaning |
 |---|---|
-| `sensor.swissweather_fusion_reference_station` | Time of the newest record. **Attributes carry the complete dataset**: `values` (every parameter by MeteoSwiss short name), `parameters` (English description and unit of each), `station` (code, name, coordinates, distance), `age_minutes`, `stale` |
+| `sensor.swissweather_fusion_reference_station` | Time of the newest record. **Attributes carry the complete dataset**: `values` (every parameter by MeteoSwiss short name), `parameters` (English description and unit of each), `station` (code, name, coordinates, distance), `age_minutes`, `stale`, and since v0.3.5 `recent_values` (every record of the last 6 hours, below) |
 | `sensor.swissweather_fusion_reference_station_temperature` | Air temperature 2 m (°C) |
 | `…_humidity` | Relative humidity (%) |
 | `…_pressure_sea_level` | Pressure reduced to sea level, QFF (hPa) |
@@ -348,6 +355,15 @@ station**; leave it blank for automatic.
   reflected shortwave, longwave out, snow depth, soil temperatures, station
   and QNH pressure) is in the dataset sensor's `values`. Those attributes
   are not stored in the recorder; the eleven sensors have history.
+- **`recent_values` (v0.3.5).** Every 10-minute record of the last 6
+  hours, oldest first: `[{"time": "2026-10-13T05:10:00+00:00", "values":
+  {...}}, ...]` — up to 36 records, same parameter names as `values`,
+  `time` = end of the interval. MeteoSwiss publishes with a varying 10–20
+  minute delay, so a 10-minute poll does not see every record as the
+  newest one; this list is read from MeteoSwiss's file (which holds every
+  record since yesterday 12 UTC) on every poll, so none is skipped and it
+  is complete again right after a restart. A record MeteoSwiss has not
+  published is absent, never filled in. Not stored in the recorder.
 - **Observation only.** The station never enters the learning or the
   blend; your own station remains the reference of the accuracy trial.
 - Source: MeteoSwiss open government data.

@@ -2200,6 +2200,38 @@ horizons the series is three-hourly. Below 75% coverage no total is
 published. `None` is honest; tripling the sum on an assumption about
 whether a three-hourly value is a rate or an accumulation would not be.
 
+## v0.3.5 — reference station: every record of the last 6 hours
+
+Requested by the solar layer (learning hub request, 13 Oct 2026). It
+builds measured hours from the station with a strict 5-of-6 rule, but the
+dataset sensor only ever showed the newest record, and on the owner's
+system it showed 10 of 19 records over three hours. Cause: MeteoSwiss
+publishes 10-minute data with a varying delay (its documentation gives a
+20-minute update interval for 10-minute files), so a 10-minute poll
+sometimes sees the same newest record twice and never sees the next one.
+
+The fix uses data already downloaded: the `_t_now.csv` file holds every
+record "from yesterday 12UTC to now" (MeteoSwiss download documentation).
+`smn.parse_records(text, window)` returns all records with
+`newest - window < time <= newest`, oldest first; the coordinator adds
+them as `data["recent"]` and `ReferenceStationSensor` publishes them as
+`recent_values` (unrecorded). Window `REFERENCE_STATION_RECENT_WINDOW` =
+6 h (36 records, ~23 kB JSON).
+
+Decisions:
+
+- **Anchored on the newest record, not the clock**, so the list always
+  ends with the record shown in `values` and a delayed feed does not
+  shrink the window.
+- **No buffer between polls.** Each poll's list comes from that poll's
+  file alone: a record MeteoSwiss withdraws or never published is absent,
+  and a restart needs no memory to be complete.
+- **Same row rules as `parse_latest`**: shared `_parse_rows` /
+  `_observation`; empty fields None; of duplicate timestamps the first row
+  wins (both functions), so the last list entry always equals `values`.
+  Rows off the 10-minute grid are skipped (none expected).
+- One download per poll, as before.
+
 ## v0.3.4 — cloud cover by layer
 
 Requested by the solar layer: total cloud cover cannot tell a thin high
