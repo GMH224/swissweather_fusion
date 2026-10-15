@@ -1,8 +1,8 @@
 """MeteoSwiss SwissMetNet (SMN) 10-minute observations — reference station.
 
 **v0.3.4.** Measured weather from the nearest MeteoSwiss automatic station,
-exposed for the downstream solar layer (and, later, as a second reference
-for verification). Requested by the solar team: measured global radiation,
+exposed for downstream consumers (and, later, as a second reference
+for verification). Measured global radiation,
 sunshine and the sky's longwave radiation show what the forecasts get wrong
 *now*, and air temperature and wind feed a panel-temperature model.
 
@@ -44,8 +44,8 @@ MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
 
 TIMESTAMP_COLUMN = "reference_timestamp"
 STATION_COLUMN = "station_abbr"
-# The parameter whose presence makes a station a useful reference for the
-# solar layer: 10-minute global radiation.
+# The parameter a station must report to be chosen automatically:
+# 10-minute global radiation.
 REQUIRED_PARAMETER = "gre000z0"
 
 

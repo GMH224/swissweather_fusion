@@ -1,7 +1,6 @@
 """Regression tests for v0.3.5 — `recent_values` on the reference station.
 
-Requested by the solar layer (Open-Meteo Solar Forecast learning hub,
-request of 13 Oct 2026): every 10-minute record of the last hours, so it
+Requested by a downstream consumer (13 Oct 2026): every 10-minute record of the last hours, so it
 can build measured hours with its strict 5-of-6 rule. On the owner's
 system the dataset sensor showed only 10 of 19 records between 04:40 and
 07:40 UTC: MeteoSwiss publishes with a varying delay, so a 10-minute poll
@@ -163,7 +162,7 @@ def test_varying_publication_delay_skips_records_for_latest_but_not_for_recent()
         seen_latest.add(smn.parse_latest(text).measured_at)
         seen_recent.update(r.measured_at for r in smn.parse_records(text, WINDOW))
     span = [t for t in sorted(seen_recent) if t >= min(seen_latest)]
-    # the latest-only view misses records (the solar layer's observation) ...
+    # the latest-only view misses records (the consumer's observation) ...
     assert len(seen_latest) < len(span)
     # ... the recent list has every record of every hour: 6 of 6
     for hour in {t.replace(minute=0) for t in span if t.replace(minute=0) + timedelta(hours=1) <= max(span)}:

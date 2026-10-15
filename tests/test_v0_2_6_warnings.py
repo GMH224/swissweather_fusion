@@ -182,7 +182,7 @@ def test_distant_location_is_reported_with_its_real_distance():
 def test_bundled_poi_index_loads_and_is_usable():
     index = wa.load_poi_index()
     assert len(index) > 1000
-    poi_id, distance = wa.find_nearest_poi(47.5536, 8.9120, index)
+    poi_id, distance = wa.find_nearest_poi(47.1236, 8.5620, index)
     assert isinstance(poi_id, int)
     assert distance < WETTERALARM_MAX_POI_DISTANCE_KM
 
@@ -467,7 +467,7 @@ def test_optimised_search_returns_the_same_answer_as_brute_force():
     cannot reject a candidate haversine would have accepted.
     """
     index = wa.load_poi_index()
-    for lat, lon in [(47.5536, 8.9120), (46.9481, 7.4474), (46.2044, 6.1432)]:
+    for lat, lon in [(47.1236, 8.5620), (46.9481, 7.4474), (46.2044, 6.1432)]:
         optimised = wa.find_nearest_poi(lat, lon, index)
         brute = None
         for poi_id, plat, plon in index:
@@ -501,7 +501,7 @@ def test_search_rejects_most_candidates_without_trigonometry():
 
     wa._haversine_km = counting
     try:
-        wa.find_nearest_poi(47.5536, 8.9120, index)
+        wa.find_nearest_poi(47.1236, 8.5620, index)
     finally:
         wa._haversine_km = original
 
@@ -569,7 +569,7 @@ REAL_PAYLOAD = {"meteo_alarms": [{
     "id": 338253, "priority": 1,
     "valid_from": "2026-09-08T18:00:00.000Z",
     "valid_to": "2026-09-08T23:00:00.000Z",
-    "poi_ids": [145140],
+    "poi_ids": [900001],
     "de": {"title": "Gewittergefahr", "hint": "lose Gegenstände sichern"},
     "region": {"de": {"name": "Frauenfeld"}},
 }]}
@@ -579,7 +579,7 @@ SCREENSHOT_TIME = datetime(2026, 9, 8, 13, 35, tzinfo=timezone.utc)  # 15:35 CES
 def test_reproduces_the_reported_gap_with_is_current():
     """The exact scenario. This must stay False: is_current() answers
     "in force right now" and must not change meaning."""
-    warning = wa.parse_alarms_response(REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME)
+    warning = wa.parse_alarms_response(REAL_PAYLOAD, 900001, now=SCREENSHOT_TIME)
     assert not warning.is_active
 
 
@@ -588,7 +588,7 @@ def test_is_upcoming_closes_the_gap_at_the_same_moment():
     from swissweather_fusion.const import WETTERALARM_LOOKAHEAD
 
     warnings = wa.parse_all_alarms(
-        REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME, lookahead=WETTERALARM_LOOKAHEAD
+        REAL_PAYLOAD, 900001, now=SCREENSHOT_TIME, lookahead=WETTERALARM_LOOKAHEAD
     )
     assert warnings and warnings[0].title == "Gewittergefahr"
 
@@ -600,7 +600,7 @@ def test_is_upcoming_respects_the_lookahead_boundary():
     from datetime import timedelta
 
     matched = [
-        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 900001, "de")
         if w.is_upcoming(timedelta(hours=6), far_future)
     ]
     assert not matched
@@ -611,7 +611,7 @@ def test_is_upcoming_true_exactly_at_the_lookahead_edge():
 
     exactly_6h_before = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
     matched = [
-        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 900001, "de")
         if w.is_upcoming(timedelta(hours=6), exactly_6h_before)
     ]
     assert matched
@@ -624,7 +624,7 @@ def test_is_upcoming_still_true_once_the_warning_is_actually_active():
 
     now = datetime(2026, 9, 8, 19, 0, tzinfo=timezone.utc)  # during the window
     matched = [
-        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 900001, "de")
         if w.is_upcoming(timedelta(hours=6), now)
     ]
     assert matched
@@ -637,7 +637,7 @@ def test_is_upcoming_excludes_an_expired_warning():
 
     after_expiry = datetime(2026, 9, 9, 1, 1, tzinfo=timezone.utc)  # 1 min past valid_to
     matched = [
-        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 145140, "de")
+        w for w in wa._iter_matching_alarms(REAL_PAYLOAD, 900001, "de")
         if w.is_upcoming(timedelta(hours=6), after_expiry)
     ]
     assert not matched
@@ -647,7 +647,7 @@ def test_default_lookahead_is_zero_so_existing_callers_are_unaffected():
     """Every caller that does not opt in gets exactly is_current()'s
     behaviour — the fix must be additive, not a silent behaviour change
     for automations already depending on the strict definition."""
-    with_no_lookahead = wa.parse_all_alarms(REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME)
+    with_no_lookahead = wa.parse_all_alarms(REAL_PAYLOAD, 900001, now=SCREENSHOT_TIME)
     assert with_no_lookahead == []
 
 
@@ -671,10 +671,10 @@ def test_next_warning_attribute_surfaces_the_soonest_pre_warning():
         "warning": wa.WeatherWarning(),  # nothing active
         "warnings": [],
         "upcoming_warnings": wa.parse_all_alarms(
-            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            REAL_PAYLOAD, 900001, now=SCREENSHOT_TIME,
             lookahead=__import__("datetime").timedelta(hours=6),
         ),
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
     assert attrs["next_warning"]["title"] == "Gewittergefahr"
@@ -690,7 +690,7 @@ def test_no_next_warning_key_when_nothing_upcoming():
     sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
         "warning": wa.WeatherWarning(), "warnings": [],
         "upcoming_warnings": [],
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
     assert "next_warning" not in attrs
@@ -702,16 +702,16 @@ def test_already_active_warning_is_not_duplicated_as_next_warning():
     from swissweather_fusion.sensor import OfficialWarningSensor
 
     now_during = datetime(2026, 9, 8, 19, 0, tzinfo=timezone.utc)
-    active = wa.parse_all_alarms(REAL_PAYLOAD, 145140, now=now_during)
+    active = wa.parse_all_alarms(REAL_PAYLOAD, 900001, now=now_during)
     upcoming = wa.parse_all_alarms(
-        REAL_PAYLOAD, 145140, now=now_during,
+        REAL_PAYLOAD, 900001, now=now_during,
         lookahead=__import__("datetime").timedelta(hours=6),
     )
     sensor = object.__new__(OfficialWarningSensor)
     sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
         "warning": active[0], "warnings": active,
         "upcoming_warnings": upcoming,
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
     assert "next_warning" not in attrs
@@ -739,10 +739,10 @@ def test_next_warning_scalars_are_top_level_attributes():
     sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
         "warning": wa.WeatherWarning(), "warnings": [],
         "upcoming_warnings": wa.parse_all_alarms(
-            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            REAL_PAYLOAD, 900001, now=SCREENSHOT_TIME,
             lookahead=__import__("datetime").timedelta(hours=6),
         ),
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
 
@@ -764,10 +764,10 @@ def test_nested_next_warning_dict_is_preserved_alongside_the_flat_fields():
     sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
         "warning": wa.WeatherWarning(), "warnings": [],
         "upcoming_warnings": wa.parse_all_alarms(
-            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            REAL_PAYLOAD, 900001, now=SCREENSHOT_TIME,
             lookahead=__import__("datetime").timedelta(hours=6),
         ),
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
 
@@ -785,10 +785,10 @@ def test_has_next_warning_boolean_is_a_scalar_shortcut():
     with_upcoming._runtime = {"wetteralarm_coordinator": type("C", (), {
         "warning": wa.WeatherWarning(), "warnings": [],
         "upcoming_warnings": wa.parse_all_alarms(
-            REAL_PAYLOAD, 145140, now=SCREENSHOT_TIME,
+            REAL_PAYLOAD, 900001, now=SCREENSHOT_TIME,
             lookahead=__import__("datetime").timedelta(hours=6),
         ),
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     assert OfficialWarningSensor.extra_state_attributes.fget(with_upcoming)[
         "has_next_warning"
@@ -797,7 +797,7 @@ def test_has_next_warning_boolean_is_a_scalar_shortcut():
     without = object.__new__(OfficialWarningSensor)
     without._runtime = {"wetteralarm_coordinator": type("C", (), {
         "warning": wa.WeatherWarning(), "warnings": [], "upcoming_warnings": [],
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     assert OfficialWarningSensor.extra_state_attributes.fget(without)[
         "has_next_warning"
@@ -813,7 +813,7 @@ def test_no_flat_next_warning_keys_when_nothing_upcoming():
     sensor = object.__new__(OfficialWarningSensor)
     sensor._runtime = {"wetteralarm_coordinator": type("C", (), {
         "warning": wa.WeatherWarning(), "warnings": [], "upcoming_warnings": [],
-        "poi_id": 145140, "poi_distance_km": 0.5,
+        "poi_id": 900001, "poi_distance_km": 0.5,
     })()}
     attrs = OfficialWarningSensor.extra_state_attributes.fget(sensor)
     assert "next_warning_title" not in attrs

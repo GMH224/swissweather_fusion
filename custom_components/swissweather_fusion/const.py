@@ -818,7 +818,7 @@ WETTERALARM_LOOKAHEAD = timedelta(hours=6)
 # ---------------------------------------------------------------------------
 # v0.3.4: reference station — measured 10-minute data from the nearest
 # MeteoSwiss SwissMetNet station that measures global radiation (Taenikon
-# for the owner's site), exposed for the solar layer. Observation only:
+# for the reference installation), exposed for downstream consumers. Observation only:
 # it never enters the Class A learning, whose reference stays the user's
 # own station.
 # ---------------------------------------------------------------------------
@@ -836,8 +836,8 @@ REFERENCE_STATION_MAX_DISTANCE_KM = 50.0
 # Station metadata and parameter descriptions change rarely.
 REFERENCE_STATION_META_REFRESH = timedelta(hours=24)
 # v0.3.5: the `recent_values` attribute of the reference station sensor —
-# every 10-minute record of this window, oldest first (36 records). The
-# solar layer rebuilds hours from it and needs 5 of 6 records per hour;
+# every 10-minute record of this window, oldest first (36 records). A
+# consumer that rebuilds hours from it may need 5 of 6 records per hour;
 # a single polled "latest" record misses some because MeteoSwiss
 # publishes with a varying delay.
 REFERENCE_STATION_RECENT_WINDOW = timedelta(hours=6)

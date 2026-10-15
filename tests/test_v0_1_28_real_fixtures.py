@@ -162,24 +162,24 @@ def test_provider_grid_coordinates_are_redacted_even_though_they_differ():
     written verbatim into a file intended for sharing.
     """
     payload = {
-        "detail": "SRF geolocation lookup resolved to id='47.5536,8.9120'",
+        "detail": "SRF geolocation lookup resolved to id='47.1236,8.5620'",
     }
     result = str(
         redaction.redact_diagnostic_payload(
-            payload, latitude=47.5541, longitude=8.9098
+            payload, latitude=47.1241, longitude=8.5598
         )
     )
-    assert "47.5536" not in result
-    assert "8.9120" not in result
+    assert "47.1236" not in result
+    assert "8.5620" not in result
 
 
 def test_configured_coordinates_still_get_the_specific_markers():
     """The value-based pass runs first, so where it applies its more
     specific markers survive."""
-    payload = {"detail": "id='47.5536,8.9120'"}
+    payload = {"detail": "id='47.1236,8.5620'"}
     result = str(
         redaction.redact_diagnostic_payload(
-            payload, latitude=47.5536, longitude=8.9120
+            payload, latitude=47.1236, longitude=8.5620
         )
     )
     assert "LAT_REDACTED" in result
@@ -198,7 +198,7 @@ def test_ordinary_weather_values_are_not_redacted_as_coordinates(text):
     decimal pair is the signature; individual numbers are not."""
     result = str(
         redaction.redact_diagnostic_payload(
-            {"d": text}, latitude=47.5541, longitude=8.9098
+            {"d": text}, latitude=47.1241, longitude=8.5598
         )
     )
     assert "COORDINATE_PAIR_REDACTED" not in result

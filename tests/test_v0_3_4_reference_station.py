@@ -1,6 +1,6 @@
 """Regression tests for v0.3.4 — MeteoSwiss reference station (SwissMetNet).
 
-Requested by the solar team: the complete current 10-minute dataset of the
+Purpose: the complete current 10-minute dataset of the
 nearest MeteoSwiss station (Taenikon for the owner), with the key values as
 sensors.
 
@@ -32,7 +32,7 @@ from swissweather_fusion.const import (
 )
 
 UTC = timezone.utc
-HOME = (47.5524, 8.9148)  # the owner's site, Frauenfeld
+HOME = (47.55, 8.90)  # a test point ~8 km north of Taenikon (not a real address)
 
 HEADER = (
     "station_abbr;reference_timestamp;tre200s0;tre005s0;tresurs0;xchills0;ure200s0;"
@@ -71,7 +71,7 @@ def _meta_row(abbr, name, lat, lon, height):
 # A nearer, precipitation-only station must be skipped in favour of TAE.
 META = "\n".join([
     META_HEADER,
-    _meta_row("XRF", "Nearby rain gauge", 47.5550, 8.9200, 400),     # ~0.5 km, no radiation
+    _meta_row("XRF", "Nearby rain gauge", 47.5520, 8.9050, 400),     # ~0.5 km, no radiation
     _meta_row("TAE", "Aadorf / Tänikon", 47.479892, 8.904928, 539),  # ~8 km
     _meta_row("KLO", "Zürich / Kloten", 47.479580, 8.536110, 426),   # ~29 km
     _meta_row("SBO", "Far away", 46.0, 7.0, 500),                    # far

@@ -123,11 +123,11 @@ HOURLY_VARIABLES = (
 # once without the optional set if a request fails permanently. Same
 # reasoning as the v0.1.28 CombiPrecip lesson — do not let an unverified
 # assumption about a provider take out a working path.
-# v0.3.3: solar radiation, for the downstream solar layer.
+# v0.3.3: solar radiation, for downstream consumers.
 #
 # Location-level and panel-agnostic on purpose. Global tilted irradiance
 # (GTI) is NOT requested: it depends on a panel's tilt and azimuth, and
-# that geometry belongs to the solar layer, not to the weather model.
+# that geometry belongs to the consumer, not to the weather model.
 # Adding or changing an array must never require touching this
 # integration (owner decision, v0.3.3). GHI/DNI/DHI is the standard
 # triple any transposition model needs; "direct on the horizontal" is
@@ -149,8 +149,8 @@ RADIATION_HOURLY_VARIABLES = (
     "direct_normal_irradiance_instant",
     "diffuse_radiation_instant",
 )
-# v0.3.4: cloud cover by layer, for the downstream solar layer (feedback
-# from the solar team: low cloud and fog are what break a solar forecast,
+# v0.3.4: cloud cover by layer, for downstream consumers (low
+# cloud and fog are what break a radiation forecast,
 # and total cover cannot tell a thin high veil from a closed low deck).
 #
 # ICON-CH1/CH2 and ICON-D2 compute these layers natively (Open-Meteo's

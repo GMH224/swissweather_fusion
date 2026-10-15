@@ -1,7 +1,7 @@
 """Regression tests for v0.3.4 — cloud cover by layer (low / mid / high),
 and SRF irradiance keyed by period like the solar series.
 
-Requested by the solar team: low cloud and fog are what break a solar
+Purpose: low cloud and fog are what break a radiation
 forecast, and total cover cannot tell a thin high veil from a closed low
 deck. The three ICON models state the layer split natively.
 
@@ -13,7 +13,7 @@ November 2026. Several tests here guard the trial, not the feature:
 - the layers must never enter the learning loop or the blend verification;
 - the condition shown on the card must not change (it reads total cover).
 
-The output tests pin where the solar layer reads the values: the hourly
+The output tests pin where the consumer reads the values: the hourly
 forecast that weather.get_forecasts returns.
 """
 from __future__ import annotations

@@ -112,7 +112,7 @@ async def async_setup_entry(
         # v0.3.3: fused since v0.2.0, never exposed until now.
         BlendedValueSensor(entry, runtime, "snow_depth", "Snow depth", "m",
                            icon="mdi:snowflake-variant"),
-        # v0.3.3: location-level solar radiation for the solar layer.
+        # v0.3.3: location-level solar radiation for downstream consumers.
         *(SolarIrradianceSensor(entry, runtime, key) for key in SOLAR_SENSOR_KEYS),
         SrfIrradianceSensor(entry, runtime),
         # v0.3.4: measured data from the MeteoSwiss reference station.
@@ -986,7 +986,7 @@ _SOLAR_SERIES_SEMANTICS = (
 class SolarIrradianceSensor(_BaseSensor):
     """One fused solar radiation value for the current hour.
 
-    **v0.3.3.** For the downstream solar layer, which owns panel geometry
+    **v0.3.3.** For downstream consumers, which own panel geometry
     and computes tilted irradiance itself — adding or changing an array
     never touches this integration.
 
@@ -1179,8 +1179,8 @@ class ReferenceStationSensor(_BaseSensor):
 
     **v0.3.5.** `recent_values`: every 10-minute record of the last six
     hours as MeteoSwiss published it, oldest first, each
-    {"time": end of interval (UTC ISO), "values": {...}}. Requested by the
-    solar layer, which builds measured hours from it (5 of 6 records): a
+    {"time": end of interval (UTC ISO), "values": {...}}. For a consumer that
+    builds measured hours from it (e.g. 5 of 6 records): a
     poll every 10 minutes against a feed published with a varying delay
     sees only some records as "newest". Read from the station file on
     every poll, so it is complete again at the first update after a

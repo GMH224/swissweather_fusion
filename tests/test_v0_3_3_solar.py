@@ -2,7 +2,7 @@
 source-health mapping drift (backlog items 19 + 20).
 
 The release adds location-level solar radiation (GHI, DNI, DHI as hourly
-averages and instants) for a downstream solar layer, exposes snow depth,
+averages and instants) for downstream consumers, exposes snow depth,
 and exposes SRF's own irradiance as a separate series. It must not touch
 the Class A measurement running until end of November 2026, so several
 tests here guard the trial rather than the feature:
@@ -90,7 +90,7 @@ def test_radiation_is_requested_and_kept_optional():
 
 
 def test_no_tilted_irradiance_is_requested():
-    """Owner decision: panel geometry belongs to the solar layer. A GTI
+    """Owner decision: panel geometry belongs to the consumer. A GTI
     request would need a tilt and azimuth, i.e. knowledge of the arrays."""
     url = open_meteo.build_forecast_url(source="ch2", latitude=47.55, longitude=8.91)
     assert "global_tilted" not in url

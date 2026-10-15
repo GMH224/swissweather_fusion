@@ -1824,7 +1824,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         "precip_probability", "wind_speed", "wind_gust_speed",
         "wind_bearing", "dew_point", "apparent_temperature",
         "cloud_coverage", "visibility",
-        # v0.3.4: cloud cover by layer, for the solar layer.
+        # v0.3.4: cloud cover by layer, for downstream consumers.
         "cloud_coverage_low", "cloud_coverage_mid", "cloud_coverage_high",
         # v0.2.2 fix (SWF-021-010 / SWF-021-011): uv_index and
         # sunshine_duration were registered, requested, mapped and
@@ -2283,7 +2283,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
     def _compute_solar_forecast(
         self, now: datetime, latest_forecast: dict
     ) -> dict[str, Any]:
-        """Location-level solar radiation for the downstream solar layer.
+        """Location-level solar radiation for downstream consumers.
 
         **v0.3.3.** One entry per hour, keyed by the hour's START, with
         explicit semantics so no consumer has to know provider labelling:
@@ -2298,7 +2298,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
           complete triple. Fewer further out: ICON-CH1 ends ~33 h,
           ICON-D2 ~48 h, ICON-CH2 ~120 h.
 
-        No tilted irradiance: panel geometry belongs to the solar layer.
+        No tilted irradiance: panel geometry belongs to the consumer.
         """
         averaged_triple, instant_triple = RADIATION_TRIPLES
         hours: list[dict[str, Any]] = []
@@ -2522,7 +2522,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 # v0.3.4: cloud cover by layer. NOT members of Home
                 # Assistant's Forecast TypedDict, so cards ignore them;
                 # weather.get_forecasts passes extra keys through
-                # unchanged, which is where the solar layer reads them.
+                # unchanged, which is where the consumer reads them.
                 # Same percent scale and same "at the labelled hour"
                 # meaning as cloud_coverage. Dropped like every other key
                 # when no source has a value (ICON horizon ~5 days).
@@ -2596,7 +2596,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             "current": current,
             "expert_weights": expert_weights,
             "hourly_forecast": hourly_forecast,
-            # v0.3.3: solar radiation for the downstream solar layer, and
+            # v0.3.3: solar radiation for downstream consumers, and
             # SRF's independent irradiance. Built from the same
             # latest_forecast dict — no extra database access.
             "solar": self._compute_solar_forecast(now, latest_forecast),
@@ -3856,7 +3856,7 @@ class WetterAlarmCoordinator(DataUpdateCoordinator):
 class ReferenceStationCoordinator(DataUpdateCoordinator):
     """Measured 10-minute weather from a MeteoSwiss SwissMetNet station.
 
-    **v0.3.4.** For the downstream solar layer: measured global radiation,
+    **v0.3.4.** For downstream consumers: measured global radiation,
     sunshine, the sky's longwave radiation (a direct sign of a cloud deck),
     air temperature and wind (panel-temperature model), and every other
     parameter the station reports.
@@ -3871,7 +3871,7 @@ class ReferenceStationCoordinator(DataUpdateCoordinator):
     within REFERENCE_STATION_MAX_DISTANCE_KM) are probed in distance order
     and the first whose 10-minute file carries global radiation is chosen
     — many SMN sites are precipitation-only, and a reference without
-    radiation would not serve the solar layer. The choice is made once and
+    radiation would not serve the consumer. The choice is made once and
     kept until reload; a failed resolution is retried on the next poll.
     """
 
@@ -3994,7 +3994,7 @@ class ReferenceStationCoordinator(DataUpdateCoordinator):
                 if observation is None:
                     raise ValueError("10-minute file has no parsable record")
                 # v0.3.5: every record of the last 6 hours from the same
-                # download, for the solar layer's hourly 5-of-6 rule.
+                # download, for consumers that rebuild complete hours.
                 records = smn.parse_records(text, REFERENCE_STATION_RECENT_WINDOW)
                 await self._async_refresh_parameters()
         except Exception as err:  # noqa: BLE001
