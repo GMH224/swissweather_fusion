@@ -12,7 +12,7 @@ own host, e.g. via the SSH/terminal add-on) does.
 
 Usage:
     python3 srf_probe.py --consumer-key KEY --consumer-secret SECRET \\
-        --latitude 47.5536 --longitude 8.9120
+        --latitude 47.1236 --longitude 8.5620
 
 Credentials are only ever used for the HTTP requests below — never
 printed, never logged. Everything else IS printed, including the

@@ -1,7 +1,6 @@
 # SwissWeather Fusion v0.3.4 — Release Audit (ICS)
 
-**Release type:** two features for the downstream solar layer, both requested by
-the solar team — cloud cover by layer, and live measurements from the nearest
+**Release type:** two features for downstream consumers — cloud cover by layer, and live measurements from the nearest
 MeteoSwiss station (§6) — plus one correction (SRF irradiance timing, §5).
 **Shipped during:** the Class A accuracy trial (closes end of November 2026;
 diagnostics download planned 13–15 November). Every change was checked against
@@ -21,15 +20,15 @@ was strengthened, §6). No schema change, no migration, no learning reset.
 | Cloud cover by layer | `cloud_cover_low`, `cloud_cover_mid`, `cloud_cover_high` from ICON-CH1, ICON-CH2, ICON-D2 via Open-Meteo (native model output per Open-Meteo's MeteoSwiss model documentation). Stored as `cloud_coverage_low/_mid/_high`, fused as the mean of the models that supply them, bounds 0–100 %. |
 | Output | Three extra keys on every entry of the weather entity's **hourly** forecast, returned by `weather.get_forecasts` (owner requirement: "it must show in `weather.get_forecasts`, type hourly"). Also present in the blend's `current` values. |
 | SRF irradiance timing | Series re-keyed by `period_start` / `period_end` (SRF labels the end of its interval, measured). §5. |
-| Reference station | Measured 10-minute data from the nearest MeteoSwiss SwissMetNet station with global radiation (Tänikon for the owner), or a configured one. Ten key sensors with history, one dataset sensor with every parameter, health telemetry, one new option. §6. |
-| Documentation | README sections "Cloud cover by layer" and "Reference station", SRF timing note; DEVELOPER.md v0.3.4 entry; SOLAR_TEAM_v0.3.4.md for the downstream consumer. |
+| Reference station | Measured 10-minute data from the nearest MeteoSwiss SwissMetNet station with global radiation (Tänikon for the reference installation), or a configured one. Ten key sensors with history, one dataset sensor with every parameter, health telemetry, one new option. §6. |
+| Documentation | README sections "Cloud cover by layer" and "Reference station", SRF timing note; DEVELOPER.md v0.3.4 entry. |
 
 **Deliberately not added:**
 
 - **No layers from meteoblue or SRF.** meteoblue's basic package has total cover
   only; SRF has no layer split. A test asserts nothing is mapped onto the layer
   names from meteoblue.
-- **No daily / twice-daily layer values.** The solar layer consumes hourly data;
+- **No daily / twice-daily layer values.** A consumer consumes hourly data;
   the daily aggregation rules (max of total cover) were not designed for layers
   and are left unchanged.
 - **No sensors.** The owner asked for the forecast service; three more sensors
@@ -84,7 +83,7 @@ data.
 3. **Unverified quality.** Low cloud and fog are the weakest part of every
    weather model (11 Oct 2026: all ICON variants and SRF expected the deck to
    break up; it did not). The values are model statements, documented as such.
-   A backtest of their value for the solar forecast is planned (archive data for
+   A backtest of their value for radiation forecasts is planned (archive data for
    cloud layers is available at Open-Meteo).
 
 ---
@@ -147,7 +146,7 @@ hourly window, 3 h beyond; the first label uses the gap to the next label; cappe
 at 3 h so a data gap is never averaged across). Intervals that ended at or before
 now are history and are dropped. The sensor state is the value whose period
 contains now. The keys are those of the solar series; the old `time` key is gone
-(deliberate interface change, announced in SOLAR_TEAM_v0.3.4.md).
+(deliberate interface change, announced in the README).
 
 **Why now and not in v0.4.0.** Owner decision: every radiation series must follow
 one convention, and the release had not been deployed. The change is outside

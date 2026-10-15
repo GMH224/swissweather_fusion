@@ -243,8 +243,8 @@ duplicate definitions or undefined names found anywhere else.
 
 **Unrelated SRF status note, from the same investigation**: log
 timestamps show SRF was still hitting the identical `400.01.007`
-location-limit error as late as 05:53:59 UTC (12:53 Vietnam) — nearly
-two hours after the ~11am Vietnam restart that was expected to have
+location-limit error as late as 05:53:59 UTC — nearly
+two hours after the restart that was expected to have
 already taken effect. A later diagnostics capture showed
 `expert_weight_srf` numeric, meaning it did eventually start working,
 sometime in the roughly 80-minute gap the available log doesn't cover.
@@ -832,8 +832,8 @@ and implementation reality can survive quietly for a long time.
 
 ## v0.1.14 — an outside code review, checked and confirmed against the actual source
 
-After the huawei_solar/Modbus theory was ruled out (a different Claude
-instance working on that integration rejected it, and the person
+After a theory blaming another installed integration was ruled out
+(the review of that integration rejected it, and the person
 confirmed every *other* integration kept working fine throughout the
 freeze — ruling out a genuine system-wide event loop stall, which is what
 would be needed for a Modbus hang elsewhere to explain this), that same
@@ -2202,7 +2202,7 @@ whether a three-hourly value is a rate or an accumulation would not be.
 
 ## v0.3.5 — reference station: every record of the last 6 hours
 
-Requested by the solar layer (learning hub request, 13 Oct 2026). It
+Requested by a downstream consumer (13 Oct 2026). It
 builds measured hours from the station with a strict 5-of-6 rule, but the
 dataset sensor only ever showed the newest record, and on the owner's
 system it showed 10 of 19 records over three hours. Cause: MeteoSwiss
@@ -2234,7 +2234,7 @@ Decisions:
 
 ## v0.3.4 — cloud cover by layer
 
-Requested by the solar layer: total cloud cover cannot tell a thin high
+Requested by the consumer: total cloud cover cannot tell a thin high
 veil from a closed low deck, and low cloud/fog is what breaks a solar
 forecast. ICON-CH1/CH2 and ICON-D2 output the WMO layer split natively;
 Open-Meteo serves it as `cloud_cover_low/_mid/_high`.
@@ -2253,7 +2253,7 @@ Same pattern as radiation in v0.3.3, for the same reasons:
 - **Output**: three extra keys on each hourly forecast entry
   (`cloud_coverage_low/_mid/_high`). Not members of HA's Forecast
   TypedDict; `weather.get_forecasts` returns the entity's dicts with extra
-  keys intact, so the solar layer reads them there. Omitted when no source
+  keys intact, so the consumer reads them there. Omitted when no source
   has a value, like every other key. The condition still derives from
   total cover only, and the daily aggregations are unchanged.
 
@@ -2268,7 +2268,7 @@ as end-labelled its hourly MAE fell from 98 to 66 W/m². So
 beyond), first label from the gap to the next, capped at 3 h so a data
 gap is never averaged over; intervals ending at or before now are dropped.
 Same keys as `data["solar"]`. The `time` key is gone — a deliberate break
-for consumers, announced in SOLAR_TEAM_v0.3.4.md. Not Class A; SRF
+for consumers, announced in the README. Not Class A; SRF
 temperature/precipitation are untouched (precipitation labelled at the end
 is already the Open-Meteo convention, so the blend stays consistent).
 
@@ -2310,7 +2310,7 @@ models; a refusal would show as a logged HTTP 400 and the existing
 ## v0.3.3 — solar radiation, and two ways an upgrade can quietly hurt a trial
 
 v0.3.3 adds location-level solar radiation (GHI, DNI, DHI; hourly
-averages and instants) for a downstream solar layer, exposes snow depth,
+averages and instants) for downstream consumers, exposes snow depth,
 and exposes SRF's irradiance on its own. The feature is small. The
 interesting part is what it had to avoid, because it shipped in the
 middle of the Class A accuracy trial.
@@ -2355,8 +2355,7 @@ provider's convention, which is the classic one-hour solar-curve shift.
 decision: arrays change, the weather model must not). No 15-minute data
 (ICON-CH1/CH2 publish hourly; only ICON-D2 is native sub-hourly, and one
 native source among interpolated ones would be false precision). No bias
-correction (needs inverter output as ground truth — the solar layer's
-job).
+correction (needs measured radiation as ground truth).
 
 **Backlog items 19 + 20.** The coordinator owning each source's
 `SourceHealth` was written down twice — `sensor._get_health` and the

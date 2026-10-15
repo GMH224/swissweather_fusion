@@ -786,7 +786,7 @@ must run before it is read.
 
 Handover §3.2's four questions, plus three added by this analysis:
 
-1. `minutely_15` at 47.5536 / 8.9120 for AROME HD — genuine output or
+1. `minutely_15` at 47.1236 / 8.5620 for AROME HD — genuine output or
    interpolation
 2. Variable coverage on HD vs the 2.5 km domain
 3. `forecast_days=7` tail inspection — ARPEGE substitution (**ARC-09**)

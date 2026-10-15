@@ -1,6 +1,6 @@
 # SwissWeather Fusion v0.3.3 — Release Audit (ICS)
 
-**Release type:** feature (solar radiation for a downstream solar layer) plus two
+**Release type:** feature (solar radiation for downstream consumers) plus two
 display/diagnostics defects (backlog items 19, 20).
 **Shipped during:** the Class A accuracy trial (window opened with v0.3.1/v0.3.2,
 closes end of November 2026). Every change below was checked against one rule:
@@ -23,14 +23,14 @@ clean, 16 targeted mutations all caught (one only after a test was strengthened,
 for gaps):
 
 - **No GTI, no panel geometry.** Tilted irradiance depends on each array's tilt
-  and azimuth; that belongs to the solar layer. Adding an array must never touch
+  and azimuth; that belongs to the consumer. Adding an array must never touch
   the weather model.
 - **No 15-minute data.** MeteoSwiss publishes ICON-CH1/CH2 at 1 h. Only ICON-D2
   is native sub-hourly; one native source among interpolated ones would be false
   precision. No public MeteoSwiss announcement of sub-hourly ICON-CH output was
   found (the announced 2027–28 item is the nowcasting successor to INCA).
-- **No bias correction of radiation.** Needs inverter output as ground truth —
-  the planned solar component (W6), not this integration.
+- **No bias correction of radiation.** Needs measured radiation as ground truth,
+  which this integration does not have.
 
 ### Semantics published to consumers
 
@@ -107,7 +107,7 @@ health classification is unchanged). Mutation M11 caught.
 ### Backlog item 20 (Medium, since v0.2.6) — Wetter-Alarm health sensors permanently blind
 `sensor._get_health` had no Wetter-Alarm branch, so its four telemetry sensors
 read `unknown` / `0` regardless of state. Field-confirmed 2026-09-29: coordinator
-healthy (`poi_id` 145140 at 0.5 km, no errors in 21 h of log), sensors blind.
+healthy (nearest POI resolved at 0.5 km, no errors in 21 h of log), sensors blind.
 
 ### Backlog item 19 (Low, since v0.2.6) — diagnostics export omitted Wetter-Alarm
 Hard-coded source tuple in `diagnostics.py`.
@@ -232,15 +232,5 @@ unwired — is preserved. The Home Assistant test stub gained
 8. Translation-key coverage and entity-attribute-contract tests.
 9. Live-HA verification gaps (above).
 10. CombiPrecip 403s — observed intermittent; watch only.
-
-**W6 — solar production model (separate component, not this integration)**
-16. Design settled with the owner: learn measured production directly from
-    forecast air temperature + radiation (this release's sensors); learning
-    window MAM/JJA/SON; angle of incidence computed analytically from known roof
-    geometry; inverter AC rating as a hard cap; continuous online learning
-    absorbs soiling drift; sudden step changes are a fault signal.
-    Hardware: East = Huawei SUN2000-5KTL-M1 (1 MPPT, 5 kW AC cap). West + South =
-    SUN2000-10KTL-M1 (2 MPPT, one shared 10 kW AC cap → model as one combined
-    target). Per-MPPT 11 A is not the binding limit (DC oversizing ~1.5×).
 
 **Closed in v0.3.3:** 19, 20. **Withdrawn:** 17.

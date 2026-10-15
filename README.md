@@ -13,7 +13,7 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.5 — the reference station now also publishes every 10-minute record of the last 6 hours (`recent_values`). v0.3.4 — for the solar layer: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 913 tests, package pyflakes clean.
+**Status: v0.3.5 — the reference station now also publishes every 10-minute record of the last 6 hours (`recent_values`). v0.3.4 — for downstream consumers: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 913 tests, package pyflakes clean.
 
 > **If you have ever seen "Config flow could not be loaded: 500 Internal
 > Server Error"** when opening setup, reconfigure or Configure — that was
@@ -61,7 +61,7 @@ carefully-reviewed codebase, not a battle-tested one.
 > `sensor.swissweather_fusion_reference_station`, filled at the first
 > update after the restart (see
 > [swissweather_fusion_v0.3.5_release_audit.md](swissweather_fusion_v0.3.5_release_audit.md)
-> and [SOLAR_TEAM_v0.3.5.md](SOLAR_TEAM_v0.3.5.md)).
+> and "Reference station" below).
 >
 > **Upgrading to v0.3.4?** No database migration and no learning reset —
 > the running accuracy trial is untouched (see
@@ -81,7 +81,9 @@ carefully-reviewed codebase, not a battle-tested one.
 > v0.3.3**, now correctly: its series is keyed by `period_start` /
 > `period_end` like the solar series (the `time` key is gone). If
 > anything reads `sensor.swissweather_fusion_srf_global_irradiance`'s
-> `hourly_forecast`, see [SOLAR_TEAM_v0.3.4.md](SOLAR_TEAM_v0.3.4.md).
+> `hourly_forecast`, read `period_start` / `period_end` instead of `time`,
+> and remove any one-hour shift you applied yourself: the series is now
+> aligned, and shifting again would make it an hour early.
 >
 > **Upgrading to v0.3.3?** No database migration and no learning reset —
 > the running accuracy trial is untouched (see
@@ -238,8 +240,8 @@ Beyond the main `weather.*` entity, this integration exposes:
 
 ### Solar radiation (new in v0.3.3)
 
-Location-level radiation for a separate solar-forecast layer. **No panel
-geometry is applied here**: the solar layer owns tilt and azimuth and
+Location-level radiation for downstream consumers. **No panel
+geometry is applied here**: the consumer owns tilt and azimuth and
 computes tilted irradiance (GTI) itself, so adding or changing an array
 never touches this integration.
 
@@ -265,8 +267,8 @@ How to read the `hourly_forecast` series:
   triple from one model run** (`sources` says how many — 3 near-term,
   falling to 1 beyond ~48 h). That keeps GHI = DHI + DNI·cos(zenith)
   intact, so any transposition model can use the triple directly.
-- **Not bias-corrected.** Nothing learns radiation yet; that needs
-  inverter output as ground truth, which belongs to the solar layer.
+- **Not bias-corrected.** Nothing learns radiation; that would need measured
+  radiation as ground truth.
 - The series attribute is excluded from the recorder (it would otherwise
   be stored again on every update). Read it live; do not expect history.
 
@@ -309,8 +311,8 @@ data:
   ICON's ~5-day horizon), never `0` — a 0 % low layer that nobody forecast
   would read as "no fog".
 - Hourly forecast only. Not part of Home Assistant's standard forecast
-  fields, so weather cards ignore them; they are for automations and the
-  solar layer. The daily and twice-daily forecasts are unchanged.
+  fields, so weather cards ignore them; they are for automations and other
+  consumers. The daily and twice-daily forecasts are unchanged.
 - Not bias-corrected and not verified: there is no local measurement of
   cloud layers. Low cloud and fog are where weather models are weakest —
   treat a high `cloud_coverage_low` as a warning sign for the solar

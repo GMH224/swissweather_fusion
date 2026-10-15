@@ -1,8 +1,8 @@
 # SwissWeather Fusion v0.3.5 — Release Audit (ICS)
 
 **Release type:** feature. One additive attribute, `recent_values`, on the
-reference station sensor, requested by the solar layer (Open-Meteo Solar Forecast
-learning hub, request "keep every 10-minute station record", 13 Oct 2026).
+reference station sensor, requested by a downstream consumer ("keep every 10-minute station
+record", 13 Oct 2026).
 **Shipped during:** the Class A accuracy trial (closes end of November 2026).
 Checked against the trial rule — *it must not alter what the trial measures* — and
 against the version rule: nothing here touches Class A learning, so it is a
@@ -15,7 +15,7 @@ migration, no learning reset, no configuration change.
 
 ## 1. Problem
 
-The solar layer counts an hour as measured only when at least 5 of its 6
+A consumer counts an hour as measured only when at least 5 of its 6
 ten-minute records are known. The reference station sensor (v0.3.4) published
 only the newest record. On the owner's system, between 04:40 and 07:40 UTC on
 13 Oct, it showed 10 of 19 records, so no hour ever reached 5 of 6 and the solar
@@ -116,3 +116,40 @@ shows 10-minute steps without 20-minute jumps (request §3).
 
 No migration, no learning reset, no configuration change. Replace the
 `custom_components/swissweather_fusion` folder and restart Home Assistant.
+
+## 8. Repackage of 15 Oct 2026 — privacy scrub (same version)
+
+The package was checked for confidential content before publication. No
+credentials were found (no API keys, consumer secrets or tokens; test files use
+placeholders such as `TESTKEY`). Removed:
+
+- **Precise coordinates of the owner's home and SRF's grid point next to it**
+  (4 decimals, ~10 m) in tests, two documents and `srf_probe.py`. Replaced with
+  fictional points; the redaction tests keep the same structure (configured
+  point plus a nearby grid point about 200 m away).
+- **Details of the owner's installation beyond the weather station** in the
+  v0.3.3 audit.
+- **The Wetter-Alarm location id nearest the owner's home** (a public POI about
+  0.5 km away, so it located the home to its neighbourhood) in the v0.3.3 audit
+  and 22 places in the warnings tests; replaced with a fictional id.
+- **Where the owner was at one point** (a timezone remark in DEVELOPER.md) and
+  **the name of another integration the owner runs** (DEVELOPER.md v0.1.14).
+
+**Second pass, same day (owner request):** this integration has no reason to
+know what the owner's other systems are or who consumes its data. Removed: the
+two consumer notes for v0.3.4 and v0.3.5 (which held owner-specific
+data), the production-model design notes in the v0.3.3
+audit, and every attribution naming the consumer
+attribution in code comments, tests and documents. The interface descriptions
+they carried (cloud layers, SRF timing, reference station, `recent_values`)
+remain in the README in neutral form, including the SRF migration note.
+
+Method: an automated scan of all 116 files (credentials, coordinates, ids,
+addresses, names, image metadata), followed by a full read of all documents.
+The last three items were found only by the full read.
+
+Kept deliberately: example elevations in physics comments and tests (they do
+not locate a house), the station brand named in the pressure-datum rationale, the town-level location (Frauenfeld / Tänikon, also implied by
+the station choice) and two-decimal test coordinates (~1 km). Hits inside
+`wetteralarm_pois.json` are public Wetter-Alarm locations, not the owner's.
+Code unchanged; 913 tests pass.

@@ -731,7 +731,7 @@ configured coordinates, and it does not: SRF resolves a request to its
 **own nearest grid point** and returns that.
 
 A real diagnostics export contained
-`id='47.5536,8.9120'` — a neighbouring grid point roughly a kilometre
+`id='47.1236,8.5620'` — a neighbouring grid point roughly a kilometre
 from the configured position. Key-based redaction missed it (the key is
 `id`); the value sweep missed it (different numbers). The household's
 location was written verbatim into a file this project's own note invites
