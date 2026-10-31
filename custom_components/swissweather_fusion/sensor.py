@@ -633,7 +633,15 @@ class StorageSizeSensor(_BaseSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         stats = self._stats or {}
-        return {k: v for k, v in stats.items() if k.endswith("_rows")}
+        attributes = {k: v for k, v in stats.items() if k.endswith("_rows")}
+        # v0.3.6: progress of the one-time storage maintenance
+        # ("delete_nulls:<id>", "index_valid", "index_learn_pending",
+        # "done"), so it can be watched without reading the log.
+        coordinator = self._runtime.get("retention_coordinator")
+        state = getattr(coordinator, "maintenance_state", None)
+        if state is not None:
+            attributes["storage_maintenance"] = state
+        return attributes
 
 
 class PressureReferenceDeltaSensor(_BaseSensor):

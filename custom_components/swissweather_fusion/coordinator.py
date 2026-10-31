@@ -113,6 +113,67 @@ from .storage.db import SwissWeatherDB
 _LOGGER = logging.getLogger(__name__)
 
 
+def _log_late_failure(future: asyncio.Future) -> None:
+    """v0.3.6: retrieve and log the outcome of a shielded background write."""
+    if future.cancelled():
+        return
+    err = future.exception()
+    if err is not None:
+        _LOGGER.warning("Background database write failed: %r", err)
+
+
+class _SingleFlight:
+    """At most one job of a kind in flight; a timeout never abandons it.
+
+    **v0.3.6.** `asyncio.timeout` around `await async_add_executor_job(...)`
+    cancels the AWAIT, not the job: the executor thread carries on and
+    keeps the database lock. A real installation showed what follows. The
+    next cycle queued a second job behind the first, timed out too, queued
+    a third — and the blend, learning and station coordinators all failed
+    together for hours while the threads drained one by one, with the
+    weather entity "unavailable" throughout.
+
+    This helper makes the two halves explicit:
+
+    * the job is awaited through `asyncio.shield`, so a timeout reports
+      the slow cycle but the job still runs to completion and its work is
+      not thrown away half-done;
+    * while it runs, `busy` is True and the caller does not start another
+      one — it serves its last result or skips the cycle instead.
+
+    A job that ends with an exception after its caller has stopped
+    waiting has that exception retrieved and logged here, so it is never
+    silently lost (and asyncio never warns that it was not retrieved).
+    """
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._future: Optional[asyncio.Future] = None
+
+    @property
+    def busy(self) -> bool:
+        return self._future is not None and not self._future.done()
+
+    def start(self, awaitable: Any) -> asyncio.Future:
+        if self.busy:
+            raise RuntimeError(f"{self._name}: previous job still running")
+        future = asyncio.ensure_future(awaitable)
+        self._future = future
+        future.add_done_callback(self._retrieve)
+        return future
+
+    def _retrieve(self, future: asyncio.Future) -> None:
+        if future.cancelled():
+            return
+        err = future.exception()
+        if err is not None:
+            _LOGGER.debug("%s job ended with %r", self._name, err)
+
+    async def wait(self, future: asyncio.Future, timeout: float) -> Any:
+        async with asyncio.timeout(timeout):
+            return await asyncio.shield(future)
+
+
 class OpenMeteoCoordinator(DataUpdateCoordinator):
     """Handles CH1, CH2, and ICON-D2 — one coordinator since they share the
     same API and the same "check before fetching" logic. Polls frequently
@@ -1346,9 +1407,26 @@ class StationCoordinator(DataUpdateCoordinator):
         now_iso = datetime.now(timezone.utc).isoformat()
         # v0.1.14: same defense-in-depth backstop as every other
         # coordinator now has.
-        async with asyncio.timeout(30):
-            await self.hass.async_add_executor_job(
+        #
+        # v0.3.6: shielded. The readings come from Home Assistant's own
+        # sensors, not from the database, so a slow write is no reason to
+        # make the station entities unavailable. The write still
+        # completes — a timeout never cancelled the executor thread
+        # anyway — and the slow write is logged instead of failing the
+        # cycle.
+        write = asyncio.ensure_future(
+            self.hass.async_add_executor_job(
                 self._db.insert_station_observation, now_iso, temperature, humidity, pressure
+            )
+        )
+        write.add_done_callback(_log_late_failure)
+        try:
+            async with asyncio.timeout(30):
+                await asyncio.shield(write)
+        except TimeoutError:
+            _LOGGER.warning(
+                "Station observation write took over 30 s; it completes in "
+                "the background"
             )
         return {"temperature": temperature, "humidity": humidity, "pressure": pressure}
 
@@ -1865,6 +1943,9 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             update_interval=timedelta(minutes=10),
         )
         self._db = db
+        # v0.3.6: see _SingleFlight and _async_update_data.
+        self._flight = _SingleFlight("blend")
+        self._last_success_monotonic: Optional[float] = None
 
     def _is_daytime_at(self, when: datetime) -> Optional[bool]:
         """Whether the sun is above the horizon at `when` (v0.1.28).
@@ -1894,8 +1975,44 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         # two bulk queries plus in-memory processing of a potentially
         # large result set (v0.1.13's fix), still bounded but with
         # headroom.
-        async with asyncio.timeout(120):
-            return await self.hass.async_add_executor_job(self._compute_blend)
+        #
+        # v0.3.6: a slow cycle no longer makes the weather entity
+        # unavailable. While a computation is still running — or after it
+        # has exceeded the timeout and is still finishing — the previous
+        # blend is served, as long as it is younger than
+        # BLEND_MAX_STALE_SECONDS. Only once the last good blend is older
+        # than that does the coordinator fail, because by then the first
+        # forecast hours shown would be misleading.
+        if self._flight.busy:
+            return self._serve_previous("previous computation still running")
+        future = self._flight.start(
+            self.hass.async_add_executor_job(self._compute_blend)
+        )
+        try:
+            result = await self._flight.wait(future, 120)
+        except TimeoutError:
+            return self._serve_previous("computation exceeded 120 s")
+        self._last_success_monotonic = time.monotonic()
+        return result
+
+    # v0.3.6: how old the last good blend may be and still be served when
+    # a cycle cannot produce a new one. Two hours: twelve missed cycles,
+    # and still within the hour-by-hour resolution the entity exposes.
+    BLEND_MAX_STALE_SECONDS = 2 * 3600
+
+    def _serve_previous(self, reason: str) -> dict[str, Any]:
+        age = (
+            None
+            if self._last_success_monotonic is None
+            else time.monotonic() - self._last_success_monotonic
+        )
+        if self.data is None or age is None or age > self.BLEND_MAX_STALE_SECONDS:
+            raise UpdateFailed(f"Blend unavailable: {reason}")
+        _LOGGER.warning(
+            "Blend cycle skipped (%s); serving the blend computed %d s ago",
+            reason, int(age),
+        )
+        return self.data
 
     def _record_blend_comparison(
         self,
@@ -2703,13 +2820,44 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         # Falls back to a private lock when none is injected, so each
         # coordinator remains independently constructible in tests.
         self._reconcile_lock = reconcile_lock or asyncio.Lock()
+        # v0.3.6: see _SingleFlight and _async_update_data.
+        self._flight = _SingleFlight("learning")
 
     async def _async_update_data(self) -> Optional[datetime]:
         # v0.1.14: same defense-in-depth backstop as every other
         # coordinator now has.
-        async with self._reconcile_lock:
-            async with asyncio.timeout(120):
-                return await self.hass.async_add_executor_job(self._reconcile)
+        #
+        # v0.3.6: the shared lock is now held until the reconciliation
+        # job has really FINISHED, not merely until this coroutine stopped
+        # waiting for it. Before, a timeout released the lock while the
+        # executor thread was still reading and writing, so retention
+        # could delete rows in the middle of a reconciliation batch —
+        # exactly what the shared lock exists to prevent (P2-04). The
+        # release is now tied to the job's completion; a timeout still
+        # reports the slow cycle, and the next cycle skips rather than
+        # queueing a second job behind the first.
+        if self._flight.busy:
+            _LOGGER.warning(
+                "Learning cycle skipped: the previous reconciliation is "
+                "still running"
+            )
+            return self.data
+        await self._reconcile_lock.acquire()
+        try:
+            future = self._flight.start(
+                self.hass.async_add_executor_job(self._reconcile)
+            )
+        except BaseException:
+            self._reconcile_lock.release()
+            raise
+        future.add_done_callback(lambda _f: self._reconcile_lock.release())
+        try:
+            return await self._flight.wait(future, 120)
+        except TimeoutError as err:
+            raise UpdateFailed(
+                "Learning reconciliation exceeded 120 s; it continues in "
+                "the background and the next cycle starts after it ends"
+            ) from err
 
     def _compute_learning_progress(self) -> dict[str, Any]:
         """How much of the learned state is actually usable yet.
@@ -3170,6 +3318,8 @@ class ModelBCoordinator(DataUpdateCoordinator):
         # firing an unwarranted bonus call for a "crossing" that never
         # actually happened, just a restart.
         self._state_loaded_from_db = False
+        # v0.3.6: see _SingleFlight and _async_update_data.
+        self._flight = _SingleFlight("model_b")
 
     async def _async_load_persisted_state_if_needed(self) -> None:
         if self._state_loaded_from_db:
@@ -3187,9 +3337,31 @@ class ModelBCoordinator(DataUpdateCoordinator):
         # trigger meteoblue/Meteonomiqs bonus calls (each already
         # independently timed-out, but bounding the whole cycle here too
         # is cheap insurance).
-        async with asyncio.timeout(90):
-            await self._async_load_persisted_state_if_needed()
-            return await self._async_update_data_inner()
+        #
+        # v0.3.6: the cycle runs as one shielded task. A timeout reports
+        # the slow cycle but no longer abandons it between steps — which
+        # left the executor thread running anyway, and could stop after
+        # the probability was computed but before it was persisted. While
+        # it is still finishing, the next cycle keeps the last score
+        # instead of starting a second one.
+        if self._flight.busy:
+            if self.data is None:
+                raise UpdateFailed("Model B: previous scoring still running")
+            _LOGGER.warning(
+                "Model B cycle skipped: the previous scoring is still running"
+            )
+            return self.data
+        future = self._flight.start(self._async_scoring_cycle())
+        try:
+            return await self._flight.wait(future, 90)
+        except TimeoutError as err:
+            raise UpdateFailed(
+                "Model B scoring exceeded 90 s; it continues in the background"
+            ) from err
+
+    async def _async_scoring_cycle(self) -> float:
+        await self._async_load_persisted_state_if_needed()
+        return await self._async_update_data_inner()
 
     async def _async_update_data_inner(self) -> float:
         rows = await self.hass.async_add_executor_job(
@@ -3469,6 +3641,17 @@ class RetentionCoordinator(DataUpdateCoordinator):
         # because this coordinator already runs hourly in an executor job
         # and already owns the retention concern.
         self.storage_stats: Optional[dict[str, Any]] = None
+        # v0.3.6: the one-time storage maintenance. See
+        # SwissWeatherDB.run_storage_maintenance_step.
+        self._maintenance_task: Optional[asyncio.Task] = None
+        self.maintenance_state: Optional[str] = None
+
+    # v0.3.6: the maintenance waits this long after setup before its first
+    # step, so Home Assistant's own startup is never competing with it,
+    # and pauses between steps so the other coordinators get the database
+    # connection in between.
+    MAINTENANCE_START_DELAY_SECONDS = 600.0
+    MAINTENANCE_PAUSE_SECONDS = 0.5
 
     async def _async_update_data(self) -> Optional[dict[str, int]]:
         async with self._retention_lock:
@@ -3476,6 +3659,112 @@ class RetentionCoordinator(DataUpdateCoordinator):
                 self._db.get_storage_stats
             )
 
+        # v0.3.6: until the one-time maintenance has finished, the purge
+        # waits. Before idx_forecast_valid exists, finding the purgeable
+        # rows means reading the whole table — the exact cost this release
+        # removes. The maintenance runs the first purge itself when it
+        # ends.
+        self.maintenance_state = await self.hass.async_add_executor_job(
+            self._db.storage_maintenance_state
+        )
+        if self.maintenance_state != "done":
+            self._ensure_maintenance_running()
+            return None
+        return await self._async_purge()
+
+    def _ensure_maintenance_running(self) -> None:
+        if self._maintenance_task is not None and not self._maintenance_task.done():
+            return
+        coro = self._async_run_maintenance()
+        create = getattr(self.hass, "async_create_background_task", None)
+        if create is not None:
+            self._maintenance_task = create(
+                coro, "swissweather_fusion storage maintenance"
+            )
+        else:
+            self._maintenance_task = asyncio.ensure_future(coro)
+
+    async def _async_run_maintenance(self) -> None:
+        """Run the one-time v0.3.6 storage maintenance to completion.
+
+        Background task: never awaited by setup. Each step is one short
+        executor job (see run_storage_maintenance_step). A failure stops
+        the run with a warning; progress is stored, so the next daily
+        retention cycle resumes where it stopped.
+        """
+        await asyncio.sleep(self.MAINTENANCE_START_DELAY_SECONDS)
+        started = time.monotonic()
+        deleted_total = 0
+        _LOGGER.warning(
+            "Storage maintenance (v0.3.6) starting: removing forecast rows "
+            "that hold no value and rebuilding two indexes. Runs in small "
+            "batches; forecasts and learning are not affected"
+        )
+        try:
+            while True:
+                result = await self.hass.async_add_executor_job(
+                    self._db.run_storage_maintenance_step
+                )
+                deleted_total += result["deleted"]
+                self.maintenance_state = result["state"]
+                if result["state"] == "done":
+                    break
+                if result["state"].startswith("index_"):
+                    _LOGGER.info(
+                        "Storage maintenance: %d empty rows removed; next "
+                        "step %s (one longer step)",
+                        deleted_total, result["state"],
+                    )
+                await asyncio.sleep(self.MAINTENANCE_PAUSE_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:  # noqa: BLE001 - resumes on the next cycle
+            _LOGGER.warning(
+                "Storage maintenance stopped at %s (%r); it resumes on the "
+                "next retention cycle",
+                self.maintenance_state, err,
+            )
+            return
+        _LOGGER.warning(
+            "Storage maintenance (v0.3.6) finished in %d s: %d empty rows "
+            "removed. The database file keeps its size until compacted; "
+            "the freed space is reused for new data",
+            int(time.monotonic() - started), deleted_total,
+        )
+        if self._diagnostics is not None:
+            self._diagnostics.record(
+                source="retention", event_type="storage_maintenance",
+                detail=f"{deleted_total} empty forecast rows removed",
+                extra={"deleted": deleted_total},
+            )
+        try:
+            await self._async_purge()
+            # Refresh the storage figures now rather than at the next
+            # daily cycle, so the database size sensor shows the result.
+            async with self._retention_lock:
+                self.storage_stats = await self.hass.async_add_executor_job(
+                    self._db.get_storage_stats
+                )
+        except Exception as err:  # noqa: BLE001 - the daily cycle retries
+            _LOGGER.warning("Retention purge after maintenance failed: %r", err)
+        update_listeners = getattr(self, "async_update_listeners", None)
+        if update_listeners is not None:
+            update_listeners()
+
+    async def async_shutdown(self) -> None:
+        """v0.3.6: stop the maintenance task with the coordinator."""
+        task = self._maintenance_task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        parent = getattr(super(), "async_shutdown", None)
+        if parent is not None:
+            await parent()
+
+    async def _async_purge(self) -> Optional[dict[str, int]]:
         if self._purge_days <= 0:
             return None
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self._purge_days)).isoformat()

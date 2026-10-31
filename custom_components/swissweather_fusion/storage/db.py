@@ -66,7 +66,51 @@ _LOGGER = logging.getLogger(__name__)
 # bucket learned before v0.3.1 was contaminated by SWF-ICS-051 (past-hour
 # rows graded as short-lead forecasts), so the learned state has to go
 # even though the columns holding it are unchanged. See _migrate_to_v5.
-SCHEMA_VERSION = 5
+# v0.3.6: bumped to 6. No shape change and no change to any learned or
+# reconciled value — this is STORAGE MAINTENANCE. Rows without a value are
+# no longer stored, rows of variables Model A does not learn from are no
+# longer marked 'pending', and two indexes replace one. The existing data
+# is brought into that shape by run_storage_maintenance_step(), in the
+# background and in small batches, never at startup. See
+# _V6_MAINTENANCE_KEY.
+SCHEMA_VERSION = 6
+
+# v0.3.6: the variables Model A learns from. A forecast row of any other
+# variable can never be reconciled — the station has no sensor for it — so
+# marking it 'pending' only ever meant "never purge this". On a real
+# 14.5 million row installation that was 86 % of the table: a partial
+# index covering almost everything, and a purge that could not remove
+# anything older than the learned rows.
+#
+# Must equal ModelALearningCoordinator.RECONCILIATION_MEASUREMENTS;
+# tests/test_v0_3_6_storage.py asserts it. Kept here rather than imported
+# because this module deliberately has no coordinator dependency.
+LEARNED_VARIABLES: tuple[str, ...] = ("temperature", "humidity", "pressure")
+
+# Status given at insert time to a row Model A will never look at.
+STATUS_NOT_LEARNED = "not_learned"
+
+# The literal SQL list. SQLite uses a PARTIAL index only when the query
+# contains the index's WHERE terms literally — a bound parameter list does
+# not qualify — so every query meant to use idx_forecast_learn_pending
+# must embed exactly this text. Derived from LEARNED_VARIABLES so the two
+# cannot drift apart.
+_LEARNED_SQL_LIST = "(" + ", ".join(f"'{v}'" for v in LEARNED_VARIABLES) + ")"
+_LEARNED_PENDING_SQL = (
+    f"reconciliation_status = 'pending' AND variable IN {_LEARNED_SQL_LIST}"
+)
+
+# v0.3.6: one-time storage maintenance progress, in schema_meta. Values:
+# absent (not started), "delete_nulls:<next id>", "indexes", "done".
+_V6_MAINTENANCE_KEY = "v0_3_6_storage_maintenance"
+
+# Rows examined per maintenance or purge batch. Each batch is its own
+# short transaction and releases the lock afterwards, so the coordinators
+# that share this connection are never blocked for long. Measured on a
+# copy of a real 3.3 GB database: the worst 50 000-id NULL-deletion batch
+# took 0.53 s.
+MAINTENANCE_BATCH_IDS = 50_000
+PURGE_BATCH_ROWS = 20_000
 
 # v0.1.23: how far back the v1->v2 migration re-opens forecast_snapshots
 # rows for a fresh, correct reconciliation pass. Deliberately reuses the
@@ -277,9 +321,6 @@ CREATE INDEX IF NOT EXISTS idx_forecast_source_ts
     ON forecast_snapshots(source, valid_at);
 CREATE INDEX IF NOT EXISTS idx_radar_ts ON radar_observations(ts);
 CREATE INDEX IF NOT EXISTS idx_predictions_ts ON storm_predictions(ts);
-CREATE INDEX IF NOT EXISTS idx_forecast_pending
-    ON forecast_snapshots(reconciliation_status, valid_at)
-    WHERE reconciliation_status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_predictions_reconciled
     ON storm_predictions(reconciled, ts);
 -- v0.3.0: blend_comparison. Here, not in _TABLE_SQL, for the reason set
@@ -290,6 +331,49 @@ CREATE INDEX IF NOT EXISTS idx_blend_comparison_pending
 CREATE INDEX IF NOT EXISTS idx_blend_comparison_report
     ON blend_comparison(status, measurement, lead_hours);
 """
+
+# v0.3.6: the forecast_snapshots indexes that replace idx_forecast_pending.
+#
+# Deliberately NOT part of _INDEX_SQL, which runs at every startup. On a
+# fresh or empty database they are created there and then (instant). On an
+# existing database, building them means reading every row — on a 14.5
+# million row file on modest hardware that is minutes — so they are built
+# by run_storage_maintenance_step() in the background, AFTER the
+# value-less rows are gone and the table is less than half the size.
+# Until then the old idx_forecast_pending still serves the learning query,
+# which contains its WHERE term too.
+#
+#   idx_forecast_learn_pending  the learning query: only the rows Model A
+#                               can still reconcile (a few thousand, not
+#                               12 million).
+#   idx_forecast_valid          the blend window and the station
+#                               reference: both select by valid_at range
+#                               across all sources, which no existing
+#                               index led with.
+_V6_INDEX_SQL = f"""
+CREATE INDEX IF NOT EXISTS idx_forecast_valid ON forecast_snapshots(valid_at);
+CREATE INDEX IF NOT EXISTS idx_forecast_learn_pending
+    ON forecast_snapshots(valid_at)
+    WHERE {_LEARNED_PENDING_SQL};
+DROP INDEX IF EXISTS idx_forecast_pending;
+"""
+
+
+def _hour_range(hour_prefix: str) -> tuple[str, str]:
+    """Bounds selecting every valid_at that starts with hour_prefix.
+
+    v0.3.6: replaces `substr(valid_at, 1, 13) = ?`, which no index can
+    serve — every call read the whole table, three times per station poll.
+    `'~'` sorts after every character an ISO timestamp contains, so
+    `prefix <= valid_at < prefix + '~'` is exactly the prefix match, and
+    an index on valid_at answers it directly.
+    """
+    return hour_prefix, hour_prefix + "~"
+
+
+def _initial_status(variable: str) -> str:
+    """v0.3.6: 'pending' only for a variable Model A can learn from."""
+    return "pending" if variable in LEARNED_VARIABLES else STATUS_NOT_LEARNED
 
 
 @dataclass(frozen=True)
@@ -485,6 +569,7 @@ class SwissWeatherDB:
             # the installations that already upgraded.
             self._migrate_to_v5()
             self._conn.executescript(_INDEX_SQL)
+            self._create_v6_indexes_if_empty()
             self._write_schema_version()
             self._conn.commit()
             return
@@ -505,8 +590,46 @@ class SwissWeatherDB:
         self._migrate_to_v4()
         self._migrate_to_v5()
         self._conn.executescript(_INDEX_SQL)
+        self._create_v6_indexes_if_empty()
         self._write_schema_version()
         self._conn.commit()
+
+    def _create_v6_indexes_if_empty(self) -> None:
+        """v0.3.6: give an empty forecast table its final indexes now.
+
+        Building an index on an empty table costs nothing, and a fresh
+        installation then never needs the background maintenance at all.
+        A populated table is left to run_storage_maintenance_step() — see
+        _V6_INDEX_SQL for why that must not happen at startup.
+        """
+        if self._conn.execute(
+            "SELECT 1 FROM schema_meta WHERE key = ? AND value = 'done'",
+            (_V6_MAINTENANCE_KEY,),
+        ).fetchone():
+            # Maintenance already finished; make sure the indexes exist
+            # (IF NOT EXISTS makes this free) and that the replaced one
+            # has not come back.
+            self._conn.executescript(_V6_INDEX_SQL)
+            return
+        if self._conn.execute(
+            "SELECT 1 FROM forecast_snapshots LIMIT 1"
+        ).fetchone() is not None:
+            # Populated and not yet maintained: the pre-v0.3.6 learning
+            # index keeps serving until the maintenance replaces it. It
+            # already exists on every v0.1.23+ database (no-op here); only
+            # a database migrated from before that gets it built now, and
+            # such a database is small.
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_forecast_pending "
+                "ON forecast_snapshots(reconciliation_status, valid_at) "
+                "WHERE reconciliation_status = 'pending'"
+            )
+            return
+        self._conn.executescript(_V6_INDEX_SQL)
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, 'done')",
+            (_V6_MAINTENANCE_KEY,),
+        )
 
     def _table_shape(self) -> dict[str, set[str]]:
         """Actual column names per table, straight from the database.
@@ -872,13 +995,21 @@ class SwissWeatherDB:
         variant below (one transaction per poll cycle) — this single-row
         form is kept as a test-setup convenience (see tests/test_db.py and
         tests/test_learning_integration.py, which exercise it directly)
-        rather than removed as dead production code."""
+        rather than removed as dead production code.
+
+        v0.3.6: applies the same initial-status rule as the bulk insert,
+        but still stores a NULL value when given one. Databases from
+        before v0.3.6 contain such rows until the background maintenance
+        removes them, and the learning loop's handling of them is still
+        tested through this method."""
         with self._transaction():
             self._conn.execute(
                 "INSERT INTO forecast_snapshots "
-                "(source, issued_at, valid_at, variable, value, trigger_reason) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (source, issued_at, valid_at, variable, value, trigger_reason),
+                "(source, issued_at, valid_at, variable, value, trigger_reason, "
+                " reconciliation_status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (source, issued_at, valid_at, variable, value, trigger_reason,
+                 _initial_status(variable)),
             )
 
     def insert_forecast_snapshots_bulk(
@@ -907,8 +1038,19 @@ class SwissWeatherDB:
             raise ValueError(
                 f"forecast_snapshots rows must have 6 or 8 fields, got {sorted(widths)}"
             )
-        wide = [r for r in rows if len(r) == 8]
-        narrow = [r for r in rows if len(r) == 6]
+        # v0.3.6: a row without a value is not stored. Every model returns
+        # its full seven-day grid with NULLs beyond its own horizon, and
+        # those NULLs were 58 % of a real installation's table. Nothing
+        # reads them: the blend skips a NULL before keying (so it cannot
+        # hide an older real value either), and learning marks it
+        # 'skipped' without touching a bucket. Not storing it is
+        # therefore not a change to any result — only to the file size.
+        #
+        # The status is decided here, once, from the variable: 'pending'
+        # only for what Model A learns from. See LEARNED_VARIABLES.
+        rows = [r for r in rows if r[4] is not None]
+        wide = [(*r, _initial_status(r[3])) for r in rows if len(r) == 8]
+        narrow = [(*r, _initial_status(r[3])) for r in rows if len(r) == 6]
         # v0.3.1 (SWF-ICS-045): explicit transaction ownership. A failure
         # partway through the two executemany calls below used to leave
         # the transaction open, so a later successful write committed the
@@ -917,16 +1059,17 @@ class SwissWeatherDB:
             if narrow:
                 self._conn.executemany(
                     "INSERT INTO forecast_snapshots "
-                    "(source, issued_at, valid_at, variable, value, trigger_reason) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "(source, issued_at, valid_at, variable, value, trigger_reason, "
+                    " reconciliation_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     narrow,
                 )
             if wide:
                 self._conn.executemany(
                     "INSERT INTO forecast_snapshots "
                     "(source, issued_at, valid_at, variable, value, trigger_reason, "
-                    " run_initialised_at, lead_time_basis) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    " run_initialised_at, lead_time_basis, reconciliation_status) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     wide,
                 )
 
@@ -952,6 +1095,7 @@ class SwissWeatherDB:
         vintage_cutoff = (
             datetime.now(timezone.utc) - REFERENCE_VINTAGE_WINDOW
         ).isoformat()
+        hour_start, hour_end = _hour_range(hour_prefix)
         with self._lock:
             cur = self._conn.execute(
                 # v0.3.1 (SWF-ICS-048): bounded by forecast VINTAGE.
@@ -972,10 +1116,12 @@ class SwissWeatherDB:
                 "SELECT value FROM forecast_snapshots "
                 "WHERE variable = ? AND value IS NOT NULL "
                 "AND source != 'blend' "
-                "AND substr(valid_at, 1, 13) = ? "
+                # v0.3.6: a range on valid_at, not substr() — see
+                # _hour_range. Same rows, served by idx_forecast_valid.
+                "AND valid_at >= ? AND valid_at < ? "
                 "AND issued_at >= ? "
                 "ORDER BY value",
-                (variable, hour_prefix, vintage_cutoff),
+                (variable, hour_start, hour_end, vintage_cutoff),
             )
             values = [row["value"] for row in cur.fetchall()]
         if not values:
@@ -1003,13 +1149,14 @@ class SwissWeatherDB:
         on the hour while station observations arrive at arbitrary
         minutes.
         """
+        hour_start, hour_end = _hour_range(hour_prefix)
         with self._lock:
             cur = self._conn.execute(
                 "SELECT value FROM forecast_snapshots "
                 "WHERE variable = 'pressure' AND value IS NOT NULL "
-                "AND substr(valid_at, 1, 13) = ? "
+                "AND valid_at >= ? AND valid_at < ? "
                 "ORDER BY value",
-                (hour_prefix,),
+                (hour_start, hour_end),
             )
             values = [row["value"] for row in cur.fetchall()]
         if not values:
@@ -1062,12 +1209,25 @@ class SwissWeatherDB:
         same valid_at from different issued_at times (different lead
         times), and each is a genuinely separate, separately-informative
         data point for its own lead_time_bucket.
+
+        v0.3.6: the query also carries _LEARNED_PENDING_SQL literally, so
+        SQLite can use idx_forecast_learn_pending (a partial index is used
+        only when its WHERE terms appear in the query as written). The
+        result is unchanged: `measurements` must be a subset of
+        LEARNED_VARIABLES, and the extra clause is then implied by the
+        original ones.
         """
+        unknown = set(measurements) - set(LEARNED_VARIABLES)
+        if unknown:
+            raise ValueError(
+                f"not a learned variable: {sorted(unknown)}; "
+                f"rows of these are stored as {STATUS_NOT_LEARNED!r}"
+            )
         placeholders = ",".join("?" for _ in measurements)
         with self._lock:
             cur = self._conn.execute(
                 f"SELECT * FROM forecast_snapshots "
-                f"WHERE reconciliation_status = 'pending' AND valid_at <= ? "
+                f"WHERE {_LEARNED_PENDING_SQL} AND valid_at <= ? "
                 f"AND variable IN ({placeholders}) "
                 f"ORDER BY valid_at ASC",
                 (until_ts, *measurements),
@@ -1557,18 +1717,41 @@ class SwissWeatherDB:
         instead of the row aging out through the normal 'skipped' path.
         """
         deleted: dict[str, int] = {}
+        # v0.3.6: forecast_snapshots is purged in batches, each its own
+        # transaction, releasing the lock in between. One DELETE over a
+        # 14-million-row table held the shared connection long enough for
+        # every other coordinator's call to time out behind it.
+        #
+        # Protected rows are now exactly those Model A can still learn
+        # from: pending AND a learned variable. A pre-v0.3.6 row of any
+        # other variable is still marked 'pending' but can never be
+        # reconciled, so protecting it only ever meant keeping it forever.
+        #
+        # Batches commit independently, so a failure part-way leaves the
+        # earlier batches deleted — which is correct, they were due — and
+        # the returned count is what was actually committed. Each batch
+        # still uses _transaction(), so no batch is ever half-applied or
+        # left open for a later write to commit (SWF-ICS-047).
+        deleted["forecast_snapshots"] = 0
+        while True:
+            with self._transaction():
+                cur = self._conn.execute(
+                    "DELETE FROM forecast_snapshots WHERE id IN ("
+                    "  SELECT id FROM forecast_snapshots "
+                    f"  WHERE valid_at < ? AND NOT ({_LEARNED_PENDING_SQL}) "
+                    "  LIMIT ?)",
+                    (cutoff_ts, PURGE_BATCH_ROWS),
+                )
+                count = cur.rowcount
+            deleted["forecast_snapshots"] += count
+            if count < PURGE_BATCH_ROWS:
+                break
         # v0.3.1 (SWF-ICS-047): a failure partway through the table-by-
         # table cleanup below used to leave the earlier DELETEs staged and
         # the transaction open, so the next successful write committed a
         # partial purge — and the returned counts described rows that had
         # not actually been deleted yet.
         with self._transaction():
-            cur = self._conn.execute(
-                "DELETE FROM forecast_snapshots "
-                "WHERE valid_at < ? AND reconciliation_status != 'pending'",
-                (cutoff_ts,),
-            )
-            deleted["forecast_snapshots"] = cur.rowcount
             # v0.3.0: comparison rows still waiting for an observation
             # are protected exactly as pending forecast rows are, and for
             # the same reason — a purge window shorter than the abandon
@@ -1590,6 +1773,102 @@ class SwissWeatherDB:
                 )
                 deleted[table] = cur.rowcount
         return deleted
+
+    # -- one-time storage maintenance (v0.3.6) -----------------------------------
+
+    def storage_maintenance_state(self) -> str:
+        """Progress of the v0.3.6 maintenance: see _V6_MAINTENANCE_KEY."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM schema_meta WHERE key = ?",
+                (_V6_MAINTENANCE_KEY,),
+            ).fetchone()
+        return row["value"] if row else "delete_nulls:0"
+
+    def run_storage_maintenance_step(self) -> dict[str, Any]:
+        """Do ONE bounded unit of the v0.3.6 maintenance and record it.
+
+        Called repeatedly from the retention coordinator, in the executor,
+        until it reports "done". Each call holds the connection lock for
+        one unit only, so the other coordinators are interleaved between
+        units rather than waiting for the whole job. Progress is stored in
+        schema_meta after every unit, so a restart resumes where it was.
+
+        The units, in this order:
+
+          delete_nulls:<id>    delete value-less rows with id in
+                               [id, id + MAINTENANCE_BATCH_IDS)
+          index_valid          build idx_forecast_valid
+          index_learn_pending  build idx_forecast_learn_pending, then
+                               drop idx_forecast_pending -> done
+
+        Deleting first matters: both index builds then read less than
+        half the rows they would have read before.
+
+        **Nothing here changes a learned value or a blend.** The deleted
+        rows have no value; the blend skips them and learning marks them
+        'skipped' without updating a bucket (see insert_forecast_snapshots_bulk).
+
+        Returns {"state": <state after this step>, "deleted": <rows>}.
+        """
+        state = self.storage_maintenance_state()
+        deleted = 0
+        if state == "done":
+            return {"state": "done", "deleted": 0}
+
+        if state.startswith("delete_nulls:"):
+            start = int(state.split(":", 1)[1])
+            with self._transaction():
+                max_id = self._conn.execute(
+                    "SELECT max(id) FROM forecast_snapshots"
+                ).fetchone()[0]
+                if max_id is None or start > max_id:
+                    next_state = "index_valid"
+                else:
+                    cur = self._conn.execute(
+                        "DELETE FROM forecast_snapshots "
+                        "WHERE id >= ? AND id < ? AND value IS NULL",
+                        (start, start + MAINTENANCE_BATCH_IDS),
+                    )
+                    deleted = cur.rowcount or 0
+                    next_state = f"delete_nulls:{start + MAINTENANCE_BATCH_IDS}"
+                self._set_maintenance_state(next_state)
+            return {"state": next_state, "deleted": deleted}
+
+        if state == "index_valid":
+            with self._transaction():
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_forecast_valid "
+                    "ON forecast_snapshots(valid_at)"
+                )
+                self._set_maintenance_state("index_learn_pending")
+            return {"state": "index_learn_pending", "deleted": 0}
+
+        if state == "index_learn_pending":
+            with self._transaction():
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_forecast_learn_pending "
+                    f"ON forecast_snapshots(valid_at) WHERE {_LEARNED_PENDING_SQL}"
+                )
+                self._conn.execute("DROP INDEX IF EXISTS idx_forecast_pending")
+                self._set_maintenance_state("done")
+            return {"state": "done", "deleted": 0}
+
+        # An unrecognised marker (hand-edited, or written by a newer
+        # version) is not guessed at: start the idempotent sequence over.
+        _LOGGER.warning(
+            "Unknown storage maintenance state %r; restarting it", state
+        )
+        with self._transaction():
+            self._set_maintenance_state("delete_nulls:0")
+        return {"state": "delete_nulls:0", "deleted": 0}
+
+    def _set_maintenance_state(self, state: str) -> None:
+        """Caller holds the lock (inside _transaction)."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            (_V6_MAINTENANCE_KEY, state),
+        )
 
     # -- durable runtime state (v0.1.23 fixes L-06/L-05/L-04/L-07/L-08/L-09) -----
     # All of these reuse the schema_meta key/value table, the same pattern
@@ -1888,7 +2167,11 @@ class SwissWeatherDB:
                     "WHERE pressure IS NOT NULL AND EXISTS ("
                     "  SELECT 1 FROM forecast_snapshots f"
                     "  WHERE f.variable = 'pressure' AND f.value IS NOT NULL"
-                    "    AND substr(f.valid_at, 1, 13) = substr(station_observations.ts, 1, 13)"
+                    # v0.3.6: range form, see _hour_range. The substr()
+                    # form read the whole forecast table once per station
+                    # observation.
+                    "    AND f.valid_at >= substr(station_observations.ts, 1, 13)"
+                    "    AND f.valid_at < substr(station_observations.ts, 1, 13) || '~'"
                     "  GROUP BY substr(f.valid_at, 1, 13)"
                     "  HAVING abs(avg(f.value) - station_observations.pressure) > ?"
                     ")",
@@ -1905,9 +2188,12 @@ class SwissWeatherDB:
                     )
                     observations_cleared += cur.rowcount or 0
 
+                # v0.3.6: only the learned variables are re-opened. A
+                # re-opened row of any other variable could never be
+                # reconciled and would only become unpurgeable.
                 cur = self._conn.execute(
                     "UPDATE forecast_snapshots SET reconciliation_status = 'pending' "
-                    "WHERE valid_at >= ?",
+                    f"WHERE valid_at >= ? AND variable IN {_LEARNED_SQL_LIST}",
                     (cutoff,),
                 )
                 forecasts_reopened = cur.rowcount or 0
