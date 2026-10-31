@@ -2200,6 +2200,96 @@ horizons the series is three-hourly. Below 75% coverage no total is
 published. `None` is honest; tripling the sum on an assumption about
 whether a three-hourly value is a rate or an accumulation would not be.
 
+## v0.3.6 — database performance without changing a result
+
+**Symptom (owner, 31 Oct 2026).** The weather card showed "unavailable";
+the log showed the blend, learning and station coordinators timing out
+together, repeatedly. Database: 3.3 GB, 14.5 million forecast rows.
+
+**Measured on a copy of that database**, not estimated:
+
+| Query | Rows read | Time |
+|---|---|---|
+| learning: pending rows | 12.4 M pending, 1,599 returned | 15–45 s |
+| station reference (×3 per 5-min poll) | full table (`substr(valid_at)`) | 1.2–2.3 s each |
+| blend window | 1.28 M | 6–8 s |
+
+Three facts explain it:
+
+1. **58 % of rows had no value.** Every model returns its full 7-day grid
+   with NULLs past its own horizon, and every NULL was stored. The blend
+   skips a NULL before keying; learning marks it 'skipped' without
+   touching a bucket. Nothing used them.
+2. **86 % of rows were 'pending' for ever.** Learning reconciles only
+   temperature/humidity/pressure, but every row was inserted 'pending', and
+   the purge protects 'pending'. So rows of every other variable could never
+   be purged, and `idx_forecast_pending` covered almost the whole table.
+3. **A timeout does not stop an executor job.** `asyncio.timeout` cancels
+   the await; the thread keeps the database lock. The next cycle queued a
+   second job behind it, and so on — the cascade in the log.
+
+**Changes (storage/db.py).**
+
+- `insert_forecast_snapshots_bulk` drops rows whose value is None and
+  sets the status: 'pending' only for `LEARNED_VARIABLES`, else
+  `'not_learned'`. `LEARNED_VARIABLES` must equal
+  `ModelALearningCoordinator.RECONCILIATION_MEASUREMENTS` (tested; kept in
+  db.py because storage has no coordinator dependency).
+- New indexes `idx_forecast_valid(valid_at)` and the partial
+  `idx_forecast_learn_pending(valid_at) WHERE reconciliation_status =
+  'pending' AND variable IN (learned)`. They replace `idx_forecast_pending`.
+  **A partial index is used only when the query contains its WHERE terms
+  literally**, so `_LEARNED_PENDING_SQL` is embedded as text in the
+  pending query and the purge, not bound as parameters.
+- Hour lookups use `valid_at >= prefix AND valid_at < prefix || '~'`
+  (`_hour_range`) instead of `substr(valid_at, 1, 13) = ?`; the same
+  rewrite in `reset_all_learning`'s correlated pressure check, which read
+  the whole table once per station observation.
+- `purge_older_than` deletes forecast rows in batches of
+  `PURGE_BATCH_ROWS`, each its own transaction; protected rows are exactly
+  "pending AND learned".
+- `reset_all_learning` re-opens only learned variables.
+- `SCHEMA_VERSION` 6. No shape change.
+
+**One-time maintenance, never at startup.** `_V6_INDEX_SQL` is not in
+`_INDEX_SQL`: building an index reads every row, minutes on a large file on
+small hardware, and setup awaits `_ensure_schema`. On an empty forecast
+table the new indexes are created immediately and the marker set to done.
+Otherwise `RetentionCoordinator` starts a background task
+(`MAINTENANCE_START_DELAY_SECONDS` after setup) that calls
+`run_storage_maintenance_step` until done. Steps:
+`delete_nulls:<id>` (id range of `MAINTENANCE_BATCH_IDS`), `index_valid`,
+`index_learn_pending` (also drops the old index), `done`. Progress is in
+schema_meta (`_V6_MAINTENANCE_KEY`), so a restart resumes. Until done, the
+daily purge waits (without `idx_forecast_valid` it would scan the table),
+and the task runs it once at the end, then refreshes the storage figures
+(the Database size sensor shows progress as attribute
+`storage_maintenance`). The task does not take
+`retention_lock`: it deletes only value-less rows, which learning would
+only mark 'skipped', so a reconciliation batch cannot be affected.
+Pre-v0.3.6 rows of unlearned variables stay 'pending' and age out
+through the purge; rewriting millions of statuses would buy nothing.
+
+**Executor guard (coordinator.py, `_SingleFlight`).** The job is awaited
+through `asyncio.shield`; while it runs, `busy` blocks a second one.
+
+- Blend: busy or timeout → the previous blend is served if younger than
+  `BLEND_MAX_STALE_SECONDS` (2 h), else `UpdateFailed`.
+- Learning: the shared `reconcile_lock` is released when the job really
+  finishes (done callback), not when the await times out. Before, a
+  timeout released it while the thread was still reading and writing —
+  exactly what P2-04 introduced the lock to prevent.
+- Model B: the whole cycle is one shielded task; busy → last score.
+- Station: the observation write is shielded; a slow write is logged and
+  the readings are still returned. A late failure is logged
+  (`_log_late_failure`).
+
+**Equivalence proof.** v0.3.5 on one copy, v0.3.6 (after maintenance) on
+another, same frozen time: identical pending selection (non-NULL ids),
+reference values (196), blend before and after learning, bucket_stats,
+row statuses, blend_comparison rows, comparison report and temperature
+MAE. Numbers in the v0.3.6 release audit.
+
 ## v0.3.5 — reference station: every record of the last 6 hours
 
 Requested by a downstream consumer (13 Oct 2026). It

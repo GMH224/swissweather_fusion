@@ -425,6 +425,9 @@ def test_every_index_can_be_created_on_an_upgraded_database(v0_1_23_database):
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
+        # v0.3.6: this fixture holds forecast rows, so the pre-v0.3.6
+        # learning index serves until the background storage maintenance
+        # replaces it (see _create_v6_indexes_if_empty).
         assert "idx_forecast_pending" in indexes
         assert "idx_predictions_reconciled" in indexes
     finally:

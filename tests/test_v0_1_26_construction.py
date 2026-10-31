@@ -301,6 +301,10 @@ def test_storm_reconciliation_first_refresh_runs(migrated_db):
 def test_retention_first_refresh_runs(migrated_db):
     hass = StatefulHass()
     c = coord.RetentionCoordinator(hass, migrated_db, purge_days=90)
+    # v0.3.6: a populated database purges only after the one-time storage
+    # maintenance (tests/test_v0_3_6_storage.py covers the deferral).
+    while migrated_db.run_storage_maintenance_step()["state"] != "done":
+        pass
     result = asyncio.run(c._async_update_data())
     assert "forecast_snapshots" in result
 

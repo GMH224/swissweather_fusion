@@ -18,3 +18,7 @@ aiohttp>=3.9.0
 # first and falls back to the stub only if it is genuinely absent, but
 # the fallback should never actually be needed in CI.
 voluptuous>=0.13.0
+# v0.3.6: imported by the config-flow tests (via the HA helpers they
+# exercise). It was installed incidentally on the original test machine
+# and missing from this list, so a clean environment failed collection.
+voluptuous-serialize>=2.6.0

@@ -13,7 +13,7 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.5 — the reference station now also publishes every 10-minute record of the last 6 hours (`recent_values`). v0.3.4 — for downstream consumers: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 913 tests, package pyflakes clean.
+**Status: v0.3.6 — database performance: the timeouts that made the weather entity "unavailable" on large databases are fixed; forecasts and learning are unchanged. v0.3.5 — the reference station now also publishes every 10-minute record of the last 6 hours (`recent_values`). v0.3.4 — for downstream consumers: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 956 tests, package pyflakes clean.
 
 > **If you have ever seen "Config flow could not be loaded: 500 Internal
 > Server Error"** when opening setup, reconfigure or Configure — that was
@@ -56,6 +56,34 @@ v0.3.0's own account is in
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
+> **Upgrading to v0.3.6?** No learning reset and no configuration change.
+> Forecasts, learned corrections and the accuracy comparison are
+> unchanged — this was verified on a copy of a real 14.5 million row
+> database (identical learning selection, buckets, blend and comparison
+> report). What changes is storage:
+>
+> - About **10 minutes after the restart** a one-time background
+>   maintenance starts. It removes forecast rows that hold no value (on
+>   that database, 58 % of all rows) and replaces one index with two.
+>   It runs in small batches and resumes after a restart; expect a few
+>   minutes, longer on small hardware. The log shows a start and a
+>   finish line. Two steps hold the database for up to about a minute
+>   each on small hardware; during them the weather entity keeps
+>   showing the last forecast.
+> - Until it has finished, the daily retention purge waits; it then runs
+>   once by itself.
+> - **The database file does not shrink.** Freed space is reused for new
+>   data, so the file stops growing for a while.
+> - A slow cycle no longer makes the weather entity unavailable: the last
+>   forecast is served for up to 2 hours, and a slow job is never queued
+>   twice.
+>
+> For anything reading the integration's entities or attributes: nothing
+> changed — same entities, attributes, units and timing. The Database size
+> sensor gains one attribute, `storage_maintenance` (progress; `done` when
+> finished). Details in
+> [swissweather_fusion_v0.3.6_release_audit.md](swissweather_fusion_v0.3.6_release_audit.md).
+>
 > **Upgrading to v0.3.5?** No database migration and no learning reset —
 > nothing changes except one new attribute, `recent_values`, on
 > `sensor.swissweather_fusion_reference_station`, filled at the first
