@@ -91,14 +91,16 @@ def test_precipitation_is_routed_to_the_median_not_the_learned_blend(db):
     assert result != pytest.approx(sum(values) / len(values))
 
 
-def test_gusts_are_routed_to_max_not_the_learned_blend(db):
+def test_gusts_are_routed_to_their_fusion_rule_not_the_learned_blend(db):
+    # v0.4.0 (C5): the rule is now the median (was max). The routing —
+    # class B, not the learned blend — is what this test is about.
     c = _blend_coordinator(db)
     result = c._blend_by_class(
         "wind_gust_speed", NOW,
         latest_forecast=_forecast("wind_gust_speed", [12.0, 25.0, 18.0]),
         bucket_lookup={},
     )
-    assert result == 25.0
+    assert result == 18.0
 
 
 def test_wind_bearing_is_routed_to_the_circular_mean(db):

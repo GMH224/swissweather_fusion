@@ -64,14 +64,16 @@ def test_precipitation_still_agrees_with_the_mean_when_models_agree():
     assert result == pytest.approx(8.0)
 
 
-def test_wind_gusts_use_max_not_mean():
-    """A gust forecast is already a peak. The mean of several peaks is
-    not a peak, and it understates the hazard."""
-    values = [12.0, 25.0, 18.0]
-    mean = sum(values) / len(values)
+def test_wind_gusts_use_median_not_max_or_mean():
+    """v0.4.0 (C5): every model over-forecasts gusts at the reference
+    station, so the maximum compounded the bias (+2.0 m/s); the median was
+    the most accurate rule in the backtest (INFO-003 §4.3). With an outlier
+    the median also differs from the mean — it is not an average."""
+    values = [12.0, 30.0, 18.0]
     result = fp.get("wind_gust_speed").fuse_values(values)
-    assert result == 25.0
-    assert result > mean
+    assert result == 18.0
+    assert result != sum(values) / len(values)
+    assert result < max(values)
 
 
 def test_visibility_uses_min_not_mean():

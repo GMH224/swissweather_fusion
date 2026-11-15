@@ -13,7 +13,7 @@ weather (temperature/rain arriving together with a pressure signature),
 using MeteoSwiss's CombiPrecip radar feed and an optional independent
 check from Meteonomiqs.
 
-**Status: v0.3.6 — database performance: the timeouts that made the weather entity "unavailable" on large databases are fixed; forecasts and learning are unchanged. v0.3.5 — the reference station now also publishes every 10-minute record of the last 6 hours (`recent_values`). v0.3.4 — for downstream consumers: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 956 tests, package pyflakes clean.
+**Status: v0.4.0 — learning tuned on your own data: a 3-day learning memory for every source, no season restarts, and a short-range correction from your station's latest error (1–6 hours ahead); dew point consistent with temperature and humidity; gusts fused by median. v0.3.6 — database performance: the timeouts that made the weather entity "unavailable" on large databases are fixed; forecasts and learning are unchanged. v0.3.5 — the reference station now also publishes every 10-minute record of the last 6 hours (`recent_values`). v0.3.4 — for downstream consumers: cloud cover by layer (low / mid / high), corrected SRF irradiance timing, and live measurements from the nearest MeteoSwiss station; on top of v0.3.3 solar radiation and the v0.3.x measurement release.** 1010 tests, package pyflakes clean.
 
 > **If you have ever seen "Config flow could not be loaded: 500 Internal
 > Server Error"** when opening setup, reconfigure or Configure — that was
@@ -56,6 +56,39 @@ v0.3.0's own account is in
 Continued real-world testing remains the priority. This is a
 carefully-reviewed codebase, not a battle-tested one.
 
+> **Upgrading to v0.4.0?** Requires Home Assistant 2026.10 or later. No
+> learning reset and no configuration change: the learned corrections
+> carry over (their season label becomes "ALL").
+>
+> What changes in the forecast:
+>
+> - **Temperature, humidity and pressure 1–6 hours ahead** include a
+>   correction from your station's latest error. Replayed on a real
+>   installation's data (22 Sep – 15 Nov 2026), the average error 1 hour
+>   ahead fell by 35–40 % for all three, 3 hours ahead by 15–23 %. It
+>   needs a week of comparison history before it starts; an existing
+>   installation has that already.
+> - **All lead times** learn with a 3-day memory instead of a few hours
+>   to a few days, depending on the source. Temperature error 24–48 hours
+>   ahead fell by 8–10 % in the same replay; humidity and pressure got
+>   no measurably worse at any lead. The effect builds up over the first
+>   days after the update, as the learned values settle.
+> - **No restart on 1 December** (or any other season start): buckets are
+>   no longer split by season.
+> - **Dew point** is now calculated from the published temperature and
+>   humidity, so it can no longer contradict them (and is more accurate).
+> - **Gusts** are the median of the sources, not the maximum: every model
+>   over-forecasts gusts, and the maximum made that worse.
+> - The forecast calculation uses far less memory per cycle (on that
+>   installation 6 MB instead of 162 MB).
+>
+> For anything reading the integration's entities or attributes: the
+> same entities, attributes, units and timing. Values change where listed
+> above; solar radiation, cloud layers and the reference station are
+> unchanged. The blend comparison now scores the forecast as published,
+> including the short-range correction. Details in
+> [swissweather_fusion_v0.4.0_release_audit.md](swissweather_fusion_v0.4.0_release_audit.md).
+>
 > **Upgrading to v0.3.6?** No learning reset and no configuration change.
 > Forecasts, learned corrections and the accuracy comparison are
 > unchanged — this was verified on a copy of a real 14.5 million row
@@ -180,6 +213,10 @@ altitude, which Model A would otherwise faithfully learn as forecast
 - **Model A** — blends CH1, CH2, ICON-D2, SRF, and meteoblue's forecasts,
   each corrected for its own systematic bias against your specific
   location, learned continuously and automatically (no manual tuning).
+  The learning remembers about three days, whatever the number of model
+  runs a source delivers. For the next 1–6 hours it also carries your
+  station's latest error forward: when the blend was 1 °C too cold an
+  hour ago, it is likely too cold for a few more hours (v0.4.0).
 - **Model B** — watches your station's pressure/humidity/temperature trend
   plus a live radar precipitation reading (at your location and three
   points upwind, roughly 20/35/60 minutes out) for the classic summer

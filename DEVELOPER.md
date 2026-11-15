@@ -2200,6 +2200,101 @@ horizons the series is three-hourly. Below 75% coverage no total is
 published. `None` is honest; tripling the sum on an assumption about
 whether a three-hourly value is a rate or an accumulation would not be.
 
+## v0.4.0 — learning tuned on the installation's own data
+
+The backtest (SWF-ICS-WX-INFO-003) proposed C1–C8 from 14 months of
+ICON archives scored at the Tänikon reference station. Before building,
+each was checked on the live installation's own database (15 Sep – 15 Nov
+2026, five sources, the owner's station as truth). Three verdicts changed;
+the release audit has the numbers.
+
+**The replay** (`tools/v0_4_0_evidence/replay.py`; the other analysis
+scripts of this release are in the same folder, see its README) ports `swf_simulate.m` + `swf_ar.m` and feeds it the stored
+forecast rows: every row is a learning sample, exactly as live, so the
+live sample density is reproduced rather than simulated. It is scored on
+the trial's own `blend_comparison` slots. It reproduces the live system's
+recorded error (temperature 0.704 vs 0.710 °C at 1 h, 0.913 vs 0.903 at
+24 h) before any variant is trusted.
+
+**C2 — memory as a half-life in days (built, 3 days, not 10).**
+`model_a.alpha_for_samples(k)`: each of the k rows of one source and lead
+bucket forecasting the same target hour gets alpha = 1 − 0.5^(1/(3k)), so
+together they count as one day. The learning coordinator counts k in a
+first pass over the batch (all rows of one target hour reconcile in the
+same cycle). Live memories before were 5–15 hours for short leads. 10
+days (the backtest's value) made humidity and pressure clearly worse: the
+station's offsets for those drift over days, which archives scored at
+MeteoSwiss's instruments could not show. 3 days was best or level for all
+three. `tools/v0_4_0_evidence/learn_equiv.py` confirmed on the real database that the built
+`_reconcile` reproduces the replay formula bit for bit (20,298 rows,
+1,056 buckets, difference 0).
+
+**Season removed from the bucket key (built).** `const.SEASON_ALL`,
+`model_a.bucket_season()` used wherever a key is built. With a 3-day
+memory the season key only caused an empty-bucket restart on the first
+day of each season. Migration v7 relabels the rows, keeping the most
+recently updated one where a key existed under several seasons (marker
+`v0_4_0_season_key_merged`). `derive_season` stays for anything that
+needs the real season.
+
+**C1 — clear-calm regime (deferred).** In autumn it added nothing on top
+of C2 for temperature and made humidity and pressure slightly worse. The
+backtest's gain was in winter. Re-run the replay on winter data in
+February; the variant is already in `replay.py`.
+
+**C3 — error persistence (built, leads 1–6 h).** Published T/RH/P for
+lead L in 1..6 = learned blend + phi(L) · e1, where e1 is the station
+reading nearest the issue hour minus the learned 1-hour forecast recorded
+for that hour (`blend_comparison`, lead 1), falling back to the hour
+before. phi is fitted per lead (1, 3, 6; interpolated between) by least
+squares through the origin over the last 30 days, clipped to [0, 0.9],
+once 168 pairs exist; refitted once per issue hour (`_fit_persistence`).
+`blend_comparison.persistence_delta` stores the shift included in
+`blend_value`, and every fit and predictor uses `blend_value −
+persistence_delta`: the correction never feeds back into its own fit.
+The blend's verification rows (`source = 'blend'`) stay unshifted — they
+train the learned blend's own bucket. The current hour (lead 0) is not
+shifted. Any failure means no shift, never a failed blend.
+
+Replay gains vs v0.3.6 rules with C2 + C3: temperature −37 % (1 h), −21 %
+(3 h), −11 % (6 h); humidity −39 % / −16 %; pressure −35 % / −22 % / −10 %.
+With the predictor as built (the reading at the issue hour rather than an
+hour earlier) the replay shows more (temperature 1 h: −56 %); the audit
+quotes the cautious figure until live data confirm it. At 12 h humidity
+got worse with persistence, hence the 6-hour limit.
+
+**C4 — dew point derived (built).** `model_a.dew_point_magnus`
+(WMO coefficients 17.62 / 243.12), applied in `_finalise_values` after
+C3, so the published dew point always agrees with the published
+temperature and humidity. The fused value remains the fallback.
+
+**C5 — gusts by median (built).** `forecast_parameters`.
+
+**C7 — calibrated rain probability (dropped).** The backtest found the
+probability derived from model agreement miscalibrated. Live, every
+source supplies its own probability, and their mean is already
+calibrated against the Tänikon gauge (0–10 % → 1 % observed, 30–50 % →
+43 %, 70–100 % → 85 %; Brier skill +0.57 at 3 h). A calibration table fitted
+on half the data made the other half worse.
+
+**Radar steering (not built).** Python port of `swf_radar_backtest.m` on
+the collector archive (26 Sep – 15 Nov, 108 rain hours): Model B's fixed
+south-west points scored best overall at 1–3 h (Heidke 0.69 / 0.62 /
+0.58). Steered wedges caught more rain with 2–3× the false alarms. Repeat
+with summer convection. The radar pixel at the station agrees with the
+Tänikon gauge at r = 0.997 with zero offset: the grid is read correctly.
+
+**Storage.**
+- `get_forecast_snapshots_in_window` returns only the newest non-NULL
+  row per (source, variable, valid_at), excluding the blend's own rows
+  (`ROW_NUMBER()`, ties by id). Proven identical for every key the blend
+  reads, on the real database at three dates; 162 MB → 6 MB per cycle.
+- Blend verification rows are written once per issue hour
+  (`has_blend_verification`); they were stored six times an hour.
+- `PRAGMA journal_size_limit` 64 MB, and `wal_checkpoint(TRUNCATE)` after
+  any purge that deleted rows: the WAL file had stayed at 315 MB.
+- `hacs.json` minimum Home Assistant 2026.10.0.
+
 ## v0.3.6 — database performance without changing a result
 
 **Symptom (owner, 31 Oct 2026).** The weather card showed "unavailable";

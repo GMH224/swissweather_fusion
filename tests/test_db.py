@@ -302,12 +302,14 @@ def test_get_pending_forecast_snapshots_finds_late_arriving_row(db):
     assert late_rows[0]["valid_at"] == "2026-07-25T09:00:00+00:00"
 
 
-def test_get_forecast_snapshots_in_window_returns_everything_ordered_for_grouping(db):
+def test_get_forecast_snapshots_in_window_returns_newest_per_key(db):
     """v0.1.13: the bulk-fetch replacement for what used to be thousands
-    of individual round-trip queries per blend cycle. Confirms it returns
-    every row in the window (all sources/measurements together) ordered
-    so the caller can group by (source, variable, valid_at) and take the
-    freshest issued_at per group in one pass.
+    of individual round-trip queries per blend cycle.
+
+    v0.4.0: it now returns only the freshest row per (source, variable,
+    valid_at) — the one the caller kept anyway — not every run. The
+    caller's grouping loop below still works unchanged, which is the
+    point: same result, fewer rows.
     """
     db.insert_forecast_snapshot("ch1", "2026-07-25T09:00:00+00:00", "2026-07-25T12:00:00+00:00", "temperature", 20.0)
     db.insert_forecast_snapshot("ch1", "2026-07-25T11:00:00+00:00", "2026-07-25T12:00:00+00:00", "temperature", 21.0)  # fresher issued_at, same valid_at
@@ -317,7 +319,7 @@ def test_get_forecast_snapshots_in_window_returns_everything_ordered_for_groupin
     rows = db.get_forecast_snapshots_in_window(
         start_valid_at="2026-07-25T00:00:00+00:00", end_valid_at="2026-07-25T23:59:59+00:00"
     )
-    assert len(rows) == 3  # the out-of-window row is excluded
+    assert len(rows) == 2  # out-of-window row excluded, older ch1 run not returned
 
     # Group by (source, variable, valid_at), keep first (freshest
     # issued_at, per the DESC ordering) — the same logic the coordinator

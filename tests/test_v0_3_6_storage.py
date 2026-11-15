@@ -530,9 +530,10 @@ def test_maintenance_step_failure_rolls_back_and_keeps_progress(db, monkeypatch)
     run_maintenance(db)
 
 
-def test_schema_version_is_six(db):
-    assert dbmod.SCHEMA_VERSION == 6
-    assert db._get_meta("schema_version") == "6"
+def test_schema_version_is_at_least_six(db):
+    # v0.4.0 raised it to 7 (tests/test_v0_4_0_*.py).
+    assert dbmod.SCHEMA_VERSION >= 6
+    assert db._get_meta("schema_version") == str(dbmod.SCHEMA_VERSION)
 
 
 # ---------------------------------------------------------------------------
