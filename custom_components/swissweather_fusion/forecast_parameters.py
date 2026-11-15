@@ -36,8 +36,12 @@ wrong for the three parameters users look at most:
   mean across disagreeing models invents a small non-zero snowfall that
   misrepresents both.
 - **A gust forecast is an extreme statistic.** The mean of several
-  maxima is not a maximum, and it understates the hazard in the one
-  direction where being wrong matters most.
+  maxima is not a maximum. v0.2 therefore fused gusts with the maximum —
+  but every model already over-forecasts gusts at the reference station,
+  and taking the largest compounds it: +2.0 m/s bias, 2.11 m/s error at
+  3 h. v0.4.0 (C5) fuses them with the MEDIAN (1.29 m/s, the best of
+  max/mean/median in the backtest, INFO-003 §4.3). The median of several
+  peaks is still a peak forecast, not an average of calm and gusty.
 
 So each parameter declares its own strategy. The strategies themselves
 are documented and defensible starting points, not calibrated choices —
@@ -202,15 +206,20 @@ PARAMETERS: dict[str, ForecastParameter] = {
     "wind_speed": _p("wind_speed", ParameterClass.FUSED, "m/s", fuse_mean,
                      0, 150, desc="10 m wind speed"),
     "wind_gust_speed": _p("wind_gust_speed", ParameterClass.FUSED, "m/s",
-                          fuse_max, 0, 200,
-                          desc="peak gust; fused with max, not mean"),
+                          fuse_median, 0, 200,
+                          desc="peak gust; fused with the median (v0.4.0, C5)"),
     # Bearing is an angle and must NOT be averaged linearly — the mean of
     # 350 deg and 10 deg is 180 deg, exactly backwards. Handled separately
     # by fuse_wind_bearing() below; registered here for bounds only.
     "wind_bearing": _p("wind_bearing", ParameterClass.FUSED, "°", fuse_median,
                        0, 360, desc="wind direction; see fuse_wind_bearing"),
+    # v0.4.0 (C4): fused only as a fallback. Where the blend has both a
+    # temperature and a humidity, the published dew point is derived
+    # from them (model_a.dew_point_magnus) — see
+    # ModelABlendCoordinator._finalise_values.
     "dew_point": _p("dew_point", ParameterClass.FUSED, "°C", fuse_mean,
-                    -60, 40, desc="dew point temperature"),
+                    -60, 40, desc="dew point temperature (derived from T and RH "
+                                  "where both are available)"),
     "apparent_temperature": _p("apparent_temperature", ParameterClass.FUSED,
                                "°C", fuse_mean, -80, 60,
                                desc="feels-like temperature"),

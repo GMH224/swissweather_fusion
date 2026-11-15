@@ -871,10 +871,9 @@ class LearningProgressSensor(_LearningStatSensor):
     MIN_SAMPLES_TO_TRUST_BUCKET a bucket contributes at the cold-start
     weight and bias correction is doing nothing for it.
 
-    Expect this to climb toward a plateau, then step DOWN at each season
-    boundary — buckets are keyed by season, so a transition empties the
-    seasonal ones and they refill. That is expected behaviour, not a
-    regression.
+    Expect this to climb toward a plateau and stay there. v0.4.0: buckets
+    are no longer keyed by season (const.SEASON_ALL), so there is no
+    longer a step down on 1 Dec, 1 Mar, 1 Jun and 1 Sep.
     """
 
     _attr_native_unit_of_measurement = "%"
@@ -897,8 +896,7 @@ class LearningProgressSensor(_LearningStatSensor):
             "note": (
                 "Percentage is of buckets that exist, not of the full key "
                 "space — most of that space is unreachable (ICON-CH1 only "
-                "forecasts 33 hours, so it can have no long-lead buckets). "
-                "Expect a step down at each season boundary."
+                "forecasts 33 hours, so it can have no long-lead buckets)."
             ),
         }
 

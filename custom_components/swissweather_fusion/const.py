@@ -481,6 +481,26 @@ SEASON_DJF = "DJF"
 SEASON_MAM = "MAM"
 SEASON_JJA = "JJA"
 SEASON_SON = "SON"
+# v0.4.0: the season is no longer part of the learning bucket key. Every
+# bucket is stored under this one value. Why: the learning memory is now a
+# 3-day half-life (LEARNING_HALF_LIFE_DAYS), which follows the seasons by
+# itself; a season key only added an empty-bucket restart on the first
+# day of every season (1 Dec, 1 Mar, 1 Jun, 1 Sep). See DEVELOPER.md
+# "v0.4.0 learning".
+SEASON_ALL = "ALL"
+
+# v0.4.0 (C2): learning memory as a half-life in DAYS, independent of how
+# many forecast runs a source delivers. Each stored forecast row is one
+# learning sample; a source that delivers 20 runs a day used to forget
+# 20 times faster than one with 2, giving live memories of 5-15 hours.
+# Each row now carries weight 1/k of one day's sample, where k is the
+# number of rows of that source and lead bucket for the same target hour
+# (models/model_a.alpha_for_samples). Replayed on a real installation
+# (15 Sep - 15 Nov 2026): 3 days beats today's rules for temperature at
+# every lead and is neutral or better for humidity and pressure; 10 days
+# (the backtest's recommendation) was worse for humidity and pressure,
+# whose station offsets drift over days.
+LEARNING_HALF_LIFE_DAYS = 3.0
 
 LEAD_TIME_SHORT = "short"      # < 24h
 LEAD_TIME_MEDIUM = "medium"    # 24-72h
@@ -502,6 +522,22 @@ EMA_ALPHA_BY_LEAD_TIME = {
 # raw forecast instead. Starting point only; revisit once real fill rates
 # are observed (plan doc §3).
 MIN_SAMPLES_TO_TRUST_BUCKET = 5
+
+# v0.4.0 (C3): error persistence. When the blend was wrong an hour ago, it
+# tends to be wrong the same way for the next few hours. The published
+# temperature/humidity/pressure for 1..PERSISTENCE_MAX_LEAD_HOURS hours
+# ahead is shifted by phi(L) times the latest observed error of the
+# 1-hour forecast. phi is fitted per lead by least squares (through the
+# origin) over the last PERSISTENCE_WINDOW_DAYS of the paired comparison,
+# clipped to [0, PERSISTENCE_PHI_MAX] (damped, never anti-persistent),
+# and only once PERSISTENCE_MIN_PAIRS pairs exist. Leads between the
+# fitted ones are interpolated; beyond 6 h the replay found no gain and,
+# for humidity at 12 h, a loss.
+PERSISTENCE_MAX_LEAD_HOURS = 6
+PERSISTENCE_FIT_LEADS = (1, 3, 6)
+PERSISTENCE_WINDOW_DAYS = 30
+PERSISTENCE_MIN_PAIRS = 7 * 24
+PERSISTENCE_PHI_MAX = 0.9
 
 EMA_WEIGHT_EPSILON = 0.01  # avoids divide-by-zero when ema_abs_error is 0
 

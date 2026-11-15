@@ -136,7 +136,7 @@ _VALID_ROW_WIDTHS = (6, 8)
 
 def validate_forecast_rows(
     rows: Iterable[tuple[Any, ...]],
-) -> tuple[list[tuple[Any, ...]], int]:
+) -> tuple[list[tuple[Any, ...]], int, int]:
     """Validate a batch of forecast rows before bulk insert.
 
     Rows are the 6-tuples every provider coordinator builds:

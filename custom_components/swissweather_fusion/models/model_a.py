@@ -24,6 +24,10 @@ from ..const import (
     EMA_ALPHA_BY_LEAD_TIME,
     EMA_WEIGHT_EPSILON,
     LAPSE_RATE_C_PER_1000M,
+    LEARNING_HALF_LIFE_DAYS,
+    PERSISTENCE_MAX_LEAD_HOURS,
+    PERSISTENCE_MIN_PAIRS,
+    PERSISTENCE_PHI_MAX,
     LEAD_TIME_LONG,
     LEAD_TIME_MEDIUM,
     LEAD_TIME_MEDIUM_MAX_HOURS,
@@ -33,6 +37,7 @@ from ..const import (
     SEASON_DJF,
     SEASON_JJA,
     SEASON_MAM,
+    SEASON_ALL,
     SEASON_SON,
 )
 
@@ -51,6 +56,31 @@ def derive_season(dt: datetime) -> str:
     if month in (6, 7, 8):
         return SEASON_JJA
     return SEASON_SON
+
+
+def bucket_season(dt: datetime) -> str:
+    """v0.4.0: the season component of a learning bucket key.
+
+    Always SEASON_ALL: the season is no longer part of the key (see
+    const.SEASON_ALL). Kept as a function, called wherever a bucket key is
+    built, so learning and blend cannot disagree about it.
+    derive_season() remains for anything that needs the actual season.
+    """
+    return SEASON_ALL
+
+
+def alpha_for_samples(samples_per_day: int, half_life_days: float = LEARNING_HALF_LIFE_DAYS) -> float:
+    """v0.4.0 (C2): EMA alpha for one of `samples_per_day` samples that
+    together stand for one day of a bucket.
+
+    A bucket (hour of day, lead bucket, source, measurement) receives one
+    target hour per day, forecast by k stored rows. With alpha =
+    1 - 0.5 ** (1 / (half_life_days * k)), those k updates together decay
+    the old state by 0.5 ** (1 / half_life_days) — so the memory is
+    `half_life_days` regardless of how many runs a source delivers.
+    """
+    k = max(int(samples_per_day), 1)
+    return 1.0 - 0.5 ** (1.0 / (half_life_days * k))
 
 
 def derive_lead_time_bucket(issued_at: datetime, valid_at: datetime) -> str:
@@ -88,8 +118,13 @@ def update_bucket_ema(
     forecast_value: float,
     actual_value: float,
     lead_time_bucket: str,
+    alpha: Optional[float] = None,
 ) -> EmaUpdateResult:
     """Fold one new (forecast, actual) pair into a bucket's EMA statistics.
+
+    v0.4.0 (C2): `alpha` overrides the per-lead-bucket default. The
+    learning coordinator passes alpha_for_samples(k); the default remains
+    for callers that state no density.
 
     Two separate quantities are tracked, deliberately:
       - ema_bias: the systematic offset (forecast - actual, signed) — this
@@ -120,7 +155,10 @@ def update_bucket_ema(
     least-squares/EMA practice — predict-then-update, never update-then-
     grade-yourself-against-the-update.
     """
-    alpha = EMA_ALPHA_BY_LEAD_TIME[lead_time_bucket]
+    if alpha is None:
+        alpha = EMA_ALPHA_BY_LEAD_TIME[lead_time_bucket]
+    if not 0.0 < alpha <= 1.0:
+        raise ValueError(f"alpha must be in (0, 1], got {alpha!r}")
 
     raw_error = forecast_value - actual_value
 
@@ -977,3 +1015,86 @@ def resolve_condition(
         precip, temperature, humidity,
         precip_threshold=precip_threshold, is_daytime=is_daytime,
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 (C4): dew point consistent with the published temperature/humidity
+# ---------------------------------------------------------------------------
+
+# Magnus formula over water, WMO-recommended coefficients (Alduchov and
+# Eskridge 1996): accurate to about 0.1 degC for -40..+50 degC.
+_MAGNUS_A = 17.62
+_MAGNUS_B = 243.12
+
+
+def dew_point_magnus(temperature_c: Optional[float], humidity_pct: Optional[float]) -> Optional[float]:
+    """Dew point from temperature and relative humidity.
+
+    v0.4.0 (C4): the dew point used to be fused on its own (mean of the
+    providers' dew points) while temperature and humidity were the learned
+    blend, so the two could contradict each other: the fused dew point
+    exceeded the blended temperature in 8-10 % of hours in the backtest,
+    which is physically impossible. Derived from the published values, it
+    is consistent by construction and was also more accurate at every
+    lead (backtest INFO-003 §4.2).
+
+    Returns None when either input is missing or humidity is not in
+    (0, 100]; humidity above 100 % is clipped to 100.
+    """
+    if temperature_c is None or humidity_pct is None:
+        return None
+    if not math.isfinite(temperature_c) or not math.isfinite(humidity_pct):
+        return None
+    if humidity_pct <= 0:
+        return None
+    rh = min(humidity_pct, 100.0)
+    gamma = math.log(rh / 100.0) + _MAGNUS_A * temperature_c / (_MAGNUS_B + temperature_c)
+    return _MAGNUS_B * gamma / (_MAGNUS_A - gamma)
+
+
+# ---------------------------------------------------------------------------
+# v0.4.0 (C3): error persistence
+# ---------------------------------------------------------------------------
+
+
+def fit_persistence_phi(pairs: list[tuple[float, float]]) -> Optional[float]:
+    """Least-squares phi through the origin for error ~ phi * predictor.
+
+    `pairs` are (error at lead L, latest known 1-hour error at issue
+    time), both observed minus forecast. Clipped to [0, PERSISTENCE_PHI_MAX]
+    — damped, never anti-persistent. None below PERSISTENCE_MIN_PAIRS
+    pairs: too little history to trust a fit, so no correction is applied.
+    """
+    usable = [(e, p) for e, p in pairs
+              if e is not None and p is not None and math.isfinite(e) and math.isfinite(p)]
+    if len(usable) < PERSISTENCE_MIN_PAIRS:
+        return None
+    sxx = sum(p * p for _, p in usable)
+    if sxx <= 0:
+        return 0.0
+    phi = sum(e * p for e, p in usable) / sxx
+    return min(max(phi, 0.0), PERSISTENCE_PHI_MAX)
+
+
+def persistence_phi_for_lead(lead_hours: int, fitted: dict[int, float]) -> float:
+    """phi for any lead, from the phis fitted at a few leads.
+
+    0 at lead <= 0 and beyond PERSISTENCE_MAX_LEAD_HOURS; linear
+    interpolation between fitted leads; the nearest fitted value below the
+    first or above the last fitted lead (within the limit). 0 when nothing
+    was fitted.
+    """
+    if lead_hours <= 0 or lead_hours > PERSISTENCE_MAX_LEAD_HOURS or not fitted:
+        return 0.0
+    leads = sorted(fitted)
+    if lead_hours in fitted:
+        return fitted[lead_hours]
+    if lead_hours < leads[0]:
+        return fitted[leads[0]]
+    if lead_hours > leads[-1]:
+        return fitted[leads[-1]]
+    for lo, hi in zip(leads, leads[1:]):
+        if lo < lead_hours < hi:
+            w = (lead_hours - lo) / (hi - lo)
+            return fitted[lo] + w * (fitted[hi] - fitted[lo])
+    return 0.0

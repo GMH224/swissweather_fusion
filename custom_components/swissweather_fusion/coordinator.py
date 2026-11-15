@@ -48,6 +48,8 @@ from .clients.wetteralarm import (
 )
 from .health import SourceHealth, classify_exception
 from .const import (
+    PERSISTENCE_FIT_LEADS,
+    PERSISTENCE_WINDOW_DAYS,
     SOURCE_SRF,
     MIN_SAMPLES_TO_TRUST_BUCKET,
     BLEND_COMPARISON_LEAD_HOURS,
@@ -2014,6 +2016,143 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         )
         return self.data
 
+    # -- v0.4.0: error persistence (C3) and derived dew point (C4) --------
+
+    def _persistence_state(self, now: datetime) -> dict[str, tuple[float, dict[int, float]]]:
+        """Latest observed 1-hour error and fitted phi per measurement.
+
+        `now` is the blend's issue hour. The error is the station reading
+        nearest that hour (within the reconciliation tolerance, never from
+        the future) minus the learned 1-hour forecast recorded for it in
+        blend_comparison; if that hour has no such forecast yet, the hour
+        before. The phis are refitted once per issue hour from the last
+        PERSISTENCE_WINDOW_DAYS of reconciled comparisons — the same
+        construction the replay on a real installation validated
+        (release audit v0.4.0 §3).
+
+        Never raises into the blend: any failure means no shift.
+        """
+        from .models import model_a
+
+        try:
+            if getattr(self, "_persistence_fit_hour", None) != now:
+                self._persistence_phis = self._fit_persistence(now)
+                self._persistence_fit_hour = now
+            phis = self._persistence_phis
+            if not phis:
+                return {}
+            hours = [now, now - timedelta(hours=1)]
+            learned = self._db.get_lead1_learned_values(h.isoformat() for h in hours)
+            tolerance = timedelta(minutes=model_a.RECONCILIATION_TOLERANCE_MINUTES)
+            real_now = model_a.utcnow()
+            obs_rows = self._db.get_station_observations_between(
+                (hours[-1] - tolerance).isoformat(), real_now.isoformat()
+            )
+            candidates: dict[str, list[tuple[datetime, Any]]] = {
+                m: [] for m in self.LEARNED_MEASUREMENTS
+            }
+            for row in obs_rows:
+                ts = datetime.fromisoformat(row["ts"])
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if ts > real_now:
+                    continue
+                for m in self.LEARNED_MEASUREMENTS:
+                    candidates[m].append((ts, row[m]))
+            state: dict[str, tuple[float, dict[int, float]]] = {}
+            for m in self.LEARNED_MEASUREMENTS:
+                fitted = phis.get(m)
+                if not fitted:
+                    continue
+                for hour in hours:
+                    forecast = learned.get((m, hour.isoformat()))
+                    if forecast is None:
+                        continue
+                    observed = model_a.find_nearest_observation(
+                        target=hour, candidates=candidates[m]
+                    )
+                    if observed is None:
+                        continue
+                    state[m] = (observed - forecast, fitted)
+                    break
+            return state
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning(
+                "Error persistence unavailable this cycle; forecast published "
+                "without it", exc_info=True,
+            )
+            return {}
+
+    def _fit_persistence(self, now: datetime) -> dict[str, dict[int, float]]:
+        """phi per measurement and fitted lead, from reconciled history."""
+        from .models import model_a
+
+        since = (now - timedelta(days=PERSISTENCE_WINDOW_DAYS)).isoformat()
+        rows = self._db.get_persistence_history(
+            since_valid_at=since, leads=PERSISTENCE_FIT_LEADS
+        )
+        error_1h: dict[tuple[str, datetime], float] = {}
+        for r in rows:
+            if r["lead_hours"] == 1:
+                error_1h[(r["measurement"], datetime.fromisoformat(r["valid_at"]))] = (
+                    r["actual_value"] - r["learned_value"]
+                )
+        pairs: dict[tuple[str, int], list[tuple[float, float]]] = {}
+        for r in rows:
+            lead = r["lead_hours"]
+            if lead not in PERSISTENCE_FIT_LEADS:
+                continue
+            issue_hour = datetime.fromisoformat(r["issued_at"]).replace(
+                minute=0, second=0, microsecond=0
+            )
+            m = r["measurement"]
+            predictor = error_1h.get((m, issue_hour))
+            if predictor is None:
+                predictor = error_1h.get((m, issue_hour - timedelta(hours=1)))
+            if predictor is None:
+                continue
+            pairs.setdefault((m, lead), []).append(
+                (r["actual_value"] - r["learned_value"], predictor)
+            )
+        fitted: dict[str, dict[int, float]] = {}
+        for (m, lead), lst in pairs.items():
+            phi = model_a.fit_persistence_phi(lst)
+            if phi is not None:
+                fitted.setdefault(m, {})[lead] = phi
+        return fitted
+
+    @staticmethod
+    def _persistence_delta(measurement: str, lead: int, persistence: dict) -> float:
+        from .models import model_a
+
+        state = persistence.get(measurement)
+        if state is None:
+            return 0.0
+        error, fitted = state
+        return model_a.persistence_phi_for_lead(lead, fitted) * error
+
+    def _finalise_values(self, values: dict[str, Any], lead: int, persistence: dict) -> None:
+        """Apply C3 to the learned measurements, then derive the dew point.
+
+        In place. Humidity stays within [0, 100] %. The dew point is
+        derived from the values as published (after the shift), so the
+        three always agree; where temperature or humidity is missing the
+        fused dew point stays.
+        """
+        from .models import model_a
+
+        for m in self.LEARNED_MEASUREMENTS:
+            if values.get(m) is None:
+                continue
+            delta = self._persistence_delta(m, lead, persistence)
+            if delta:
+                values[m] = values[m] + delta
+                if m == "humidity":
+                    values[m] = min(max(values[m], 0.0), 100.0)
+        derived = model_a.dew_point_magnus(values.get("temperature"), values.get("humidity"))
+        if derived is not None:
+            values["dew_point"] = derived
+
     def _record_blend_comparison(
         self,
         *,
@@ -2021,8 +2160,14 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         latest_forecast: dict,
         bucket_lookup: dict,
         basis_by_source: Optional[dict] = None,
+        persistence: Optional[dict] = None,
     ) -> None:
         """Write one paired comparison row per (target, measurement, lead).
+
+        v0.4.0 (C3): blend_value is the PUBLISHED value, including the
+        error-persistence shift for leads up to 6 h; the shift itself is
+        stored alongside (persistence_delta), so the learned blend stays
+        recoverable and phi is never fitted on its own output.
 
         Only Class A measurements participate. Class B and Class C have
         no local ground truth by definition — that is what makes them
@@ -2052,6 +2197,8 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 blend_value = model_a.blend(contributions)
                 if blend_value is None:
                     continue
+                delta = self._persistence_delta(measurement, int(lead), persistence or {})
+                blend_value += delta
 
                 contributors: dict[str, dict[str, Any]] = {}
                 bases: list[str] = []
@@ -2095,6 +2242,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                         self._comparison_basis(bases),
                         blend_value,
                         json.dumps(contributors, separators=(",", ":")),
+                        delta,
                     )
                 )
 
@@ -2184,7 +2332,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
 
         now = model_a.utcnow()
         hour_of_day = target_hour.hour
-        season = model_a.derive_season(target_hour)
+        season = model_a.bucket_season(target_hour)
         target_iso = target_hour.replace(minute=0, second=0, microsecond=0).isoformat()
 
         contributions: list[model_a.SourceContribution] = []
@@ -2574,6 +2722,10 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             )
             for m in self.MEASUREMENTS
         }
+        # v0.4.0 (C3): the latest observed error and the fitted phi per
+        # measurement; empty until enough comparison history exists.
+        persistence = self._persistence_state(now)
+        self._finalise_values(current, 0, persistence)
 
         # v0.1.14 fix: ExpertWeightSensor used to call self._db.get_bucket_stats()
         # directly inside its native_value property — a plain (non-
@@ -2586,7 +2738,7 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
         from .const import LEAD_TIME_SHORT
         from .models import model_a as _model_a_for_weights
 
-        season_now = _model_a_for_weights.derive_season(now)
+        season_now = _model_a_for_weights.bucket_season(now)
         expert_weights: dict[str, Optional[float]] = {}
         for source in ALL_FORECAST_SOURCES:
             bucket = bucket_lookup.get(
@@ -2611,6 +2763,9 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                 )
 
             values = {m: blend(m) for m in self.MEASUREMENTS}
+            # v0.4.0: error persistence (C3, leads 1-6 h) and the dew
+            # point derived from the published temperature/humidity (C4).
+            self._finalise_values(values, i, persistence)
             # Skip hours with literally nothing from any source — no
             # point showing an all-None row, and sources with shorter
             # horizons (CH1's ~33-45h) will naturally taper off rather
@@ -2692,7 +2847,11 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
                     (SOURCE_BLEND, issued_at_iso, target_iso, measurement,
                      value, "blend_verification")
                 )
-        if blend_rows:
+        # v0.4.0: once per issue hour. `now` is truncated to the hour and
+        # the blend runs every 10 minutes, so these rows used to be stored
+        # six times per hour with the same issued_at (62,000 duplicates on
+        # a real installation), each one then learned separately.
+        if blend_rows and not self._db.has_blend_verification(issued_at_iso, blend_rows[0][2]):
             self._db.insert_forecast_snapshots_bulk(blend_rows)
 
         # v0.3.0 (W0/ARC-05): the paired comparison.
@@ -2707,10 +2866,18 @@ class ModelABlendCoordinator(DataUpdateCoordinator):
             latest_forecast=latest_forecast,
             bucket_lookup=bucket_lookup,
             basis_by_source=basis_by_source,
+            persistence=persistence,
         )
 
         return {
             "current": current,
+            # v0.4.0 (C3): what the short-range shift is based on, per
+            # measurement — for diagnostics and the release audit.
+            "persistence": {
+                m: {"error": round(p[0], 3),
+                    "phi": {str(k): round(v, 3) for k, v in sorted(p[1].items())}}
+                for m, p in persistence.items()
+            },
             "expert_weights": expert_weights,
             "hourly_forecast": hourly_forecast,
             # v0.3.3: solar radiation for downstream consumers, and
@@ -3128,6 +3295,12 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
         # repeats must build on.
         bucket_updates: dict[BucketKey, tuple] = {}
         pending_bucket_state: dict[BucketKey, tuple[float, float, int]] = {}
+        # v0.4.0 (C2): first pass — match observations and build each
+        # row's bucket key, so the number of rows per (bucket, target
+        # hour) is known before any of them is learned. That number, k,
+        # sets each row's alpha (model_a.alpha_for_samples): the k rows
+        # for one target hour together count as one day of the bucket.
+        matched: list[tuple[Any, BucketKey, float, datetime]] = []
         for fs_row in pending_rows:
             if fs_row["value"] is None:
                 # The stored forecast value itself is null — this can
@@ -3156,11 +3329,18 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
 
             key = BucketKey(
                 hour_of_day=valid_at.hour,
-                season=model_a.derive_season(valid_at),
+                season=model_a.bucket_season(valid_at),
                 lead_time_bucket=model_a.derive_lead_time_bucket(issued_at, valid_at),
                 source=fs_row["source"],
                 measurement=measurement,
             )
+            matched.append((fs_row, key, actual_value, valid_at))
+
+        rows_per_target: dict[tuple[BucketKey, datetime], int] = {}
+        for _row, key, _actual, valid_at in matched:
+            rows_per_target[(key, valid_at)] = rows_per_target.get((key, valid_at), 0) + 1
+
+        for fs_row, key, actual_value, valid_at in matched:
             # v0.1.24 fix (P0-01): consult this batch's own in-flight
             # results before falling back to the database.
             #
@@ -3192,6 +3372,7 @@ class ModelALearningCoordinator(DataUpdateCoordinator):
                 forecast_value=fs_row["value"],
                 actual_value=actual_value,
                 lead_time_bucket=key.lead_time_bucket,
+                alpha=model_a.alpha_for_samples(rows_per_target[(key, valid_at)]),
             )
             pending_bucket_state[key] = (
                 result.ema_bias,
@@ -3776,6 +3957,9 @@ class RetentionCoordinator(DataUpdateCoordinator):
             )
         total_deleted = sum(deleted.values())
         if total_deleted > 0:
+            # v0.4.0: a bulk deletion is what grows the write-ahead log;
+            # merge and truncate it now rather than leave it at its peak.
+            await self.hass.async_add_executor_job(self._db.checkpoint_truncate)
             _LOGGER.info(
                 "Retention purge (cutoff %d days): deleted %s",
                 self._purge_days,

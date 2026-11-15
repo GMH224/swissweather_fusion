@@ -73,7 +73,9 @@ _LOGGER = logging.getLogger(__name__)
 # is brought into that shape by run_storage_maintenance_step(), in the
 # background and in small batches, never at startup. See
 # _V6_MAINTENANCE_KEY.
-SCHEMA_VERSION = 6
+# v0.4.0: 7. One added column (blend_comparison.persistence_delta) and a
+# data migration of bucket_stats (season key merged). See _migrate_to_v7.
+SCHEMA_VERSION = 7
 
 # v0.3.6: the variables Model A learns from. A forecast row of any other
 # variable can never be reconciled — the station has no sensor for it — so
@@ -86,6 +88,11 @@ SCHEMA_VERSION = 6
 # tests/test_v0_3_6_storage.py asserts it. Kept here rather than imported
 # because this module deliberately has no coordinator dependency.
 LEARNED_VARIABLES: tuple[str, ...] = ("temperature", "humidity", "pressure")
+
+# v0.4.0: the source name the blend uses for its own verification rows.
+# Must equal const.SOURCE_BLEND (tested); kept here for the same reason as
+# LEARNED_VARIABLES — this module has no dependency on the rest.
+BLEND_SOURCE = "blend"
 
 # Status given at insert time to a row Model A will never look at.
 STATUS_NOT_LEARNED = "not_learned"
@@ -110,6 +117,9 @@ _V6_MAINTENANCE_KEY = "v0_3_6_storage_maintenance"
 # copy of a real 3.3 GB database: the worst 50 000-id NULL-deletion batch
 # took 0.53 s.
 MAINTENANCE_BATCH_IDS = 50_000
+
+# v0.4.0: see _configure_pragmas.
+WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024
 PURGE_BATCH_ROWS = 20_000
 
 # v0.1.23: how far back the v1->v2 migration re-opens forecast_snapshots
@@ -144,6 +154,10 @@ _V3_REQUIRED_COLUMNS = {
 # this way so a future v5 cannot accidentally drop a v3 requirement while
 # copying the block.
 _V5_DATA_MIGRATION_KEY = "v0_3_1_lead_time_contamination_cleared"
+# v0.4.0: bucket_stats rows merged onto the single season SEASON_ALL.
+_V7_SEASON_MERGE_KEY = "v0_4_0_season_key_merged"
+# Must equal const.SEASON_ALL (tested).
+SEASON_ALL = "ALL"
 
 _V4_REQUIRED_COLUMNS = {
     **_V3_REQUIRED_COLUMNS,
@@ -260,6 +274,11 @@ CREATE TABLE IF NOT EXISTS blend_comparison (
     actual_value REAL,
     reconciled_at TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
+    -- v0.4.0 (C3): the error-persistence shift included in blend_value.
+    -- blend_value is what was published; blend_value - persistence_delta
+    -- is the learned blend alone, which is what phi is fitted on (so the
+    -- correction never feeds back into its own fit).
+    persistence_delta REAL NOT NULL DEFAULT 0.0,
     UNIQUE (valid_at, measurement, lead_hours)
 );
 
@@ -479,6 +498,24 @@ class SwissWeatherDB:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # v0.4.0: cap the size the write-ahead log is left at. SQLite
+        # checkpoints the log into the database automatically, but by
+        # default never shrinks the file: after the v0.3.6 index rebuilds
+        # a real installation kept a 315 MB log file indefinitely. With
+        # this limit, the file is truncated back to at most 64 MB after
+        # each checkpoint. It changes nothing about what is stored.
+        self._conn.execute(f"PRAGMA journal_size_limit={WAL_SIZE_LIMIT_BYTES}")
+
+    def checkpoint_truncate(self) -> None:
+        """v0.4.0: merge the write-ahead log and truncate it to zero.
+
+        Called after bulk deletions (purge, storage maintenance), which
+        are what grow the log. A checkpoint that cannot complete because
+        another reader holds an old snapshot is harmless: SQLite retries
+        on the next automatic checkpoint.
+        """
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def _ensure_schema(self) -> None:
         """Bring the database to the current schema.
@@ -568,6 +605,7 @@ class SwissWeatherDB:
             # here would leave the contaminated buckets in place on exactly
             # the installations that already upgraded.
             self._migrate_to_v5()
+            self._migrate_to_v7()
             self._conn.executescript(_INDEX_SQL)
             self._create_v6_indexes_if_empty()
             self._write_schema_version()
@@ -589,10 +627,61 @@ class SwissWeatherDB:
             self._migrate_to_v3()
         self._migrate_to_v4()
         self._migrate_to_v5()
+        self._migrate_to_v7()
         self._conn.executescript(_INDEX_SQL)
         self._create_v6_indexes_if_empty()
         self._write_schema_version()
         self._conn.commit()
+
+    def _migrate_to_v7(self) -> None:
+        """v0.4.0: persistence column, and one season for all buckets.
+
+        1. blend_comparison.persistence_delta is added if missing
+           (ALTER TABLE ADD COLUMN with a constant default: instant, no
+           table rewrite). Older rows get 0.0, which is exactly right —
+           nothing was shifted before v0.4.0.
+        2. bucket_stats: the season leaves the bucket key (const.SEASON_ALL).
+           Where one (hour, lead, source, measurement) exists under several
+           seasons, the most recently updated row is kept — it is the one
+           that describes the present; the others would be replaced by it
+           anyway. All remaining rows are then relabelled. On a database
+           installed in autumn there is only 'SON', so nothing is dropped
+           and every learned value carries over unchanged.
+
+        Dispatched on a schema_meta marker (like _migrate_to_v5), because
+        the shape does not show whether the merge has happened. Both steps
+        are idempotent.
+        """
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(blend_comparison)")}
+        if "persistence_delta" not in cols:
+            self._conn.execute(
+                "ALTER TABLE blend_comparison "
+                "ADD COLUMN persistence_delta REAL NOT NULL DEFAULT 0.0"
+            )
+        if self._conn.execute(
+            "SELECT 1 FROM schema_meta WHERE key = ?", (_V7_SEASON_MERGE_KEY,)
+        ).fetchone():
+            return
+        dropped = self._conn.execute(
+            "DELETE FROM bucket_stats WHERE rowid NOT IN ("
+            "  SELECT rowid FROM ("
+            "    SELECT rowid, ROW_NUMBER() OVER ("
+            "      PARTITION BY hour_of_day, lead_time_bucket, source, measurement "
+            "      ORDER BY last_updated DESC, rowid DESC) AS rank_in_key "
+            "    FROM bucket_stats"
+            "  ) WHERE rank_in_key = 1"
+            ")"
+        ).rowcount
+        self._conn.execute("UPDATE bucket_stats SET season = ?", (SEASON_ALL,))
+        self._conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            (_V7_SEASON_MERGE_KEY, "done"),
+        )
+        if dropped:
+            _LOGGER.info(
+                "Learning buckets merged onto one season; %d older seasonal "
+                "rows superseded by the most recent one", dropped,
+            )
 
     def _create_v6_indexes_if_empty(self) -> None:
         """v0.3.6: give an empty forecast table its final indexes now.
@@ -1276,14 +1365,50 @@ class SwissWeatherDB:
         `ORDER BY issued_at DESC LIMIT via [0]` pattern did — just once
         for the whole batch instead of once per (hour, measurement,
         source) combination.
+
+        **v0.4.0**: returns only the row the caller keeps — the newest
+        stored value per (source, variable, valid_at) — instead of every
+        run in the window. On a real installation that was 249,000 rows
+        and 162 MB of Python objects per blend cycle for 9,400 rows
+        actually used; now it is the 9,400. Proven identical on that
+        database at three dates (release audit v0.4.0 §4).
+
+        The selection matches the caller's former in-memory rule exactly:
+        NULL values are skipped BEFORE choosing (a newer row without a
+        value never hides an older real one), and the newest issued_at
+        wins. Ties on issued_at are broken by the higher id (the later
+        insert), which the old ORDER BY left to the query plan; on that
+        database ties exist only for source 'blend', which is excluded
+        here because the blend never reads its own verification rows.
+        Rows stay ordered by (source, variable, valid_at).
         """
         with self._lock:
             cur = self._conn.execute(
-                "SELECT * FROM forecast_snapshots WHERE valid_at >= ? AND valid_at <= ? "
-                "ORDER BY source, variable, valid_at, issued_at DESC",
-                (start_valid_at, end_valid_at),
+                "SELECT * FROM ("
+                "  SELECT f.*, ROW_NUMBER() OVER ("
+                "    PARTITION BY source, variable, valid_at "
+                "    ORDER BY issued_at DESC, id DESC) AS newest_rank "
+                "  FROM forecast_snapshots f "
+                "  WHERE valid_at >= ? AND valid_at <= ? "
+                "  AND value IS NOT NULL AND source != ?"
+                ") WHERE newest_rank = 1 "
+                "ORDER BY source, variable, valid_at",
+                (start_valid_at, end_valid_at, BLEND_SOURCE),
             )
             return cur.fetchall()
+
+    def has_blend_verification(self, issued_at: str, valid_at: str) -> bool:
+        """v0.4.0: whether the blend's verification row for this issue
+        hour and target is already stored (see
+        ModelABlendCoordinator._compute_blend). Looked up by
+        (source, valid_at) so idx_forecast_source_ts answers it.
+        """
+        with self._lock:
+            return self._conn.execute(
+                "SELECT 1 FROM forecast_snapshots WHERE source = ? AND valid_at = ? "
+                "AND issued_at = ? AND trigger_reason = 'blend_verification' LIMIT 1",
+                (BLEND_SOURCE, valid_at, issued_at),
+            ).fetchone() is not None
 
     def get_all_bucket_stats(self) -> list[sqlite3.Row]:
         """**v0.1.13**: bucket_stats is documented to stay small
@@ -1545,22 +1670,63 @@ class SwissWeatherDB:
         logs — a count that collapses to zero forever would mean the
         dedupe key is wrong, and that is worth being able to see.
         """
-        rows = list(rows)
+        rows = [tuple(r) if len(r) == 8 else (*r, 0.0) for r in rows]
         if not rows:
             return 0
         # v0.3.1 (SWF-ICS-046): same ownership fix as the forecast bulk
         # insert. apply_blend_comparison_batch below already rolled back
         # correctly; this one did not, in the same module and the same
         # release.
+        #
+        # v0.4.0: an optional 8th element, the persistence shift included
+        # in blend_value (0.0 when absent).
         with self._transaction():
             cur = self._conn.executemany(
                 "INSERT OR IGNORE INTO blend_comparison "
                 "(valid_at, measurement, lead_hours, issued_at, "
-                " lead_time_basis, blend_value, contributors) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                " lead_time_basis, blend_value, contributors, persistence_delta) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 rows,
             )
         return cur.rowcount or 0
+
+    def get_persistence_history(
+        self, *, since_valid_at: str, leads: Iterable[int]
+    ) -> list[sqlite3.Row]:
+        """v0.4.0 (C3): reconciled comparison rows for fitting phi.
+
+        Returns (measurement, lead_hours, valid_at, issued_at,
+        learned_value, actual_value) for the given leads plus lead 1 (the
+        predictor), learned_value being the blend WITHOUT any persistence
+        shift — so the fit is on the learned blend's own errors.
+        """
+        wanted = sorted(set(int(x) for x in leads) | {1})
+        marks = ",".join("?" for _ in wanted)
+        with self._lock:
+            return self._conn.execute(
+                "SELECT measurement, lead_hours, valid_at, issued_at, "
+                "blend_value - persistence_delta AS learned_value, actual_value "
+                "FROM blend_comparison "
+                f"WHERE status = 'reconciled' AND lead_hours IN ({marks}) "
+                "AND valid_at >= ? AND actual_value IS NOT NULL",
+                (*wanted, since_valid_at),
+            ).fetchall()
+
+    def get_lead1_learned_values(self, valid_ats: Iterable[str]) -> dict[tuple[str, str], float]:
+        """v0.4.0 (C3): the learned 1-hour blend recorded for each target
+        hour, keyed (measurement, valid_at) — the forecast the current
+        error is measured against."""
+        valid_ats = list(valid_ats)
+        if not valid_ats:
+            return {}
+        marks = ",".join("?" for _ in valid_ats)
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT measurement, valid_at, blend_value - persistence_delta AS learned_value "
+                f"FROM blend_comparison WHERE lead_hours = 1 AND valid_at IN ({marks})",
+                valid_ats,
+            ).fetchall()
+        return {(r["measurement"], r["valid_at"]): r["learned_value"] for r in rows}
 
     def get_pending_blend_comparisons(self, until_ts: str) -> list[sqlite3.Row]:
         """Comparison rows whose target hour has passed and which have no
